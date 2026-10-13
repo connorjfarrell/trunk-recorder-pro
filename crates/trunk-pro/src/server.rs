@@ -885,10 +885,16 @@ pub(crate) fn keys_result(v: &Value, result: Result<(), String>) -> Value {
 }
 
 /// What is held changed: the running session uses it from the next call, and browsers are told.
+/// Queue `store` as what the engine is to hold, in place of any such command already waiting.
+fn queue_keys(cmds: &mut Vec<crate::runtime::EngineCmd>, store: Option<Arc<trunk_core::crypto::KeyStore>>) {
+    cmds.retain(|c| !matches!(c, crate::runtime::EngineCmd::Keys(_)));
+    cmds.push(crate::runtime::EngineCmd::Keys(store));
+}
+
 pub(crate) fn keys_changed(ctx: &Ctx) {
-    if ctx.runner.lock().unwrap().is_some() {
-        ctx.engine_cmds.lock().unwrap().push(crate::runtime::EngineCmd::Keys(ctx.keys.store()));
-    }
+    // Queued whether or not a recording is running yet: one that is still starting takes it when its engine
+    // runs. Only the latest is kept (each carries what is held at the moment, so the last is the current one).
+    queue_keys(&mut ctx.engine_cmds.lock().unwrap(), ctx.keys.store());
     // (The config as it is now, not the settings the caller worked from: a slower, older task that
     // finishes last must not show the browsers a state for settings that have been replaced.)
     let settings = ctx.config.lock().unwrap().keys.clone();
@@ -988,6 +994,8 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                 // A change to the keys section wins over an unlock that is still opening its container,
                 // from this moment, not from when the refresh below gets its turn.
                 let keys_generation = (old.keys != c.keys).then(|| ctx.keys.invalidate());
+                // (At once, before anything else is awaited: a recording that is still starting builds its plugins from this.)
+                ctx.plugins.set_share(c.keys.share_decrypted.clone());
                 // A talkgroup file changed while recording (an Ignore flag set): the session takes it now.
                 if ctx.runner.lock().unwrap().is_some() {
                     let mut cmds = ctx.engine_cmds.lock().unwrap();
@@ -1283,6 +1291,20 @@ mod tests {
             headers.insert(axum::http::HeaderName::from_bytes(h.as_bytes()).unwrap(), HeaderValue::from_static("203.0.113.9"));
             assert!(!is_local(&peer("127.0.0.1:5000"), &headers, true), "{h}");
         }
+    }
+
+    /// Key changes that come before the engine runs are not lost, and only the latest is kept.
+    #[test]
+    fn only_the_latest_keys_command_waits_for_the_engine() {
+        use crate::runtime::EngineCmd;
+        let mut store = trunk_core::crypto::KeyStore::new();
+        store.insert(trunk_core::crypto::Key::new(0x81, 1, "k".into(), 0, true, vec![0; 8]));
+        let mut cmds = vec![EngineCmd::Talkgroups { short_name: "s".into(), csv: String::new() }];
+        queue_keys(&mut cmds, Some(Arc::new(store)));
+        queue_keys(&mut cmds, None);
+        assert_eq!(cmds.len(), 2, "the other command stays; one keys command");
+        assert!(matches!(&cmds[0], EngineCmd::Talkgroups { .. }));
+        assert!(matches!(&cmds[1], EngineCmd::Keys(None)), "the last one: locked");
     }
 
     #[test]

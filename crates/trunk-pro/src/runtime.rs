@@ -186,7 +186,11 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
     let mut session = Session::new(cfg.clone(), epoch_ms, &|name| fs::read_to_string(bandplan_path(name)).ok(), local_offset)?;
     session.attach(ctx.shared.clone());
     // Decryption keys: from the files the config names (read now), or those unlocked with a password.
-    for (problem, text) in ctx.keys.refresh(&cfg.keys, ctx.config_path.parent().unwrap_or(std::path::Path::new("."))) {
+    // (Tied to the key state as it is now: a Lock or a newer config change that comes while the files are
+    // read stands, and what it leaves is what the session gets. Changes after that reach the engine as
+    // commands, queued from the first, not only once recording is up.)
+    let keys_at = ctx.keys.generation();
+    for (problem, text) in ctx.keys.refresh_at(keys_at, &cfg.keys, ctx.config_path.parent().unwrap_or(std::path::Path::new("."))) {
         if problem {
             log::warn!("{text}");
         } else {
@@ -194,7 +198,7 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
         }
     }
     session.set_keys(ctx.keys.store());
-    publish(&ctx.hub, ctx.keys.status_json(&cfg.keys));
+    crate::server::keys_changed(&ctx);
     session.load_units(&|name| fs::read_to_string(units_path(name)).ok());
     session.load_heard(&fs::read_to_string(heard_path(&cfg)).unwrap_or_default());
     ctx.plugins.start(&cfg);

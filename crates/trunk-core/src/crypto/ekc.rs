@@ -166,8 +166,9 @@ pub fn parse(file: &[u8], password: &str) -> Result<Container, EkcError> {
     }
     let keep = plain.len() - pad;
     plain.truncate(keep);
-    let inner_xml = Zeroizing::new(String::from_utf8(plain.to_vec()).map_err(|_| EkcError::WrongPasswordOrCorrupt)?);
-    let inner = Document::parse(&inner_xml).map_err(|_| EkcError::WrongPasswordOrCorrupt)?;
+    // (Read in place from the wiped buffer: no second, unwiped copy of what may hold the keys.)
+    let inner_xml = std::str::from_utf8(&plain).map_err(|_| EkcError::WrongPasswordOrCorrupt)?;
+    let inner = Document::parse(inner_xml).map_err(|_| EkcError::WrongPasswordOrCorrupt)?;
     let inner_root = inner.root_element();
     if inner_root.tag_name().name() != "InnerContainer" {
         return Err(EkcError::WrongPasswordOrCorrupt);
