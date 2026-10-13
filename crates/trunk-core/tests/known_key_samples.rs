@@ -31,10 +31,11 @@ struct Sample {
 }
 
 fn load(dir: &Path) -> Sample {
-    let kv = std::fs::read_to_string(dir.join("key.txt")).unwrap();
-    let get = |k: &str| kv.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).unwrap().trim().to_string();
+    // (The file holds the key as text: kept wiped like the key, and only borrowed from.)
+    let kv = zeroize::Zeroizing::new(std::fs::read_to_string(dir.join("key.txt")).unwrap());
+    let get = |k: &str| -> &str { kv.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).unwrap().trim() };
     let algid = u8::from_str_radix(get("algid").trim_start_matches("0x"), 16).unwrap();
-    let key = zeroize::Zeroizing::new(unhex(&get("key_hex")));
+    let key = zeroize::Zeroizing::new(unhex(get("key_hex")));
     let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("encrypted.mbe")).unwrap()).unwrap();
     let frames = j["frames"]
         .as_array()

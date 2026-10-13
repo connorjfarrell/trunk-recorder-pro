@@ -1576,6 +1576,24 @@ impl Engine {
                 }
                 TrackerOut::Crypto { algid, key_id, decrypted } => {
                     let now = t.now_s;
+                    // A call dropped for a key we lacked turns out (a later transmission, under a key we
+                    // hold) to be decryptable: it is recorded again from here, a recorder permitting.
+                    if decrypted && !self.radio.recordings.contains_key(&id) && self.radio.recordings.len() < self.radio.max_recorders {
+                        if let Some(c) = t.calls.call_mut(id).filter(|c| !c.recording && c.reason == Some(Reason::Encrypted)) {
+                            let r = &mut self.radio;
+                            let recorder_num = r.free_nums.pop().unwrap_or_else(|| {
+                                r.next_num += 1;
+                                r.next_num - 1
+                            });
+                            r.recordings.insert(
+                                id,
+                                Recording { audio: Vec::new(), frames: CallFrames::new(r.capture_frames), recorder_num, tx: Transmissions::default(), freq_error: (0.0, 0), reception: Reception::default() },
+                            );
+                            c.recording = true;
+                            c.reason = None;
+                            self.call_events.push(CallEvent::Update(c.clone()));
+                        }
+                    }
                     if decrypted {
                         if let Some(rec) = self.radio.recordings.get_mut(&id) {
                             rec.tx.mark_decrypted(now);
@@ -1982,6 +2000,23 @@ mod tests {
         e.emit_call_events();
         assert!(saved(&e.drain_events()).is_empty());
         // (Frames that did decode stop a call being dropped for a key we lack: not here, none did.)
+    }
+
+    /// A call dropped for a key we lacked is recorded again when a later transmission names one we hold.
+    #[test]
+    fn a_call_dropped_for_a_missing_key_is_recorded_again_when_a_held_key_appears() {
+        let (mut e, id) = keyed_engine_with_call();
+        e.radio.pending.push((0, id, TrackerOut::Info { source: None, emergency: false, encrypted: true }));
+        e.radio.pending.push((0, id, TrackerOut::Crypto { algid: 0x81, key_id: 9, decrypted: false }));
+        e.apply_pending();
+        assert!(!e.trunks[0].calls.calls[0].recording && e.radio.recordings.is_empty());
+        // A later transmission of the same call, under key 7, which we hold.
+        e.radio.pending.push((0, id, TrackerOut::Crypto { algid: 0x81, key_id: 7, decrypted: true }));
+        e.radio.pending.push((0, id, audio_out()));
+        e.apply_pending();
+        let c = &e.trunks[0].calls.calls[0];
+        assert!(c.recording && c.decrypted && c.reason.is_none());
+        assert_eq!(e.radio.recordings[&id].audio.len(), mbe::FRAME_SAMPLES, "its audio is kept from there");
     }
 
     /// Audio already recorded keeps the recording, even when a later transmission's key is missing.

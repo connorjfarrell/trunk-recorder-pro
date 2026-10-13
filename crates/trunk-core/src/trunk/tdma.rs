@@ -227,6 +227,8 @@ impl TdmaTracker {
                 s.active = true;
                 s.encrypted = false;
                 s.algid = ALGID_CLEAR;
+                // (What an earlier transmission's ESS said isn't this one's.)
+                s.next_algid = ALGID_CLEAR;
                 if let Some(cr) = &mut s.crypto {
                     cr.reset();
                 }
@@ -299,6 +301,8 @@ impl TdmaTracker {
                     s.active = true;
                     s.end_s = t;
                     s.algid = ptt.algid;
+                    // (Until its first ESS says otherwise, the algorithm goes on; not the last transmission's.)
+                    s.next_algid = ptt.algid;
                     s.encrypted = ptt.algid != ALGID_CLEAR;
                     s.first4v = ((p.sf_slot >> 1) as i32 + pdu.offset as i32 + 1) % 5;
                     s.burst_id = -1;
@@ -315,6 +319,7 @@ impl TdmaTracker {
                 MAC_END_PTT => {
                     s.active = false;
                     s.algid = ALGID_CLEAR;
+                    s.next_algid = ALGID_CLEAR;
                     s.talker = None;
                     if let Some(cr) = &mut s.crypto {
                         cr.reset();

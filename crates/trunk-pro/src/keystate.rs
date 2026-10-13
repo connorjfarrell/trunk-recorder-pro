@@ -28,6 +28,9 @@ struct Inner {
     /// Counts every change of what is held, for browsers to know to ask again.
     version: u64,
     last_try: Option<Instant>,
+    /// Counts every operation that changes what is held (a refresh, a lock, an unlock): an unlock
+    /// that was opening the container while one of the others happened is dropped, not applied.
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -49,6 +52,7 @@ impl KeyState {
         let mut g = self.0.lock().unwrap();
         // (What the browsers show: which keys, not only how many; a replaced container with as many keys changes it.)
         let shown = |g: &Inner| (g.store.as_ref().map(|k| k.list()), g.from_prompt, g.problem.clone());
+        g.generation += 1;
         let before = shown(&g);
         let mut notes = Notes::new();
         if s.ekc_file.trim().is_empty() || s.password_file.trim().is_empty() {
@@ -90,9 +94,21 @@ impl KeyState {
         if password.is_empty() {
             return Err("Enter the container's password.".into());
         }
+        let started = self.0.lock().unwrap().generation;
         let loaded = keyfiles::open_ekc(&keyfiles::resolve(&s.ekc_file, config_dir), password)?;
+        self.commit_unlock(started, s, loaded)
+    }
+
+    /// Install what an unlock opened, unless the keys were changed (a lock, a refresh) since it
+    /// began at generation `started`: opening the container takes a moment, and what happened in
+    /// it wins.
+    fn commit_unlock(&self, started: u64, s: &KeysSettings, loaded: keyfiles::Loaded) -> Result<Notes, String> {
         let Some(keys) = loaded.keys else { return Err("The container holds no key this program can use.".into()) };
         let mut g = self.0.lock().unwrap();
+        if g.generation != started {
+            return Err("The keys were changed while the container was opening; try again.".into());
+        }
+        g.generation += 1;
         g.store = Some(keys);
         g.from_prompt = true;
         g.ekc = s.ekc_file.clone();
@@ -105,6 +121,7 @@ impl KeyState {
     /// told to take them from every call in progress too.
     pub fn lock(&self) {
         let mut g = self.0.lock().unwrap();
+        g.generation += 1;
         if g.store.take().is_some() {
             g.version += 1;
         }
@@ -244,5 +261,29 @@ mod tests {
         assert_eq!(state(&k, &bad), "error");
         assert!(k.status_json(&bad)["message"].as_str().unwrap().contains("Decryption is off"));
         assert!(notes.iter().any(|n| n.0));
+    }
+
+    /// A lock (or a refresh) that happens while an unlock is opening the container beats it.
+    #[test]
+    fn an_unlock_does_not_undo_a_lock_that_came_after_it_began() {
+        let (d, k) = (dir("race"), KeyState::default());
+        let s = settings("k.ekc", "");
+        let open = || keyfiles::open_ekc(&d.join("k.ekc"), "testing1234").unwrap();
+        // An unlock begins, a lock lands while it opens the container, then it tries to install.
+        let started = k.0.lock().unwrap().generation;
+        let loaded = open();
+        k.lock();
+        assert!(k.commit_unlock(started, &s, loaded).unwrap_err().contains("changed while"));
+        assert!(k.store().is_none(), "the lock stands");
+        // Likewise a refresh (a config change) in the meantime.
+        let started = k.0.lock().unwrap().generation;
+        let loaded = open();
+        k.refresh(&settings("other.ekc", ""), &d);
+        assert!(k.commit_unlock(started, &s, loaded).is_err());
+        assert!(k.store().is_none());
+        // With nothing in between it takes.
+        let started = k.0.lock().unwrap().generation;
+        k.commit_unlock(started, &s, open()).unwrap();
+        assert!(k.store().is_some());
     }
 }

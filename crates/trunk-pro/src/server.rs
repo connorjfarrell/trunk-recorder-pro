@@ -989,6 +989,13 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                         }
                     }
                 }
+                // Plugins' settings changed while recording (or what lets them be given decrypted
+                // calls): they restart with them first, before the keys are re-read, which takes a
+                // moment, so that a revoked authorization is not still in use meanwhile.
+                if crate::plugins::changed(&old, &c) {
+                    let (ctx2, c2) = (ctx.clone(), c.clone());
+                    let _ = tokio::task::spawn_blocking(move || ctx2.plugins.reload(&c2)).await;
+                }
                 if old.keys != c.keys {
                     let (ctx2, keys) = (ctx.clone(), c.keys.clone());
                     let _ = tokio::task::spawn_blocking(move || {
@@ -1007,11 +1014,6 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                     crate::logging::configure(&c.log, ctx.config_path.parent().unwrap_or(std::path::Path::new(".")));
                 }
                 publish(&ctx.hub, json!({ "type": "config", "config": c }));
-                // Plugins' settings changed while recording: they restart with them.
-                if crate::plugins::changed(&old, &c) {
-                    let ctx2 = ctx.clone();
-                    let _ = tokio::task::spawn_blocking(move || ctx2.plugins.reload(&c)).await;
-                }
                 saved.err().map(|e| json!({ "type": "error", "message": format!("Couldn't save the config: {e}") }))
             }
             Err(e) => Some(json!({ "type": "error", "message": format!("Bad config: {e}") })),
