@@ -28,7 +28,7 @@ export function KeysPanel() {
   const edit = (patch: Partial<typeof k>) => updateConfig((x) => void (x.keys = { ...(x.keys ?? { ekcFile: "", passwordFile: "" }), ...patch }));
   const state = keys?.state ?? "off";
   const local = onThisComputer() || !!k.allowLanUnlock;
-  const canType = state === "locked" || (state === "unlocked" && keys?.source === "password");
+  const canType = state === "locked" || state === "unlocked";
 
   const act = async (f: () => Promise<{ ok: boolean; message: string | null }>, done: string) => {
     setBusy(true);

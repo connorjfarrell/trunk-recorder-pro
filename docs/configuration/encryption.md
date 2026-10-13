@@ -176,7 +176,7 @@ trunk-pro replay call.cu8 --center 155150000 --rate 2400000 --p25 155200000 \
 
 The call is a test pattern, not speech, so it shows the path works (the receiver, your keys, the
 cipher, saving), not what a real system sounds like. Without `--ekc` on the `replay` the same file
-writes no call. `--start ldu1` or `ldu2` joins the call part-way, and `--key <hex>` gives a key
+writes no call. `--join ldu1` or `ldu2` joins the call part-way, and `--key <hex>` gives a key
 directly (it shows in the process list: for test keys only).
 
 `--phase2` makes a Phase 2 call instead (one logical channel of a TDMA voice channel, `--channel 0`

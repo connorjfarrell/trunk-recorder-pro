@@ -405,7 +405,7 @@ Every message is a JSON object with a `type`. Exact fields are in
 | `plugins` | After `hello`; after plugin changes; answers `plugins` | `plugins` (`PluginInfo[]`), `encoderFound` |
 | `keys` | In `hello`; when the decryption keys change | `state` (`off` / `locked` / `unlocked` / `error`), `source` (`file` / `password` / null), `message`, `count`, `version`. Never a key ([Encryption keys](../configuration/encryption.md)) |
 | `keysList` | Answers `keysQuery` | `keys`: each key held as `{ algId, keyId, name, sln, active }` (never the key), only to a connection from the recorder's own computer (`restricted: true` and none otherwise) |
-| `keysResult` | Answers `keysUnlock`, `keysLock`, `keysReload` | `ok`, `message` |
+| `keysResult` | Answers `keysUnlock`, `keysLock`, `keysReload` | `ok`, `message`, and the `id` the command carried (when it had one) |
 | `state` | Recording starts / stops | `phase`, `error`, `ended` |
 | `status` | ~2/s while running | `status` (`EngineStatus`: totals, `systems[]` with control channel, decode counts `good`/`bad`, site identity, patches, DMR state), `sources[]` (each radio: rate, drops, errors, frequency error), `load` (share of real time the decoder is busy), `calls` (`CallView[]`, on the air now) |
 | `spectrum` | Topic `spectrum:<source>`: ~7/s while running | `source`, `centerHz`, `rateHz`, `bins`: 512 levels in dBFS, lowest frequency first, spanning `centerHz ± rateHz/2` |
@@ -457,9 +457,9 @@ aren't understood are ignored.
 | `surveyListen` | `freqHz` | Monitor this signal. |
 | `surveyRescan` / `surveyStop` | — | Scan again / end the survey. |
 | `profileSource` | `source`, `centerHz` | Look at radio `source`'s band for a couple of seconds, tuned to `centerHz` (a capture keeps its own), and measure how it rolls off at the edges (→ `sourceProfile`; not while recording). |
-| `keysQuery` | — | Which decryption keys are held (→ `keysList`). |
-| `keysUnlock` | `password` | Open the config's key container with its password (→ `keysResult`, then `keys`). **Only from the computer the recorder runs on**: a connection from another address, or through a reverse proxy, is refused. The password is not stored or sent back. |
-| `keysLock` / `keysReload` | — | Forget the keys held / read the files the config names again. Same restriction. |
+| `keysQuery` | — | Which decryption keys are held (→ `keysList`; only to a direct connection from the recorder's own computer, even when `keys.allowLanUnlock` lets other private addresses unlock). |
+| `keysUnlock` | `password`, `id?` | Open the config's key container with its password (→ `keysResult` with the same `id`, then `keys`). **Only from the computer the recorder runs on** (a direct loopback connection), or, when the config's `keys.allowLanUnlock` is on, from a private-network address; a connection from a public address, or through a reverse proxy, is refused. The password is not stored or sent back. Send an `id` to match answers to commands when several are in flight. |
+| `keysLock` / `keysReload` | `id?` | Forget the keys held / read the files the config names again. Same restriction and `id`. |
 | `plugins` | — | List plugins again (→ `plugins`). |
 | `addPlugin` | `path` | Add a plugin executable of your own. |
 | `removePlugin` | `id` | Remove a plugin. |

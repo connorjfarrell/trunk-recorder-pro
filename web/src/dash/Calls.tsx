@@ -212,7 +212,7 @@ export function ActiveCalls({ s }: { s: AppState }) {
                   <td className="unit-cell">{c.sources.length ? <Unit id={c.sources.at(-1)!} alias={aliasOf(s, c.systemName, c.sources.at(-1)!)} /> : "—"}</td>
                   <td className="mono">{clock(Math.max(0, now - c.startS))}</td>
                   <td>
-                    <span className={`dot dot-${c.state}${c.decrypted ? " dot-dec" : c.encrypted ? " dot-enc" : ""}`} /> {reasonText(c)}
+                    <span className={`dot dot-${c.state}${c.decrypted ? " dot-dec" : c.encrypted ? " dot-enc" : ""}`} aria-hidden="true" /> {reasonText(c)}
                     {c.decrypted && c.algId != null && <span className="muted" title="The cipher and key id the call named"> · {cipherName(c.algId)} key {c.keyId}</span>}
                   </td>
                   <td>

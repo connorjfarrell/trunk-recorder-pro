@@ -1,5 +1,5 @@
 //! `trunk-pro tool p25synth <out.cu8> [--phase2 [--channel 0|1] [--sysid N --wacn N]] [--center Hz]
-//! [--freq Hz] [--rate Hz] [--nac N] [--tg N] [--src N] [--superframes N] [--start header|ldu1|ldu2]
+//! [--freq Hz] [--rate Hz] [--nac N] [--tg N] [--src N] [--superframes N] [--join header|ldu1|ldu2]
 //! [--algid N --kid N (--key hex | --ekc file [--password-file file]) [--mi hex]]` — a synthetic P25
 //! call as a capture (rtl_sdr's cu8), in noise: one channel at `--freq`, Phase 1 (C4FM) or, with
 //! `--phase2`, one logical channel of a Phase 2 (H-DQPSK) voice channel (decode it with `tool p2
@@ -17,12 +17,14 @@ use trunk_core::p25::synth::{imbe, modulate, Call, Crypt, Start};
 
 use crate::{die, Args};
 
-fn hex(s: &str) -> Vec<u8> {
+/// Hex digits as bytes. A bad value is reported without being repeated: it may be a key.
+fn hex(s: &str, what: &str) -> Vec<u8> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let bad = || -> ! { die(&format!("--{what}: not an even number of hex digits")) };
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
-        die(&format!("not hex: {s}"));
+        bad();
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or_else(|_| die(&format!("not hex: {s}")))).collect()
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or_else(|_| bad())).collect()
 }
 
 pub fn run(a: &Args) {
@@ -30,17 +32,18 @@ pub fn run(a: &Args) {
     let center = a.num("center", 155_150_000.0);
     let freq = a.num("freq", 155_200_000.0);
     let fs = a.num("rate", 2_400_000.0);
-    let start = match a.get("start").unwrap_or("header") {
+    // (`--join`: `--start` is a flag of other commands, which takes no value.)
+    let start = match a.get("join").unwrap_or("header") {
         "header" => Start::Header,
         "ldu1" => Start::Ldu1,
         "ldu2" => Start::Ldu2,
-        s => die(&format!("--start {s}: header, ldu1 or ldu2")),
+        s => die(&format!("--join {s}: header, ldu1 or ldu2")),
     };
     let crypt = a.get("algid").map(|_| {
         let algid = crate::tool::num_any(a, "algid") as u8;
         let kid = crate::tool::num_any(a, "kid") as u16;
         let key = match (a.get("key"), a.get("ekc")) {
-            (Some(k), _) => hex(k),
+            (Some(k), _) => zeroize::Zeroizing::new(hex(k, "key")),
             (None, Some(ekc)) => {
                 let settings = trunk_app::config::KeysSettings { ekc_file: ekc.into(), password_file: a.get("password-file").unwrap_or("").into(), ..Default::default() };
                 let loaded = crate::keyfiles::load(&settings, std::path::Path::new("."));
@@ -48,17 +51,17 @@ pub fn run(a: &Args) {
                     eprintln!("{t}");
                 }
                 let store = loaded.keys.unwrap_or_else(|| die("--ekc: no keys loaded"));
-                store.get(algid, kid).unwrap_or_else(|| die(&format!("--ekc: no key for algorithm {algid:#04x}, key id {kid}"))).bytes().to_vec()
+                zeroize::Zeroizing::new(store.get(algid, kid).unwrap_or_else(|| die(&format!("--ekc: no key for algorithm {algid:#04x}, key id {kid}"))).bytes().to_vec())
             }
             _ => die("--algid needs --key hex, or --ekc <file> --password-file <file>"),
         };
-        let mi = a.get("mi").map(hex).unwrap_or_else(|| vec![0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef]);
+        let mi = a.get("mi").map(|m| hex(m, "mi")).unwrap_or_else(|| vec![0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef]);
         if mi.len() != 8 {
             die("--mi: 8 octets (16 hex digits)");
         }
         let mut m = [0u8; 9];
         m[..8].copy_from_slice(&mi);
-        Crypt { algid, kid, key: zeroize::Zeroizing::new(key), mi: m }
+        Crypt { algid, kid, key, mi: m }
     });
     if a.flag("phase2") {
         return run_phase2(a, path, center, freq, fs, start, crypt);

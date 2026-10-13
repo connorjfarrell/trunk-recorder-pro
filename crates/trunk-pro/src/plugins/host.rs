@@ -381,6 +381,9 @@ impl PluginHost {
         // (A call JSON that can't be read is withheld like a decrypted call, not released.)
         let decrypted = super::guard::call_json_decrypted(json);
         if self.call_takers(decrypted) == 0 {
+            if decrypted {
+                self.shared.say_all_withheld(topic::CALL_CONCLUDED);
+            }
             return;
         }
         let call = |files: &CallFiles| ConcludedCall { path: rel.to_string(), system, call: record.clone(), files: files.clone() };
@@ -502,18 +505,32 @@ impl Shared {
         (self.notes)(Note::Log { plugin: plugin.to_string(), level, text: text.into() });
     }
 
+    /// Say, once a run, that `p` is not given decrypted calls, why, and how to allow it.
+    fn say_withheld(&self, p: &Plugin) {
+        let super::guard::Verdict::Withheld(why) = &p.decrypted else { return };
+        if !p.withheld_said.swap(true, Ordering::Relaxed) {
+            self.note_log(
+                &p.id,
+                Level::Warn,
+                format!("is NOT given decrypted calls: {why}. Sending decrypted calls out is risky (a call uploaded can't be taken back, and may become public). Only if you are sure and authorized, set keys.shareDecrypted.{} to \"{}\" in the config file", super::parse_label(&p.id).0, super::guard::PHRASE),
+            );
+        }
+    }
+
+    /// A decrypted call came and no plugin that takes calls may have it: say so for each (they are
+    /// otherwise passed over without a word, as nothing is sent to them at all).
+    fn say_all_withheld(&self, t: &str) {
+        for p in self.plugins.iter().filter(|p| p.manifest.subscribes(t)) {
+            self.say_withheld(p);
+        }
+    }
+
     /// `decrypted`: what is sent is a call decrypted with our keys (or its audio), which only the
     /// plugins [`super::guard`] allows are given.
     fn dispatch(&self, t: &str, l: &Arc<str>, decrypted: bool) {
         for p in self.plugins.iter().filter(|p| p.manifest.subscribes(t)) {
-            if decrypted && let super::guard::Verdict::Withheld(why) = &p.decrypted {
-                if !p.withheld_said.swap(true, Ordering::Relaxed) {
-                    self.note_log(
-                        &p.id,
-                        Level::Warn,
-                        format!("is NOT given decrypted calls: {why}. Sending decrypted calls out is risky (a call uploaded can't be taken back, and may become public). Only if you are sure and authorized, set keys.shareDecrypted.{} to \"{}\" in the config file", super::parse_label(&p.id).0, super::guard::PHRASE),
-                    );
-                }
+            if decrypted && !p.decrypted.allowed() {
+                self.say_withheld(p);
                 continue;
             }
             let Some(tx) = p.tx.lock().unwrap().clone() else {
@@ -777,6 +794,7 @@ mod tests {
         assert!(local_rx.try_recv().is_ok() && public_rx.try_recv().is_ok(), "a clear call goes to both");
         sh.dispatch(topic::CALL_CONCLUDED, &msg, true);
         sh.dispatch(topic::AUDIO, &msg, true);
+        sh.say_all_withheld(topic::CALL_CONCLUDED);
         assert!(local_rx.try_recv().is_ok() && local_rx.try_recv().is_ok(), "the plugin that was allowed gets the call and its audio");
         assert!(public_rx.try_recv().is_err(), "the public one gets neither");
         // It is told once, with how to allow it, never the key.

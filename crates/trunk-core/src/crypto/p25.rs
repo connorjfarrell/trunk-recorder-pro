@@ -138,7 +138,8 @@ fn ofb<C: BlockCipherEncrypt>(cipher: &C, iv: &[u8], out: &mut [u8]) {
 
 /// RC4: the stream after dropping the first `skip` outputs.
 fn rc4(key: &[u8], skip: usize, out: &mut [u8]) {
-    let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
+    // (The permutation is made from the key: wiped when dropped, as well as cleared below.)
+    let mut s: zeroize::Zeroizing<[u8; 256]> = zeroize::Zeroizing::new(std::array::from_fn(|i| i as u8));
     let mut j = 0u8;
     for i in 0..256 {
         j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);

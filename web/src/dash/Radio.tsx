@@ -106,7 +106,12 @@ function ActiveNow({ s, sys }: { s: AppState; sys: DashSystem }) {
           {calls.map((c) => (
             <li key={c.id}>
               <button className="linkish" onClick={() => setView("radio", sys.name, "tg", c.talkgroup)}>
-                <span className={`dot dot-${c.state}${c.decrypted ? " dot-dec" : c.encrypted ? " dot-enc" : ""}`} />
+                <span
+                  className={`dot dot-${c.state}${c.decrypted ? " dot-dec" : c.encrypted ? " dot-enc" : ""}`}
+                  role="img"
+                  aria-label={c.decrypted ? "decrypted" : c.encrypted ? "encrypted" : c.state}
+                  title={c.decrypted ? "decrypted" : c.encrypted ? "encrypted" : c.state}
+                />
                 <TgName r={{ tg: c.talkgroup, alphaTag: c.alphaTag }} />
               </button>
               <span className="row">

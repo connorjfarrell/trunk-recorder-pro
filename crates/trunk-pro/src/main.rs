@@ -240,7 +240,7 @@ usage:
   trunk-pro tool ekc <keys.ekc> [--password-file path]   (or TRUNK_EKC_PASSWORD)
   trunk-pro tool nxdnsynth <out.cu8> --center Hz [--kind conv|typeC|typeD] [--nxdn 48|96]
       A synthetic NXDN capture, for checking a setup.
-  trunk-pro tool p25synth <out.cu8> [--phase2 [--channel 0|1] [--nac N --sysid N --wacn N]] [--freq Hz --center Hz] [--algid N --kid N (--key hex | --ekc f --password-file f)] [--start header|ldu1|ldu2]
+  trunk-pro tool p25synth <out.cu8> [--phase2 [--channel 0|1] [--nac N --sysid N --wacn N]] [--freq Hz --center Hz] [--algid N --kid N (--key hex | --ekc f --password-file f)] [--join header|ldu1|ldu2]
       A synthetic P25 call (Phase 1, or Phase 2 with --phase2), encrypted if asked: for checking decryption end to end.
   trunk-pro tool snr <capture.cu8> --center Hz --rate Hz --freq Hz --kind dmr|p25|smartnet|p2 [--snr 40,20,…]
       Weak-signal curves: one channel decoded again with noise added.
