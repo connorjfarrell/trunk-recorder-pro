@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit reviews only when asked: comment `@coderabbitai review` on a pull request.
+language: "en-US"
+reviews:
+  profile: "assertive"
+  auto_review:
+    enabled: false
+  path_filters:
+    - "!**/Cargo.lock"
+    - "!web/package-lock.json"
+    - "!docs/api/protocol.schema.json"
+    - "!web/dist/**"
+  path_instructions:
+    - path: "crates/trunk-core/src/crypto/**"
+      instructions: |
+        Cryptography for P25 voice with operator-supplied keys (TIA-102.AAAD / AAAD-B: DES-OFB, AES-256,
+        and Motorola ADP/RC4). Check keystream construction, MI handling and key sizes. Key material must
+        stay in Zeroizing storage and never reach Debug, logs, errors, the API or the UI. This code
+        decrypts with known keys only; flag anything that would guess, recover or weaken a key.
+    - path: "crates/trunk-pro/src/{server,keystate,keyfiles}.rs"
+      instructions: |
+        The key unlock path. The interface has no login. Check that unlock/lock/reload and the key list
+        are limited to a direct loopback connection (or a private address only with keys.allowLanUnlock),
+        never through a proxy header; that the password is not logged, echoed or stored; the 1 s throttle;
+        the Origin check on the WebSocket; and the password-file permission check.
+    - path: "crates/trunk-pro/src/plugins/**"
+      instructions: |
+        Decrypted calls must never reach a plugin unless that plugin's own keys.shareDecrypted entry holds
+        the exact sentence. Look for any path that sends audio or call files to a plugin (live audio,
+        concluded calls, queues, the plugin-run tool, M4A encoding) without going through the guard.
+    - path: "crates/trunk-core/src/trunk/**"
+      instructions: |
+        Decrypting call recording for P25 Phase 1 and Phase 2 (late entry, held frames until the ESS /
+        next MI, call flags `encrypted` vs `decrypted`). Check that a decrypted call is never left marked
+        encrypted (its audio would be dropped when saved), and that clear and no-key behaviour is unchanged.
+    - path: "docs/**"
+      instructions: |
+        Documentation must not contain real keys, passwords, site names, hostnames, serials or addresses
+        of a live system; examples must be generic.
+chat:
+  auto_reply: true

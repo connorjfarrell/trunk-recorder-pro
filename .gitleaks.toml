@@ -1,0 +1,9 @@
+# gitleaks' default rules, plus an allowlist for the one fixture: a throwaway key container whose
+# password is written in the tests (crates/trunk-core/src/crypto/testdata). Nothing else.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "the throwaway test container and its password"
+paths = ['''crates/trunk-core/src/crypto/testdata/''']
+regexes = ['''testing1234''']

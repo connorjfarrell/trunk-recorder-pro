@@ -1,0 +1,51 @@
+# Checks for the decryption work: the tests, the browser (wasm32) build, the protocol schema, and a
+# scan of the whole history for secrets. Runs only on request: press "Run workflow" on the Actions
+# tab (any branch), or put the label `run-ci` on a pull request (take it off and put it on again to
+# run again). The repository's other workflows (build, docker) are unchanged.
+name: crypto-checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: web/package-lock.json }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - uses: Swatinem/rust-cache@v2
+      # trunk-pro embeds web/dist; the tests don't need the real interface.
+      - run: mkdir -p web/dist && [ -f web/dist/index.html ] || echo '<!doctype html>' > web/dist/index.html
+      - run: cargo test --workspace
+      # The core and app crates are the browser build's too.
+      - run: cargo check --target wasm32-unknown-unknown -p trunk-core -p trunk-app
+      # docs/api/protocol.schema.json must be regenerated when protocol.ts changes.
+      - run: npm ci && npm run schema -- --check
+        working-directory: web
+
+  secrets:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # Every commit, not just the final tree (the allowlist is .gitleaks.toml).
+      - name: gitleaks over the whole history
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect --source /repo --config /repo/.gitleaks.toml --redact --verbose
+      # Key containers, password files and captures belong outside the repository.
+      - name: no key containers, password files or captures
+        run: |
+          bad=$(git ls-files | grep -E '\.(ekc|pw|cu8|s16|cf32|sdr)$' | grep -v '^crates/trunk-core/src/crypto/testdata/dummy-test-keys\.ekc$' || true)
+          if [ -n "$bad" ]; then echo "::error::files that should not be committed:"; echo "$bad"; exit 1; fi
