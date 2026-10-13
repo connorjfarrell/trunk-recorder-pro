@@ -375,7 +375,8 @@ function take(m: FromRecorder): void {
       set({ heldKeys: m.keys, heldKeysRestricted: !!m.restricted });
       break;
     case "keysResult": {
-      const done = keysWaiting.shift();
+      const done = m.id === undefined ? undefined : keysWaiting.get(m.id);
+      if (m.id !== undefined) keysWaiting.delete(m.id);
       if (done) done(m);
       else if (!m.ok && m.message) set({ error: m.message });
       break;
@@ -493,18 +494,18 @@ export function useTopic(topic: string | null): void {
 
 // ── decryption keys ──────────────────────────────────────────────────────────
 
-const keysWaiting: ((r: { ok: boolean; message: string | null }) => void)[] = [];
+type KeysAnswer = { ok: boolean; message: string | null };
+const keysWaiting = new Map<number, (r: KeysAnswer) => void>();
+let nextKeysId = 1;
 
-function keysCommand(msg: ToRecorder): Promise<{ ok: boolean; message: string | null }> {
+function keysCommand(msg: { type: "keysUnlock"; password: string } | { type: "keysLock" } | { type: "keysReload" }): Promise<KeysAnswer> {
   return new Promise((resolve) => {
-    keysWaiting.push(resolve);
-    transport.send(msg);
+    // (Answers are matched by id: one that comes after its timeout is not taken for the next command's.)
+    const id = nextKeysId++;
+    keysWaiting.set(id, resolve);
+    transport.send({ ...msg, id });
     setTimeout(() => {
-      const k = keysWaiting.indexOf(resolve);
-      if (k >= 0) {
-        keysWaiting.splice(k, 1);
-        resolve({ ok: false, message: "No answer from the recorder." });
-      }
+      if (keysWaiting.delete(id)) resolve({ ok: false, message: "No answer from the recorder." });
     }, 20_000);
   });
 }

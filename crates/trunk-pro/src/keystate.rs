@@ -99,7 +99,8 @@ impl KeyState {
         Ok(loaded.notes)
     }
 
-    /// Forget what is held (a password file's keys come back at the next refresh).
+    /// Forget what is held (a password file's keys come back at the next refresh). Calls already
+    /// being decrypted keep the keys they began with; they are wiped when those calls end.
     pub fn lock(&self) {
         let mut g = self.0.lock().unwrap();
         if g.store.take().is_some() {

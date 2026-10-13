@@ -770,6 +770,15 @@ fn keys_command(ctx: &Arc<Ctx>, kind: &str, password: &str) -> Result<(), String
     Ok(())
 }
 
+/// The answer to a keys command `v`, carrying its `id` when it had one.
+pub(crate) fn keys_result(v: &Value, result: Result<(), String>) -> Value {
+    let mut r = json!({ "type": "keysResult", "ok": result.is_ok(), "message": result.err() });
+    if v["id"].is_number() {
+        r["id"] = v["id"].clone();
+    }
+    r
+}
+
 /// What is held changed: the running session uses it from the next call, and browsers are told.
 pub(crate) fn keys_changed(ctx: &Ctx, settings: &trunk_app::config::KeysSettings) {
     if ctx.runner.lock().unwrap().is_some() {
@@ -960,14 +969,14 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
         "keysUnlock" | "keysLock" | "keysReload" => {
             let kind = v["type"].as_str().unwrap_or("");
             if !local {
-                return Some(json!({ "type": "keysResult", "ok": false, "message": "Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, or use a password file)." }));
+                return Some(keys_result(v, Err("Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, or use a password file).".into())));
             }
             // (Held apart from the message, and wiped when done.)
             let password = zeroize::Zeroizing::new(v["password"].as_str().unwrap_or("").to_string());
             let ctx2 = ctx.clone();
             let kind = kind.to_string();
             let result = tokio::task::spawn_blocking(move || keys_command(&ctx2, &kind, &password)).await.unwrap_or_else(|_| Err("internal error".into()));
-            Some(json!({ "type": "keysResult", "ok": result.is_ok(), "message": result.err() }))
+            Some(keys_result(v, result))
         }
         "quit" => {
             let ctx2 = ctx.clone();

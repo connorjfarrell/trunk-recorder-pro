@@ -6,7 +6,8 @@
 //! --nac N --sysid N --wacn N`). With `--algid` its voice is
 //! encrypted: under `--key`, or the key the container holds for that algorithm and key id, so
 //! a capture made from a container is decrypted by the same container. Its voice is a test
-//! pattern, not speech. For checking a setup end to end (`replay --p25 <freq> --ekc …`), or
+//! pattern, not speech. `--key` puts a key on the command line (visible to other users of the
+//! computer): for test keys; a real key comes from `--ekc`. For checking a setup end to end (`replay --p25 <freq> --ekc …`), or
 //! another decoder against this one.
 
 use std::io::{BufWriter, Write};
@@ -57,7 +58,7 @@ pub fn run(a: &Args) {
         }
         let mut m = [0u8; 9];
         m[..8].copy_from_slice(&mi);
-        Crypt { algid, kid, key, mi: m }
+        Crypt { algid, kid, key: zeroize::Zeroizing::new(key), mi: m }
     });
     if a.flag("phase2") {
         return run_phase2(a, path, center, freq, fs, start, crypt);
@@ -68,36 +69,16 @@ pub fn run(a: &Args) {
     // 120 ms of alternating outer symbols (a key-up), the call, then silence for the call to end.
     let mut dibits: Vec<u8> = (0..576).map(|i| if i % 2 == 0 { 0b01 } else { 0b11 }).collect();
     dibits.extend(frames.into_iter().flatten());
-    let mut seed = 0x2545_f491_4f6c_dd1du64;
-    let mut noise = |n: usize| -> Vec<Complex32> {
-        (0..n)
-            .map(|_| {
-                let mut u = || {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-                };
-                let (x, y) = (u(), u());
-                let r = (-2.0 * x.ln()).sqrt() * 0.01;
-                let t = 2.0 * std::f64::consts::PI * y;
-                Complex32::new((r * t.cos()) as f32, (r * t.sin()) as f32)
-            })
-            .collect()
-    };
-    let mut iq = noise((fs * 0.5) as usize);
+    let mut noise = Noise::new();
+    let mut iq = noise.take((fs * 0.5) as usize);
     let mut phase = 0.0;
     let mut tx = modulate(&dibits, fs, freq - center, 0.25, &mut phase);
-    for (t, n) in tx.iter_mut().zip(noise(dibits.len() * (fs / 4800.0) as usize + 1)) {
+    for (t, n) in tx.iter_mut().zip(noise.take(dibits.len() * (fs / 4800.0) as usize + 1)) {
         *t += n;
     }
     iq.extend(tx);
-    iq.extend(noise((fs * 2.5) as usize));
-    let mut w = BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| die(&format!("{path}: {e}"))));
-    for v in &iq {
-        w.write_all(&[(v.re * 127.5 + 127.5).clamp(0.0, 255.0) as u8, (v.im * 127.5 + 127.5).clamp(0.0, 255.0) as u8]).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-    }
-    w.flush().unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    iq.extend(noise.take((fs * 2.5) as usize));
+    write_cu8(path, &iq);
     eprintln!(
         "{path}: {:.1} s at {fs} S/s, centre {center} Hz; channel {freq} Hz, NAC {:#x}, talkgroup {}, {} superframes{}",
         iq.len() as f64 / fs,
@@ -106,6 +87,42 @@ pub fn run(a: &Args) {
         call.superframes,
         call.crypt.as_ref().map_or(String::new(), |c| format!(", encrypted: algorithm {:#04x}, key id {}", c.algid, c.kid))
     );
+}
+
+/// Gaussian noise (σ 0.01 per axis), the same sequence every run.
+struct Noise(u64);
+
+impl Noise {
+    fn new() -> Self {
+        Noise(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn uniform(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    fn take(&mut self, n: usize) -> Vec<Complex32> {
+        (0..n)
+            .map(|_| {
+                let (x, y) = (self.uniform(), self.uniform());
+                let r = (-2.0 * x.ln()).sqrt() * 0.01;
+                let t = 2.0 * std::f64::consts::PI * y;
+                Complex32::new((r * t.cos()) as f32, (r * t.sin()) as f32)
+            })
+            .collect()
+    }
+}
+
+/// Write `iq` as rtl_sdr's unsigned 8-bit I/Q.
+fn write_cu8(path: &str, iq: &[Complex32]) {
+    let mut w = BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| die(&format!("{path}: {e}"))));
+    for v in iq {
+        w.write_all(&[(v.re * 127.5 + 127.5).clamp(0.0, 255.0) as u8, (v.im * 127.5 + 127.5).clamp(0.0, 255.0) as u8]).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    }
+    w.flush().unwrap_or_else(|e| die(&format!("{path}: {e}")));
 }
 
 fn run_phase2(a: &Args, path: &str, center: f64, freq: f64, fs: f64, start: Start, crypt: Option<Crypt>) {
@@ -120,43 +137,26 @@ fn run_phase2(a: &Args, path: &str, center: f64, freq: f64, fs: f64, start: Star
         source: a.num("src", 4_567_890.0) as u32,
         crypt,
         superframes: a.num("superframes", 5.0) as usize,
-        channel: a.num("channel", 0.0) as usize & 1,
+        channel: match a.num("channel", 0.0) {
+            c if c == 0.0 || c == 1.0 => c as usize,
+            _ => die("--channel: 0 or 1"),
+        },
         start,
     };
     if (fs / 6000.0).fract() != 0.0 {
         die("--rate: a whole number of samples per symbol at 6000 baud (a multiple of 6000)");
     }
     let dibits = call.dibits(ambe).unwrap_or_else(|e| die(&format!("{e}")));
-    let mut seed = 0x2545_f491_4f6c_dd1du64;
-    let mut noise = |n: usize| -> Vec<Complex32> {
-        (0..n)
-            .map(|_| {
-                let mut u = || {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-                };
-                let (x, y) = (u(), u());
-                let r = (-2.0 * x.ln()).sqrt() * 0.01;
-                let t = 2.0 * std::f64::consts::PI * y;
-                Complex32::new((r * t.cos()) as f32, (r * t.sin()) as f32)
-            })
-            .collect()
-    };
-    let mut iq = noise((fs * 0.3) as usize);
+    let mut noise = Noise::new();
+    let mut iq = noise.take((fs * 0.3) as usize);
     let mut phase = 0.0;
     let mut tx = modulate(&dibits, fs, freq - center, 0.25, &mut phase);
-    for (t, n) in tx.iter_mut().zip(noise(tx_len(&dibits, fs))) {
+    for (t, n) in tx.iter_mut().zip(noise.take(tx_len(&dibits, fs))) {
         *t += n;
     }
     iq.extend(tx);
-    iq.extend(noise((fs * 0.5) as usize));
-    let mut w = BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| die(&format!("{path}: {e}"))));
-    for v in &iq {
-        w.write_all(&[(v.re * 127.5 + 127.5).clamp(0.0, 255.0) as u8, (v.im * 127.5 + 127.5).clamp(0.0, 255.0) as u8]).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-    }
-    w.flush().unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    iq.extend(noise.take((fs * 0.5) as usize));
+    write_cu8(path, &iq);
     eprintln!(
         "{path}: {:.1} s at {fs} S/s, centre {center} Hz; Phase 2 channel {freq} Hz, logical channel {}, NAC {:#x}, system {:#x}, WACN {:#x}, talkgroup {}, {} superframes{}",
         iq.len() as f64 / fs,

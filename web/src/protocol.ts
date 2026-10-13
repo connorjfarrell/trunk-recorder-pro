@@ -1204,8 +1204,8 @@ export type FromRecorder =
   | ({ type: "keys" } & KeysStatus)
   /** Answers keysQuery: the keys held by algorithm, key id and name (never the keys), to a connection from the recorder's own computer only; `restricted` otherwise. */
   | { type: "keysList"; version: number; keys: HeldKey[]; restricted?: boolean }
-  /** Answers keysUnlock / keysLock / keysReload. */
-  | { type: "keysResult"; ok: boolean; message: string | null }
+  /** Answers keysUnlock / keysLock / keysReload, with the `id` the command carried. */
+  | { type: "keysResult"; id?: number; ok: boolean; message: string | null }
   | ({ type: "state" } & PhaseState)
   | { type: "config"; config: Config }
   | { type: "status"; status: EngineStatus; sources: SourceStatus[]; load: number; calls: CallView[] }
@@ -1274,11 +1274,11 @@ export type ToRecorder =
   /** The keys held, as a keysList (answered in full only to the recorder's own computer). */
   | { type: "keysQuery" }
   /** Open the config's key container with its password. Only from the recorder's own computer (not over a network or a proxy); the password is neither stored nor sent back. */
-  | { type: "keysUnlock"; password: string }
+  | { type: "keysUnlock"; password: string; id?: number }
   /** Forget the keys held (a password file's come back when recording starts or on keysReload). Own computer only. */
-  | { type: "keysLock" }
+  | { type: "keysLock"; id?: number }
   /** Read the files the config names again. Own computer only. */
-  | { type: "keysReload" }
+  | { type: "keysReload"; id?: number }
   | { type: "plugins" }
   /** A plugin executable on the recorder's computer (a build of the user's own); it's added to the config. */
   | { type: "addPlugin"; path: string }

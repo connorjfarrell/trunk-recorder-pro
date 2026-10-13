@@ -129,7 +129,7 @@ pub struct Args {
 /// any option, these included (`--start=0`).
 const FLAGS: &[&str] = &[
     "analog-default", "auto-tune", "bursts", "capture-frames", "diversity", "dmr-trunk", "frames", "full", "hard-fec", "keep-silent", "messages", "no-gain", "no-open",
-    "no-unknown", "osw", "quality", "quiet", "record-encrypted", "s16", "separation", "start",
+    "no-unknown", "osw", "phase2", "quality", "quiet", "record-encrypted", "s16", "separation", "start",
 ];
 
 impl Args {

@@ -1557,6 +1557,9 @@
               "type": "string",
               "const": "keysResult"
             },
+            "id": {
+              "type": "number"
+            },
             "ok": {
               "type": "boolean"
             },
@@ -6386,6 +6389,9 @@
             },
             "password": {
               "type": "string"
+            },
+            "id": {
+              "type": "number"
             }
           },
           "required": [
@@ -6400,6 +6406,9 @@
             "type": {
               "type": "string",
               "const": "keysLock"
+            },
+            "id": {
+              "type": "number"
             }
           },
           "required": [
@@ -6413,6 +6422,9 @@
             "type": {
               "type": "string",
               "const": "keysReload"
+            },
+            "id": {
+              "type": "number"
             }
           },
           "required": [

@@ -173,8 +173,7 @@ pub fn golay23_decode_soft(r: u32, w: &[f32]) -> Fec {
     Fec { data: best_cw >> 11, errs: ((best_cw ^ r) & 0x7fffff).count_ones() as i32, cost: best }
 }
 
-/// op25_hamming.h hmg1063EncTbl / hmg1063Dec: the corrected 6-bit hexbit.
-/// Hamming(10,6,3): the 4 parity bits of 6 data bits.
+/// Hamming(10,6,3): the 4 parity bits of 6 data bits (op25_hamming.h hmg1063EncTbl).
 pub fn hamming1063_parity(data6: u32) -> u8 {
     const ENC: [u8; 64] = [
         0, 12, 3, 15, 7, 11, 4, 8, 11, 7, 8, 4, 12, 0, 15, 3, 13, 1, 14, 2, 10, 6, 9, 5, 6, 10, 5, 9, 1, 13, 2, 14, 14, 2, 13, 1, 9, 5, 10,
@@ -183,6 +182,7 @@ pub fn hamming1063_parity(data6: u32) -> u8 {
     ENC[(data6 & 63) as usize]
 }
 
+/// op25_hamming.h hmg1063Dec: the corrected 6-bit hexbit.
 pub fn hamming1063_decode(data6: u32, parity4: u32) -> u8 {
     const DEC: [u8; 16] = [0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 8, 1, 16, 32, 0];
     ((data6 as u8) ^ DEC[(hamming1063_parity(data6) ^ (parity4 & 15) as u8) as usize]) & 63

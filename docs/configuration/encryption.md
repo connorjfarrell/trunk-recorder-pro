@@ -64,7 +64,9 @@ stopping and starting recording keeps it. After a restart you unlock again.
 - Tries are a second apart, and a wrong password changes nothing.
 - Any browser is told whether keys are held and how many; only a browser on the recorder's own
   computer is told which (cipher, key id and name, never the keys).
-- Keys unlocked while recording is on are used for calls that start afterwards.
+- Keys unlocked while recording is on are used for calls that start afterwards. **Lock** likewise
+  takes effect for calls that start afterwards: a call already being decrypted finishes with the
+  keys it began with (they are wiped from memory when it ends).
 
 - **The password file must be readable by you alone** on Linux and macOS: no access for group or
   others (`600` is usual). A file others can read is refused, and the log tells you to `chmod 600`
@@ -97,8 +99,9 @@ holds (algorithm, key id, name), to check it.
   works out the call's cipher state from the next encryption sync, and the first 180 ms of such a call
   are held until it has. A Phase 2 call joined without its start learns its cipher at the end of the
   first superframe it sees (its ESS); with keys loaded the voice until then is held, so a call
-  joined at a superframe's start loses nothing, and one joined part-way through loses that
-  first partial superframe (up to 360 ms).
+  joined at a superframe's start loses nothing, and an encrypted one joined part-way through loses
+  that first partial superframe (up to 360 ms; it can't be decrypted without the message
+  indicator). A clear call is held the same way but its held voice is played, a little late.
 - **Wrong keys give noise.** P25 voice has no check that a key is right, so a call whose key id is
   loaded with the wrong key sounds like static, as it does in a real radio.
 - While keys are loaded, a call flagged encrypted is recorded from its grant (the grant doesn't say
@@ -122,11 +125,11 @@ trunk-pro replay call.cu8 --center 155150000 --rate 2400000 --p25 155200000 \
 The call is a test pattern, not speech, so it shows the path works (the receiver, your keys, the
 cipher, saving), not what a real system sounds like. Without `--ekc` on the `replay` the same file
 writes no call. `--start ldu1` or `ldu2` joins the call part-way, and `--key <hex>` gives a key
-directly.
+directly (it shows in the process list: for test keys only).
 
 `--phase2` makes a Phase 2 call instead (one logical channel of a TDMA voice channel, `--channel 0`
 or `1`, scrambled for `--nac`, `--sysid` and `--wacn`). Phase 2 voice needs its system's control
-channel for those numbers, so `replay` can't play it alone; `trunk-pro tool p2 call.cu8 --nac …
---sysid … --wacn …` decodes it, and it is IQ for any other decoder to try (DSD-FME, op25) with the
+channel for those numbers, so `replay` can't play it alone; `trunk-pro tool p2 call.cu8 --center 155150000 --freq 155200000 --rate 2400000 --nac …
+--sysid … --wacn …` (the generator's own defaults) decodes it, and it is IQ for any other decoder to try (DSD-FME, op25) with the
 same key.
 

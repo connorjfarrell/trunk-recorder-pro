@@ -149,14 +149,20 @@ pub fn tdu(nac: u16) -> Vec<u8> {
     dibits_of(&blank(nac, TDU))
 }
 
-/// How a call is encrypted.
-#[derive(Clone, Debug)]
+/// How a call is encrypted. The key is wiped when dropped and never printed.
+#[derive(Clone)]
 pub struct Crypt {
     pub algid: u8,
     pub kid: u16,
-    pub key: Vec<u8>,
+    pub key: zeroize::Zeroizing<Vec<u8>>,
     /// The first superframe's MI (the header's).
     pub mi: [u8; 9],
+}
+
+impl std::fmt::Debug for Crypt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Crypt {{ algid: {:#04x}, kid: {}, {} key bytes }}", self.algid, self.kid, self.key.len())
+    }
 }
 
 /// Where a receiver "joins" a call: what of its start is not sent.
@@ -284,7 +290,7 @@ mod tests {
     const MI: [u8; 9] = [0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0];
 
     fn call(crypt: bool, start: Start) -> Call {
-        Call { nac: 0x293, tgid: 1001, source: 4_567_890, crypt: crypt.then(|| Crypt { algid: 0x81, kid: 7, key: KEY.to_vec(), mi: MI }), superframes: 3, start }
+        Call { nac: 0x293, tgid: 1001, source: 4_567_890, crypt: crypt.then(|| Crypt { algid: 0x81, kid: 7, key: zeroize::Zeroizing::new(KEY.to_vec()), mi: MI }), superframes: 3, start }
     }
 
     /// What goes in comes out: every field of every frame, read back by the real decoders.
@@ -355,7 +361,7 @@ mod tests {
     #[test]
     fn a_key_of_the_wrong_size_is_an_error() {
         let mut c = call(true, Start::Header);
-        c.crypt.as_mut().unwrap().key = vec![0; 5];
+        c.crypt.as_mut().unwrap().key = zeroize::Zeroizing::new(vec![0; 5]);
         assert!(c.frames(imbe).is_err());
     }
 }

@@ -493,6 +493,7 @@ fn the_keys_messages() {
         json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }),
         json!({ "type": "keysResult", "ok": false, "message": "Wait a moment before trying again." }),
         json!({ "type": "keysResult", "ok": true, "message": null }),
+        crate::server::keys_result(&json!({ "type": "keysLock", "id": 4 }), Ok(())),
     ];
     check_all("FromRecorder", &msgs);
 }
@@ -507,7 +508,7 @@ fn messages_to_the_recorder() {
         json!({ "type": "listen", "on": true, "system": null, "talkgroup": 101 }),
         json!({ "type": "listDir", "path": "" }),
         json!({ "type": "keysQuery" }),
-        json!({ "type": "keysUnlock", "password": "p" }),
+        json!({ "type": "keysUnlock", "password": "p", "id": 1 }),
         json!({ "type": "keysLock" }),
         json!({ "type": "keysReload" }),
         json!({ "type": "surveyStart", "source": 0, "bands": ["800"], "findGain": true }),

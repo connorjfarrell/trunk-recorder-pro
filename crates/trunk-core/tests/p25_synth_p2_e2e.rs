@@ -27,7 +27,7 @@ fn call(crypt: Option<(u8, u16, &[u8])>, start: Start, channel: usize) -> Call {
         wacn: SYSTEM.2,
         tgid: 1001,
         source: 4_567_890,
-        crypt: crypt.map(|(algid, kid, key)| Crypt { algid, kid, key: key.to_vec(), mi: MI }),
+        crypt: crypt.map(|(algid, kid, key)| Crypt { algid, kid, key: zeroize::Zeroizing::new(key.to_vec()), mi: MI }),
         superframes: SUPERFRAMES,
         channel,
         start,

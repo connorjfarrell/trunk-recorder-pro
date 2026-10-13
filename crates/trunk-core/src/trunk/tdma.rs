@@ -493,4 +493,45 @@ mod tests {
         assert_eq!(audio(&out)[0][..], clear(3)[..]);
         assert!(events(&out).is_empty());
     }
+
+    /// What the engine makes of a decrypted call's outputs, superframe after superframe: the
+    /// transmission is never left marked encrypted, which would drop its audio when saved.
+    #[test]
+    fn a_decrypted_call_is_never_left_marked_encrypted() {
+        use crate::trunk::record::Transmissions;
+        let mut s = slot(true);
+        s.crypto.as_mut().unwrap().dec.header(&es(MI, 7));
+        let mut tx = Transmissions::default();
+        let (mut out, mut mi, mut t, mut samples) = (Vec::new(), MI, 0.0, 0usize);
+        // The PTT says the call is encrypted.
+        out.push((0, TrackerOut::Info { source: Some(5), emergency: false, encrypted: true }));
+        for sf in 0..4 {
+            for n in 0..18 {
+                if n == 16 {
+                    s.crypto.as_mut().unwrap().dec.sync(&es(next_mi(&mi), 7));
+                }
+                s.voice_frame(0, Some(n), sent(&mi, n), &mut out);
+                for (_, o) in out.drain(..).collect::<Vec<_>>() {
+                    match o {
+                        TrackerOut::Info { encrypted: true, .. } => tx.mark_encrypted(t),
+                        TrackerOut::Crypto { decrypted: true, .. } => tx.mark_decrypted(t),
+                        TrackerOut::Audio(a, _) => {
+                            tx.note(samples, t);
+                            samples += a.len();
+                        }
+                        _ => {}
+                    }
+                }
+                t += 0.02;
+            }
+            // The superframe's end, as the tracker does it.
+            TdmaTracker::set_encryption(&mut s, 0, ALGID_DES_OFB, &mut out);
+            assert!(out.is_empty(), "superframe {sf}: an encrypted call is not announced again");
+            s.crypto.as_mut().unwrap().dec.superframe_done();
+            mi = next_mi(&mi);
+        }
+        assert!(samples > 0);
+        assert!(!tx.current_encrypted());
+        assert_eq!(tx.kept(samples, 0.0, 8000), None, "nothing of it is left out");
+    }
 }
