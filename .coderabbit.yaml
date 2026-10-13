@@ -33,6 +33,13 @@ reviews:
         Decrypting call recording for P25 Phase 1 and Phase 2 (late entry, held frames until the ESS /
         next MI, call flags `encrypted` vs `decrypted`). Check that a decrypted call is never left marked
         encrypted (its audio would be dropped when saved), and that clear and no-key behaviour is unchanged.
+    - path: "**"
+      instructions: |
+        Flag anything that looks like it came from a live radio system: system, site, NAC, WACN or system
+        IDs, talkgroup numbers or names for a real system, radio (unit) IDs and their aliases, key IDs,
+        SLNs, frequencies of a real system, recorder log excerpts, hostnames, addresses, serial numbers,
+        file paths of a real machine, or key material. Test and documentation values must be invented or
+        published test vectors from a standard.
     - path: "docs/**"
       instructions: |
         Documentation must not contain real keys, passwords, site names, hostnames, serials or addresses

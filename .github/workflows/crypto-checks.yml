@@ -1,5 +1,5 @@
 # Checks for the decryption work: the tests, the browser (wasm32) build, the protocol schema, and a
-# scan of the whole history for secrets. Runs only on request: press "Run workflow" on the Actions
+# scan of the whole history for secrets and live-system data. Runs only on request: press "Run workflow" on the Actions
 # tab (any branch), or put the label `run-ci` on a pull request (take it off and put it on again to
 # run again). The repository's other workflows (build, docker) are unchanged.
 name: crypto-checks
@@ -49,3 +49,12 @@ jobs:
         run: |
           bad=$(git ls-files | grep -E '\.(ekc|pw|cu8|s16|cf32|sdr)$' | grep -v '^crates/trunk-core/src/crypto/testdata/dummy-test-keys\.ekc$' || true)
           if [ -n "$bad" ]; then echo "::error::files that should not be committed:"; echo "$bad"; exit 1; fi
+      # Nothing from a live system: system / radio / talkgroup ids, aliases, keys, addresses, log lines
+      # and call records (scripts/check-live-data.sh). Your own terms (system names, NAC / WACN /
+      # system ids, key ids, talkgroup names, radio ids, aliases, hostnames, serials) go in the
+      # repository secret LIVE_DATA_DENYLIST, one per line (`re:<regex>` for a pattern), so that the
+      # list of what mustn't be here isn't itself here. Without it only the general checks run.
+      - name: no live-system data (general checks and your denylist)
+        env:
+          LIVE_DATA_DENYLIST: ${{ secrets.LIVE_DATA_DENYLIST }}
+        run: ./scripts/check-live-data.sh

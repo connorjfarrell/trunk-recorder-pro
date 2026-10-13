@@ -86,6 +86,30 @@ cargo install wasm-bindgen-cli --version 0.2.129 --locked
 WebAssembly engine (`web/src/web/pkg`) has been built; `npx vite build` builds
 the interface alone.
 
+## Keeping live-system data out
+
+Test fixtures and docs use invented values or the standards' published test vectors, never anything
+from a real radio system: no real system, site, NAC / WACN / system id, talkgroup, radio id or alias,
+key or key id, frequency list, hostname, address, serial number or log excerpt, and no key
+container, password file, recording or capture.
+
+`scripts/check-live-data.sh` checks what a branch **added** (every commit, not just the final files)
+for those: key containers and recordings among the tracked files, call records, talkgroup and unit
+lists, configs naming real channels, key-length hex strings, private addresses, home-directory paths
+and recorder log lines. Run it before pushing:
+
+```bash
+scripts/check-live-data.sh                       # origin/main..HEAD
+scripts/check-live-data.sh --denylist ~/denylist.txt
+```
+
+Your own terms (the system's name, NAC, key ids, talkgroup names, radio ids, aliases, hostnames,
+serials) go in a **denylist file kept outside the repository**, one per line (`re:<regex>` for a
+pattern, `#` for a comment); a match is reported by file and entry number, never the term. CI reads
+the same lines from the repository secret `LIVE_DATA_DENYLIST` (workflow `crypto-checks`, run on
+request). Public test vectors and documentation addresses the general checks would flag are listed in
+`.live-data-allow`, and nothing from a real system belongs there.
+
 ## Code layout
 
 ```
