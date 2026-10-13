@@ -1169,7 +1169,7 @@ mod tests {
         use std::net::SocketAddr;
         let peer = |a: &str| a.parse::<SocketAddr>().unwrap();
         let none = HeaderMap::new();
-        for a in ["192.168.1.20:5000", "10.1.2.3:5000", "172.29.0.7:5000", "169.254.1.1:5000", "[fd00::5]:5000", "[fe80::1]:5000"] {
+        for a in ["192.168.1.20:5000", "10.1.2.3:5000", "172.20.5.7:5000", "169.254.1.1:5000", "[fd00::5]:5000", "[fe80::1]:5000"] {
             assert!(is_local(&peer(a), &none, true), "{a}");
             assert!(!is_local(&peer(a), &none, false), "{a}");
         }
