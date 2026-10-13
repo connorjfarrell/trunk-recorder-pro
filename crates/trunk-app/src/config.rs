@@ -1028,6 +1028,11 @@ pub struct KeysSettings {
     /// crosses the network unencrypted. Config file only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_lan_unlock: bool,
+    /// Plugins that send somewhere outside this network may be given decrypted calls only
+    /// when their entry here (the plugin's id) holds the sentence the documentation gives.
+    /// Config file only; plugins that send only to this network need no entry.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub share_decrypted: BTreeMap<String, String>,
     /// Keys this version doesn't know (a newer version's, a hand edit's):
     /// kept, and saved back as they were.
     #[serde(flatten)]
@@ -1037,7 +1042,7 @@ pub struct KeysSettings {
 impl KeysSettings {
     /// Nothing set: how a config with no `keys` section reads.
     pub fn is_unset(&self) -> bool {
-        self.ekc_file.trim().is_empty() && self.password_file.trim().is_empty() && !self.allow_lan_unlock && self.other.is_empty()
+        self.ekc_file.trim().is_empty() && self.password_file.trim().is_empty() && !self.allow_lan_unlock && self.share_decrypted.is_empty() && self.other.is_empty()
     }
 }
 

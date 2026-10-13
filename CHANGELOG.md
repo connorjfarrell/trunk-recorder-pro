@@ -15,7 +15,9 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   `decrypted`, `alg_id` and `key_id` (`encrypted` still means encrypted on the
   air). Leave the password file out and unlock the container by typing its
   password in Setup (only from the recorder's own computer); the dashboard marks
-  decrypted calls, and they play. See [Encryption keys](docs/configuration/encryption.md).
+  decrypted calls, and they play. Decrypted calls (and their live audio) are not given to a plugin
+  that sends outside your own network unless `keys.shareDecrypted` says, in so many words, that it
+  may; plugins on your LAN get them. See [Encryption keys](docs/configuration/encryption.md).
 
 - **NXDN talker aliases:** Kenwood radios' programmed names are read from the
   traffic channel and shown as each radio's name (`tag_ota`, the Calls page,

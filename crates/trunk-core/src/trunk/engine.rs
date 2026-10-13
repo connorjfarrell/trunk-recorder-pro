@@ -234,7 +234,8 @@ pub enum Event {
     CallUpdate(Call),
     CallEnd(Call),
     /// Live audio for a recording call.
-    Audio { call_id: CallId, system: u16, talkgroup: u32, samples: Vec<f32> },
+    /// `decrypted`: the call is encrypted on the air, so this audio is of a cipher we hold the key for.
+    Audio { call_id: CallId, system: u16, talkgroup: u32, samples: Vec<f32>, decrypted: bool },
     /// System `system` heard a radio's talker alias it didn't know (or knew by another name).
     UnitAlias { system: u16, unit: u32, alias: String, talkgroup: u32 },
     Concluded(Concluded),
@@ -1472,7 +1473,7 @@ impl Engine {
             match o {
                 ConvOut::Start(c) => self.events.push(Event::CallStart(c)),
                 ConvOut::Update(c) => self.events.push(Event::CallUpdate(c)),
-                ConvOut::Audio { call_id, system, talkgroup, samples } => self.events.push(Event::Audio { call_id, system, talkgroup, samples }),
+                ConvOut::Audio { call_id, system, talkgroup, samples, decrypted } => self.events.push(Event::Audio { call_id, system, talkgroup, samples, decrypted }),
                 ConvOut::End { call, audio, frames, recorder_num, tx, reception } => {
                     self.write_call(Held { call: call.clone(), audio, frames, recorder_num, tx, reception, freq_error_hz: None });
                     self.events.push(Event::CallEnd(call));
@@ -1522,9 +1523,9 @@ impl Engine {
                     rec.audio.extend_from_slice(&samples);
                     rec.frames.push(frame);
                     t.calls.note_audio(id, t.now_s);
-                    let tg = t.calls.calls.iter().find(|c| c.id == id).map_or(0, |c| c.talkgroup);
+                    let (tg, decrypted) = t.calls.calls.iter().find(|c| c.id == id).map_or((0, false), |c| (c.talkgroup, c.encrypted || c.decrypted));
                     if self.multisite.audio_lead(id, t.now_s) {
-                        self.events.push(Event::Audio { call_id: id, system: sys, talkgroup: tg, samples });
+                        self.events.push(Event::Audio { call_id: id, system: sys, talkgroup: tg, samples, decrypted });
                     }
                 }
                 TrackerOut::AnalogAudio(samples) => {
@@ -1534,7 +1535,7 @@ impl Engine {
                     t.calls.note_audio(id, t.now_s);
                     let tg = t.calls.calls.iter().find(|c| c.id == id).map_or(0, |c| c.talkgroup);
                     if self.multisite.audio_lead(id, t.now_s) {
-                        self.events.push(Event::Audio { call_id: id, system: sys, talkgroup: tg, samples });
+                        self.events.push(Event::Audio { call_id: id, system: sys, talkgroup: tg, samples, decrypted: false });
                     }
                 }
                 TrackerOut::Info { source, emergency, encrypted } => {

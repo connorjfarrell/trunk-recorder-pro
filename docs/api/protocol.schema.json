@@ -3020,6 +3020,13 @@
         "allowLanUnlock": {
           "type": "boolean",
           "description": "Config file only: let a private-network address unlock the keys (plain HTTP: the password is not encrypted on the way)."
+        },
+        "shareDecrypted": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Config file only: plugin id → the sentence (docs/configuration/encryption.md) that lets a plugin sending outside this network be given decrypted calls."
         }
       },
       "required": [
