@@ -320,6 +320,8 @@ export interface KeysSettings {
   ekcFile: string;
   /** A file holding the container's password on its first line (mode 600). */
   passwordFile: string;
+  /** Config file only: let a private-network address unlock the keys (plain HTTP: the password is not encrypted on the way). */
+  allowLanUnlock?: boolean;
 }
 
 /** The decryption keys: whether any are held and how they came, for any browser. */

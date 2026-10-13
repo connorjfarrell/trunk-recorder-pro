@@ -1022,6 +1022,12 @@ pub struct KeysSettings {
     /// relative to the config file's folder. On Linux and macOS it must be
     /// readable by its owner alone (mode 600).
     pub password_file: String,
+    /// Allow unlocking the container (typing its password into Setup) from a
+    /// private-network address, not only from the computer itself. Off by
+    /// default: the interface is plain HTTP with no login, so the password
+    /// crosses the network unencrypted. Config file only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_lan_unlock: bool,
     /// Keys this version doesn't know (a newer version's, a hand edit's):
     /// kept, and saved back as they were.
     #[serde(flatten)]
@@ -1031,7 +1037,7 @@ pub struct KeysSettings {
 impl KeysSettings {
     /// Nothing set: how a config with no `keys` section reads.
     pub fn is_unset(&self) -> bool {
-        self.ekc_file.trim().is_empty() && self.password_file.trim().is_empty() && self.other.is_empty()
+        self.ekc_file.trim().is_empty() && self.password_file.trim().is_empty() && !self.allow_lan_unlock && self.other.is_empty()
     }
 }
 
