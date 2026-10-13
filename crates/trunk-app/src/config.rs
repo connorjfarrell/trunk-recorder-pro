@@ -1028,9 +1028,8 @@ pub struct KeysSettings {
     /// crosses the network unencrypted. Config file only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_lan_unlock: bool,
-    /// Plugins that send somewhere outside this network may be given decrypted calls only
-    /// when their entry here (the plugin's id) holds the sentence the documentation gives.
-    /// Config file only; plugins that send only to this network need no entry.
+    /// Plugin id → the sentence the documentation gives, which lets that plugin be given
+    /// decrypted calls. No plugin is, by default. Config file only.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub share_decrypted: BTreeMap<String, String>,
     /// Keys this version doesn't know (a newer version's, a hand edit's):

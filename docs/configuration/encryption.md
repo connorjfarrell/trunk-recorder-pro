@@ -46,7 +46,7 @@ Then add a `keys` section to the config:
 |---|:---:|---|
 | `ekcFile` | to decrypt | The container: absolute, or relative to the config file's folder |
 | `allowLanUnlock` | optional | `true` lets a browser on a private-network address (not only this computer) unlock the container in Setup. Off by default, and set in the config file only: the interface is plain HTTP with no login, so the password crosses the network unencrypted and anyone on that network can try to unlock. Never through a reverse proxy, and never from a public address |
-| `shareDecrypted` | optional | Plugin id → the sentence that lets a plugin that sends outside your network be given decrypted calls. See [Where decrypted calls go](#where-decrypted-calls-go). Config file only |
+| `shareDecrypted` | optional | Plugin id → the sentence that lets that plugin be given decrypted calls (every plugin needs its own; none are allowed by default). See [Where decrypted calls go](#where-decrypted-calls-go). Config file only |
 | `passwordFile` | optional | A file with the container's password on its first line (its line ending is not part of it): absolute, or relative to the config file's folder. Leave it out to type the password into Setup instead (below) |
 
 With no `keys` section, or an empty `ekcFile`, **nothing is decrypted** and nothing else changes.
@@ -118,42 +118,46 @@ holds (algorithm, key id, name), to check it.
 
 ## Where decrypted calls go
 
-A decrypted call is what the system's owner chose to encrypt. Trunk Recorder Pro keeps it on
-purpose from going anywhere public by accident:
+> **Warning: uploading decrypted calls is risky.** A decrypted call is what the system's owner chose
+> to encrypt. A call sent to a public service (OpenMHz, Broadcastify) can be heard by anyone, can't be
+> taken back, and may be against the law or your agreement with the system's owner. A server of your
+> own isn't safe by being yours: it may be reachable from outside, or pass calls on. Only allow it if
+> you are sure, and authorized to share them.
 
-- **Plugins.** A plugin is given a decrypted call (its live audio and its concluded files) only if
-  everything it sends to is **on your own network**: every address in its settings (a `server` or
-  `url`, an address or host) is a private or loopback address (`192.168.x.x`, `10.x.x.x`,
-  `172.16-31.x.x`, `127.x`, link-local, IPv6 `fd00::/8` and `::1`), `localhost`, a name with no dot,
-  or a name ending in `.local`, `.lan`, `.internal`, `.localhost`, `.localdomain` or `.home.arpa`. A
-  name that only happens to resolve to a private address doesn't count; it isn't looked up. So a
-  self-hosted Rdio Scanner or OpenMHz on your LAN gets them, and `api.openmhz.com` does not.
-  A plugin that names nowhere it sends to (Broadcastify, which has a fixed service; an upload
-  script, which can do anything) is withheld too. The log says so once, naming the plugin and what
-  to change. What a plugin isn't given it can't upload; the call's files stay or go by your call rules and the plugins that did take it. Calls that aren't
-  decrypted are not affected, and neither is call and unit information (talkgroup, units: the same
-  as for any encrypted call without keys).
-- **To let a plugin that sends elsewhere have them**, say so in the config file, in that plugin's
-  own entry. It is not in Setup on purpose, and the sentence must be exactly this one:
+So nothing is sent anywhere by default, and every plugin has to be allowed, one by one:
+
+- **Plugins.** No plugin is given a decrypted call (its live audio and its concluded files) unless
+  the config says so in that plugin's own entry. This holds for every plugin: OpenMHz, Broadcastify,
+  Rdio Scanner, a stream, an upload script, one on your own network or not. There is no automatic
+  exception for a plugin on your LAN.
+- **To allow one**, write this sentence, exactly, in the config file (it is not in Setup on purpose):
 
   ```json
   "keys": {
     "ekcFile": "/etc/trunk-pro/keys.ekc",
-    "shareDecrypted": { "openmhz": "I understand decrypted calls will leave my own network" }
+    "shareDecrypted": { "openmhz": "I accept that decrypted calls will be sent to this plugin and may become public, and I am authorized to share them" }
   }
   ```
 
-  Anything else in its place (`true`, `"yes"`, another sentence) leaves the plugin withheld. This is
-  a one-way door: a call once uploaded can't be taken back, and a service that lists calls publicly
-  has then published them. Check that you may.
+  Anything else in its place (`true`, `"yes"`, another sentence, or another plugin's) leaves the
+  plugin withheld. Each plugin needs its own entry, under its id (`openmhz`, `broadcastify`,
+  `rdioscanner`, `simplestream`, `upload-script`, ...).
+- **You are told, every time.** A plugin that is withheld says so in the log (once per run: what it
+  sends to, and the warning above). A plugin that is allowed logs a warning each time it starts:
+  `RECEIVES DECRYPTED CALLS`, naming where it sends to (each address in its settings, marked **on
+  your network** or **OUTSIDE your network**) and how to stop it. Setup's Decryption keys panel
+  carries the same warning.
+- **What is withheld:** the call's audio, live and concluded (WAV and M4A), and its JSON. A call no
+  plugin may take is kept on disk by your call rules, as when no plugin is set up. Call and unit
+  information (talkgroup, units) is not withheld: it is the same as for any encrypted call without
+  keys. `trunk-pro plugin run` follows the same rules.
 - **The interface.** With keys held and the interface bound to anything but `127.0.0.1`
   (`--bind 0.0.0.0`), the log warns: the interface has no login, so anyone who can reach it can
   listen to decrypted calls (the Listen page, the recordings folder it serves). Keep it on a
   network you trust, or bind it to `127.0.0.1` and forward the port.
 - **On disk.** Decrypted calls are saved like any other, as WAV and JSON in the recordings folder,
   unencrypted. Treat that folder like the keys: backups and sync tools (a cloud drive, say) would
-  copy them too. `recordEncrypted` and the rest of the call rules apply as to other calls.
-- **`trunk-pro plugin run`** (a plugin tried on saved calls) follows the same rules.
+  copy them too.
 
 ## Trying it without a radio
 

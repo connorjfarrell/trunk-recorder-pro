@@ -3026,7 +3026,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Config file only: plugin id → the sentence (docs/configuration/encryption.md) that lets a plugin sending outside this network be given decrypted calls."
+          "description": "Config file only: plugin id → the sentence (docs/configuration/encryption.md) that lets that plugin be given decrypted calls. None are allowed by default."
         }
       },
       "required": [
