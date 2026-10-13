@@ -87,7 +87,8 @@ LimeSDR...).
   [conventional systems](configuration/conventional.md),
   [recording](configuration/recording.md),
   [server and log](configuration/server-and-log.md),
-  [plugins](configuration/plugins.md)
+  [plugins](configuration/plugins.md),
+  [encryption keys](configuration/encryption.md)
 - [Command line](command-line.md)
 
 ## For developers

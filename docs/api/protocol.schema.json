@@ -96,6 +96,17 @@
         "encrypted": {
           "type": "number"
         },
+        "decrypted": {
+          "type": "number",
+          "description": "1 when an encrypted call was decrypted with a key we hold."
+        },
+        "alg_id": {
+          "type": "number",
+          "description": "The cipher and key id an encrypted call named (-1: not known)."
+        },
+        "key_id": {
+          "type": "number"
+        },
         "phase2_tdma": {
           "type": "number"
         },
@@ -315,6 +326,9 @@
         "call_length_ms",
         "emergency",
         "encrypted",
+        "decrypted",
+        "alg_id",
+        "key_id",
         "phase2_tdma",
         "duplex",
         "priority",
@@ -413,7 +427,25 @@
           ]
         },
         "encrypted": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Encrypted on the air."
+        },
+        "decrypted": {
+          "type": "boolean",
+          "description": "Encrypted, and its voice is decoded with a key we hold."
+        },
+        "algId": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "The cipher (P25 ALGID) and key id an encrypted call named, when keys are loaded."
+        },
+        "keyId": {
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "emergency": {
           "type": "boolean"
@@ -660,6 +692,10 @@
         "monitor": {
           "$ref": "#/definitions/MonitorSettings",
           "description": "What the dashboard watches on the computer (desktop app)."
+        },
+        "keys": {
+          "$ref": "#/definitions/KeysSettings",
+          "description": "Decryption keys for P25 Phase 1 calls (desktop app). Absent or empty: none."
         }
       },
       "required": [
@@ -2779,6 +2815,25 @@
         "site"
       ],
       "additionalProperties": false
+    },
+    "KeysSettings": {
+      "type": "object",
+      "properties": {
+        "ekcFile": {
+          "type": "string",
+          "description": "A KFDtool encrypted key container (.ekc): absolute, or relative to the config file's folder."
+        },
+        "passwordFile": {
+          "type": "string",
+          "description": "A file holding the container's password on its first line (mode 600)."
+        }
+      },
+      "required": [
+        "ekcFile",
+        "passwordFile"
+      ],
+      "additionalProperties": false,
+      "description": "Where the keys to decrypt with are. Neither the keys nor the password are ever sent here, only where the files are."
     },
     "LengthHistogram": {
       "type": "object",

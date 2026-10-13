@@ -94,7 +94,13 @@ pub struct Call {
     pub unit_to_unit: bool,
     pub recording: bool,
     pub reason: Option<Reason>,
+    /// Encrypted on the air (still true when we decrypt it: see `decrypted`).
     pub encrypted: bool,
+    /// Its voice is being decoded with a key we hold.
+    pub decrypted: bool,
+    /// The cipher and key id it named: known only when keys are loaded.
+    pub alg_id: Option<u8>,
+    pub key_id: Option<u16>,
     pub emergency: bool,
     pub priority: u8,
     pub duplex: bool,
@@ -181,6 +187,11 @@ pub trait RecorderHost {
     /// is given up (the channel closes with its last call); nothing when it
     /// has no channel.
     fn release(&mut self, call: &Call);
+    /// Whether keys are loaded, so that a call flagged encrypted may turn out
+    /// to be one it can decrypt (the grant doesn't say which key).
+    fn can_decrypt(&self, _call: &Call) -> bool {
+        false
+    }
     /// A long call goes on as `new`: record it on `old`'s channel. `old`'s
     /// recorder is freed as it ends, so this takes none more from the pool.
     fn record_continued(&mut self, _old: &Call, new: &Call) -> Result<(), Reason> {
@@ -382,6 +393,9 @@ impl CallManager {
             recording: false,
             reason: None,
             encrypted: m.encrypted || tg.as_ref().is_some_and(|t| t.encrypted_mode()),
+            decrypted: false,
+            alg_id: None,
+            key_id: None,
             emergency: m.emergency,
             priority: m.priority,
             duplex: m.duplex,
@@ -416,7 +430,7 @@ impl CallManager {
             c.reason = Some(Reason::Ignored);
         } else if !known && !cfg.record_unknown && !talkgroups.is_empty() {
             c.reason = Some(Reason::UnknownTg);
-        } else if c.encrypted && !cfg.record_encrypted {
+        } else if c.encrypted && !cfg.record_encrypted && !host.can_decrypt(c) {
             // No audio to record, but its terminators' link control is in
             // the clear: who spoke, and their talker aliases.
             c.reason = Some(Reason::Encrypted);
@@ -442,6 +456,41 @@ mod tests {
             Ok(())
         }
         fn release(&mut self, _: &Call) {}
+    }
+
+    /// A host that records, follows, and whether it holds keys.
+    struct KeyedHost {
+        keys: bool,
+        recorded: usize,
+        followed: usize,
+    }
+    impl RecorderHost for KeyedHost {
+        fn record(&mut self, _: &Call) -> Result<(), Reason> {
+            self.recorded += 1;
+            Ok(())
+        }
+        fn follow(&mut self, _: &Call) -> bool {
+            self.followed += 1;
+            true
+        }
+        fn release(&mut self, _: &Call) {}
+        fn can_decrypt(&self, _: &Call) -> bool {
+            self.keys
+        }
+    }
+
+    #[test]
+    fn a_call_flagged_encrypted_is_recorded_only_when_keys_might_decrypt_it() {
+        let enc = |t: f64| Message { encrypted: true, ..msg(MessageType::Grant, t, 101) };
+        // No keys: followed for its link control, as ever.
+        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: false, recorded: 0, followed: 0 });
+        m.handle(&[enc(0.0)], &mut h, &mut ev);
+        assert_eq!((h.recorded, h.followed, m.calls[0].recording, m.calls[0].reason), (0, 1, false, Some(Reason::Encrypted)));
+        // Keys: recorded, in case its key is one of them.
+        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: true, recorded: 0, followed: 0 });
+        m.handle(&[enc(0.0)], &mut h, &mut ev);
+        assert_eq!((h.recorded, h.followed, m.calls[0].recording, m.calls[0].reason), (1, 0, true, None));
+        assert!(m.calls[0].encrypted && !m.calls[0].decrypted);
     }
 
     fn msg(kind: MessageType, t: f64, tg: u32) -> Message {

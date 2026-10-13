@@ -243,6 +243,7 @@ called `conv`.
 | `--epoch s` | 0 | The Unix time the capture started, for call times and file names |
 | `--no-unknown` | off | Don't record talkgroups that aren't in the talkgroup file |
 | `--record-encrypted` | off | Record (and keep) encrypted calls |
+| `--ekc file` `--password-file file` | off | Decrypt P25 Phase 1 calls with the keys in a KFDtool container ([how](configuration/encryption.md)) |
 | `--keep-silent` | off | Keep calls with no audio |
 | `--min-call s` | 0 | Drop calls shorter than this |
 | `--max-call s` | 0 (no limit) | Split calls longer than this |

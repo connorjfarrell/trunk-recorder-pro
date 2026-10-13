@@ -353,6 +353,8 @@ struct Heard {
     frames: Vec<VoiceFrame>,
     /// (source, emergency, encrypted) from link control.
     infos: Vec<(Option<u32>, bool, bool)>,
+    /// The key an encrypted call named, and whether it was decrypted.
+    crypto: Option<(u8, u16, bool)>,
     /// Air time of the first voice frame, and the end of the last (digital).
     air: Option<(f64, f64)>,
     /// The talkgroup the air named (FM with tones: the row's).
@@ -449,6 +451,8 @@ struct Floor {
 }
 
 pub struct Conventional {
+    /// Keys to decrypt P25 channels with.
+    keys: Option<std::sync::Arc<crate::crypto::KeyStore>>,
     cfg: ConvConfig,
     bank_cfg: BankConfig,
     chans: Vec<Chan>,
@@ -504,7 +508,7 @@ impl Conventional {
             return Err(format!("Conventional channel(s) outside every source's bandwidth: {} MHz — move a center frequency or disable them.", outside.join(", ")));
         }
         let floors = sources.iter().map(|_| Floor { slices: vec![0.0; FLOOR_SLICES], scratch: vec![0.0; FLOOR_SLICES], next_s: 0.0, primed: false }).collect();
-        Ok(Conventional { cfg, bank_cfg, chans, floors })
+        Ok(Conventional { keys: None, cfg, bank_cfg, chans, floors })
     }
 
     /// Whether `channels` can run together: rows on one frequency have one
@@ -557,6 +561,11 @@ impl Conventional {
     }
 
     /// Heads open now.
+    /// Decrypt P25 channels' calls with `keys` (None, or empty: don't).
+    pub fn set_keys(&mut self, keys: Option<std::sync::Arc<crate::crypto::KeyStore>>) {
+        self.keys = keys.filter(|k| !k.is_empty());
+    }
+
     pub fn open_count(&self) -> usize {
         self.chans.iter().filter(|c| c.open.is_some()).count()
     }
@@ -607,7 +616,7 @@ impl Conventional {
                     ch.bar_db = base;
                 }
                 if snr_db >= ch.bar_db {
-                    Self::open(ch, chz, now_s, self.cfg.preroll_s, self.bank_cfg, self.cfg.vocoder, meter_thr, idx as u32, ids, rules, out);
+                    Self::open(ch, chz, now_s, self.cfg.preroll_s, self.bank_cfg, self.cfg.vocoder, self.keys.as_ref(), meter_thr, idx as u32, ids, rules, out);
                 }
                 continue;
             }
@@ -646,7 +655,7 @@ impl Conventional {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn open(ch: &mut Chan, chz: &mut Channelizer, now_s: f64, preroll_s: f64, bank_cfg: BankConfig, vocoder: mbe::Profile, meter_thr: f32, num: u32, ids: &CallIds, rules: &CallRules, out: &mut Vec<ConvOut>) {
+    fn open(ch: &mut Chan, chz: &mut Channelizer, now_s: f64, preroll_s: f64, bank_cfg: BankConfig, vocoder: mbe::Profile, keys: Option<&std::sync::Arc<crate::crypto::KeyStore>>, meter_thr: f32, num: u32, ids: &CallIds, rules: &CallRules, out: &mut Vec<ConvOut>) {
         let (head, pre, start_sample) = chz.add_head(ch.offset_hz, ch.cfg.mode.head_cutoff_hz(), preroll_s);
         let rate = chz.output_rate();
         let kind = match ch.cfg.mode {
@@ -655,7 +664,7 @@ impl Conventional {
             ConvMode::Dmr => VoiceKind::Dmr,
             ConvMode::Nxdn(r) => VoiceKind::Nxdn(r),
         };
-        let voice = voice::build(&VoiceSpec {
+        let mut voice = voice::build(&VoiceSpec {
             kind,
             rate,
             // (On the engine's clock: `now_s` is this source's, offset included.)
@@ -668,6 +677,9 @@ impl Conventional {
             // For the tone detector.
             subaudible: true,
         });
+        if let Some(keys) = keys {
+            voice.set_keys(keys.clone());
+        }
         let meter = (kind != VoiceKind::Analog).then(|| ChannelFilter::new(rate));
         ch.open = Some(Open { head, voice, meter, opened_s: now_s, carrier_seen: false, last_carrier_s: now_s, live: [None, None], tx: None });
         Self::run(ch, &pre, now_s, meter_thr, num, ids, rules, 0.0, out);
@@ -694,6 +706,7 @@ impl Conventional {
                 TrackerOut::AnalogAudio(a) => h.audio.extend_from_slice(&a),
                 TrackerOut::Subaudible(l) => h.low.extend_from_slice(&l),
                 TrackerOut::Info { source, emergency, encrypted } => h.infos.push((source, emergency, encrypted)),
+                TrackerOut::Crypto { algid, key_id, decrypted } => h.crypto = Some((algid, key_id, decrypted)),
                 TrackerOut::Alias(a) => out.push(ConvOut::Alias(conventional_system(ch.cfg.system), a)),
                 TrackerOut::AliasLc(_) => {}
             }
@@ -892,6 +905,9 @@ impl Conventional {
                 ran: h.ran,
                 nac: h.nac,
                 tone: None,
+                decrypted: false,
+                alg_id: None,
+                key_id: None,
                 tone_set: match row.access {
                     Some(Access::Tone(t)) => Some(t),
                     _ => None,
@@ -921,6 +937,15 @@ impl Conventional {
         if l.call.color_code.is_none() && h.color_code.is_some() {
             l.call.color_code = h.color_code;
             changed = true;
+        }
+        if let Some((algid, key_id, decrypted)) = h.crypto {
+            if decrypted {
+                l.tx.mark_decrypted(now_s);
+            }
+            if (l.call.alg_id, l.call.key_id, l.call.decrypted) != (Some(algid), Some(key_id), decrypted) || !l.call.encrypted {
+                (l.call.alg_id, l.call.key_id, l.call.decrypted, l.call.encrypted) = (Some(algid), Some(key_id), decrypted, true);
+                changed = true;
+            }
         }
         for (src, emergency, encrypted) in h.infos {
             if encrypted {

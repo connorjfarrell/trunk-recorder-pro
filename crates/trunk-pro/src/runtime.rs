@@ -181,6 +181,16 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
     let epoch_at = Instant::now();
     let mut session = Session::new(cfg.clone(), epoch_ms, &|name| fs::read_to_string(bandplan_path(name)).ok(), local_offset)?;
     session.attach(ctx.shared.clone());
+    // Decryption keys, when the config names them: from files, read now.
+    let keys = crate::keyfiles::load(&cfg.keys, ctx.config_path.parent().unwrap_or(std::path::Path::new(".")));
+    for (problem, text) in &keys.notes {
+        if *problem {
+            log::warn!("{text}");
+        } else {
+            log::info!("{text}");
+        }
+    }
+    session.set_keys(keys.keys);
     session.load_units(&|name| fs::read_to_string(units_path(name)).ok());
     session.load_heard(&fs::read_to_string(heard_path(&cfg)).unwrap_or_default());
     ctx.plugins.start(&cfg);

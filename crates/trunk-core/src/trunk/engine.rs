@@ -26,6 +26,7 @@
 //! engine does no I/O.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 use num_complex::Complex32;
 
@@ -43,6 +44,7 @@ use super::identity::Identity;
 use super::control::{self, CarrierPlan, ControlChannel, Protocol, ProtocolStatus, Step};
 use super::voice::{self, VoiceDecoder, VoiceKind, VoiceParams, VoiceSpec};
 use crate::alias::Alias;
+use crate::crypto::KeyStore;
 use crate::dsp::{Channelizer, HeadId};
 use crate::mbe;
 use crate::metrics::{self, Scoped, Sink};
@@ -165,6 +167,8 @@ pub struct EngineConfig {
     pub drop_duplicates: bool,
     /// The IMBE vocoder for P25 Phase 1 voice, trunked and conventional.
     pub vocoder: mbe::Profile,
+    /// Keys to decrypt P25 Phase 1 calls with ([`crate::crypto`]); None: no decryption.
+    pub keys: Option<Arc<KeyStore>>,
 }
 
 impl Default for EngineConfig {
@@ -182,6 +186,7 @@ impl Default for EngineConfig {
             capture_frames: false,
             drop_duplicates: true,
             vocoder: mbe::Profile::Enhanced,
+            keys: None,
         }
     }
 }
@@ -452,6 +457,8 @@ struct Radio {
     preroll_s: f64,
     capture_frames: bool,
     vocoder: mbe::Profile,
+    /// The keys P25 Phase 1 voice channels decrypt with, when there are any.
+    keys: Option<Arc<KeyStore>>,
     tout: Vec<(usize, TrackerOut)>,
     /// What each system's control channel tells its voice channels (Phase 2: the scrambler key, once it gave it).
     voice_params: Vec<VoiceParams>,
@@ -575,6 +582,10 @@ impl SysHost<'_> {
             squelch: (noise * 10f64.powf(ANALOG_SQUELCH_DB / 10.0)) as f32,
             subaudible: false,
         });
+        let mut voice = voice;
+        if let Some(keys) = &r.keys {
+            voice.set_keys(keys.clone());
+        }
         let mut calls = [None, None];
         calls[slot] = Some(call.id);
         let mut ch = Channel { system: self.system, source: src, head, calls, voice, freq_hz: call.freq_hz as f64, tune_ppm, meter: ChannelFilter::new(rate), noise };
@@ -638,6 +649,11 @@ impl RecorderHost for SysHost<'_> {
         };
         self.open_channel(call, src);
         true
+    }
+
+    fn can_decrypt(&self, call: &Call) -> bool {
+        // (Only Phase 1 so far.)
+        self.radio.keys.is_some() && !call.analog && !call.phase2_tdma && call.color_code.is_none() && call.nxdn.is_none()
     }
 
     fn release(&mut self, call: &Call) {
@@ -969,6 +985,13 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Decrypt P25 Phase 1 calls with `keys` from now on (calls already in
+    /// progress go on as they were). None, or no keys: don't.
+    pub fn set_keys(&mut self, keys: Option<Arc<KeyStore>>) {
+        self.radio.keys = keys.clone().filter(|k| !k.is_empty());
+        self.conv.set_keys(keys);
+    }
+
     pub fn new(mut cfg: EngineConfig) -> Result<Self, String> {
         // Every conventional channel's system exists (a default one if none was given).
         let need = cfg.conventional.iter().map(|c| c.system + 1).max().unwrap_or(0);
@@ -993,7 +1016,8 @@ impl Engine {
         }
         let history = cfg.preroll_s.max(cfg.conv.preroll_s).max(0.1);
         let spans: Vec<(f64, f64, f64)> = cfg.sources.iter().map(|s| (s.center_hz, s.rate_hz, s.usable_half_width())).collect();
-        let conv = Conventional::new(&cfg.conventional, &spans, ConvConfig { vocoder: cfg.vocoder, ..cfg.conv }, cfg.bank)?;
+        let mut conv = Conventional::new(&cfg.conventional, &spans, ConvConfig { vocoder: cfg.vocoder, ..cfg.conv }, cfg.bank)?;
+        conv.set_keys(cfg.keys.clone());
         let sources: Vec<Source> =
             cfg.sources.iter().map(|s| Source { cfg: s.clone(), chz: Channelizer::new(s.rate_hz, MIN_CHANNEL_RATE, history), errors: VecDeque::new(), tune_ppm: 0.0, in_gap: false, half: None, clock_offset_s: 0.0 }).collect();
         let rate = sources[0].chz.output_rate();
@@ -1008,6 +1032,7 @@ impl Engine {
             preroll_s: cfg.preroll_s,
             capture_frames: cfg.capture_frames,
             vocoder: cfg.vocoder,
+            keys: cfg.keys.clone().filter(|k| !k.is_empty()),
             tout: Vec::new(),
             voice_params: vec![VoiceParams::default(); cfg.systems.len()],
             pending: Vec::new(),
@@ -1530,6 +1555,40 @@ impl Engine {
                         }
                     }
                 }
+                TrackerOut::Crypto { algid, key_id, decrypted } => {
+                    let now = t.now_s;
+                    if decrypted {
+                        if let Some(rec) = self.radio.recordings.get_mut(&id) {
+                            rec.tx.mark_decrypted(now);
+                        }
+                    }
+                    let mut no_key_recorded = false;
+                    let record_encrypted = t.calls.cfg.record_encrypted;
+                    if let Some(c) = t.calls.call_mut(id) {
+                        let mut changed = (c.alg_id, c.key_id) != (Some(algid), Some(key_id)) || c.decrypted != decrypted;
+                        (c.alg_id, c.key_id, c.decrypted) = (Some(algid), Some(key_id), decrypted);
+                        if !c.encrypted {
+                            c.encrypted = true;
+                            changed = true;
+                        }
+                        // An encrypted call we hold no key for was recorded only in case we did:
+                        // with no audio yet, it is followed instead, as one flagged encrypted is.
+                        no_key_recorded = !decrypted && c.recording && !record_encrypted;
+                        if changed {
+                            self.call_events.push(CallEvent::Update(c.clone()));
+                        }
+                    }
+                    if no_key_recorded && self.radio.recordings.get(&id).is_some_and(|rec| rec.audio.is_empty()) {
+                        if let Some(rec) = self.radio.recordings.remove(&id) {
+                            self.radio.free_nums.push(rec.recorder_num);
+                        }
+                        if let Some(c) = t.calls.call_mut(id) {
+                            c.recording = false;
+                            c.reason = Some(Reason::Encrypted);
+                            self.call_events.push(CallEvent::Update(c.clone()));
+                        }
+                    }
+                }
                 // (Only conventional FM asks for it.)
                 TrackerOut::Subaudible(_) => {}
                 TrackerOut::Alias(a) => {
@@ -1657,6 +1716,22 @@ mod tests {
         use super::super::conventional::{ConvChannel, ConvMode};
         let ch = ConvChannel { freq_hz: 155.2e6, mode: ConvMode::Fm, talkgroup: 1, info: None, squelch_db: None, access: None, system: 0 };
         Engine::new(EngineConfig { sources: vec![SourceConfig { center_hz: 155e6, rate_hz: 2.4e6, auto_tune: false, guard_hz: DEFAULT_GUARD_HZ }], conventional: vec![ch], ..Default::default() }).unwrap()
+    }
+
+    /// Keys come from the config or `set_keys`; none, or an empty store, is no decryption.
+    #[test]
+    fn keys_are_off_unless_given_some() {
+        use crate::crypto::{Key, KeyStore};
+        let mut e = plain_engine();
+        assert!(e.radio.keys.is_none());
+        let mut store = KeyStore::new();
+        e.set_keys(Some(Arc::new(KeyStore::new())));
+        assert!(e.radio.keys.is_none(), "an empty store is no keys");
+        store.insert(Key::new(0x81, 1, "k".into(), 0, true, vec![0; 8]));
+        e.set_keys(Some(Arc::new(store)));
+        assert!(e.radio.keys.is_some());
+        e.set_keys(None);
+        assert!(e.radio.keys.is_none());
     }
 
     /// u8 IQ in buffers of odd length: the same as in even ones (no I/Q swap).

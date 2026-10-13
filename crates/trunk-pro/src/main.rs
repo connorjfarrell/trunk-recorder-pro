@@ -22,6 +22,7 @@
 //!     --out calls  --short-name sys1  --talkgroups tg.csv  --bandplan file
 //!     --recorders 32  --preroll 1  --timeout 3  --epoch <unix s>
 //!     --record-encrypted  --keep-silent  --no-unknown  --capture-frames  --quiet
+//!     --ekc <keys.ekc> --password-file <file>   (decrypt P25 Phase 1 calls with a KFDtool key container)
 //!     --messages (print every control channel message)
 //!     --min-call s  --max-call s  --min-transmission s (drop short calls, split long
 //!     ones, leave out short transmissions)  --auto-tune (correct the sources'
@@ -84,6 +85,7 @@
 //! ```
 
 mod dmrtool;
+mod keyfiles;
 mod logging;
 mod monitor;
 mod nxdntool;
@@ -205,6 +207,7 @@ usage:
   trunk-pro replay <capture> --center Hz --rate Hz --dmr Hz,… --nxdn48 Hz,… --nxdn96 Hz,…
   trunk-pro replay <capture> --center Hz --rate Hz --cc Hz,… --dmr-trunk [--dmr-channels Hz,…] [--lcn n=Hz,…] [--color-code N]
   trunk-pro replay <capture> --center Hz --rate Hz --cc Hz,… --nxdn-trunk typeC|typeD [--nxdn-rate 48|96] [--nxdn-channels Hz,…] [--lcn n=Hz,…] [--ran N]
+  trunk-pro replay <capture> … --ekc keys.ekc --password-file keys.pw   (decrypt P25 Phase 1 calls: docs/configuration/encryption.md)
   trunk-pro replay <capture> --center Hz --rate Hz --cc Hz --smartnet 800_standard|800_reband|800_splinter|900|400_custom
   trunk-pro replay <capture> --center Hz --rate Hz --channels channels.csv
       Record calls from captures instead of dongles (a trunked system from
@@ -431,6 +434,15 @@ fn replay(a: &Args) {
         conventional,
         conv: ConvConfig { squelch_db: a.num("squelch", ConvConfig::default().squelch_db), ..Default::default() },
         capture_frames: a.flag("capture-frames"),
+        // --ekc <keys.ekc> --password-file <file>: decrypt P25 Phase 1 calls.
+        keys: {
+            let settings = trunk_app::config::KeysSettings { ekc_file: a.get("ekc").unwrap_or("").into(), password_file: a.get("password-file").unwrap_or("").into(), ..Default::default() };
+            let loaded = keyfiles::load(&settings, std::path::Path::new("."));
+            for (_, text) in &loaded.notes {
+                eprintln!("{text}");
+            }
+            loaded.keys
+        },
         ..Default::default()
     };
     let mut engine = Engine::new(cfg).unwrap_or_else(|e| die(&e));

@@ -242,6 +242,11 @@ impl Session {
         &self.cfg
     }
 
+    /// Decrypt P25 Phase 1 calls with `keys` from now on (see [`Engine::set_keys`]).
+    pub fn set_keys(&mut self, keys: Option<std::sync::Arc<trunk_core::crypto::KeyStore>>) {
+        self.engine.set_keys(keys);
+    }
+
     /// Use `shared` (the platform's, outliving sessions) for the radio
     /// registry and the event monitor, instead of this session's own.
     pub fn attach(&mut self, shared: Arc<Shared>) {
@@ -902,6 +907,9 @@ fn call_view(c: &Call, system_name: &str, patched: Vec<Value>) -> Value {
         "state": if c.recording { "recording" } else { "monitoring" },
         "reason": c.reason.map(|r| r.as_str()),
         "encrypted": c.encrypted,
+        "decrypted": c.decrypted,
+        "algId": c.alg_id,
+        "keyId": c.key_id,
         "emergency": c.emergency,
         "startS": c.start_s,
         "sources": c.sources.iter().map(|s| s.src).collect::<Vec<_>>(),

@@ -1910,6 +1910,7 @@ dependencies = [
  "trunk-recorder-plugin",
  "ureq",
  "winresource",
+ "zeroize",
  "zip",
 ]
 

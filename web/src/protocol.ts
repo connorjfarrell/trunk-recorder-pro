@@ -310,6 +310,16 @@ export interface Config {
   log?: LogSettings;
   /** What the dashboard watches on the computer (desktop app). */
   monitor?: MonitorSettings;
+  /** Decryption keys for P25 Phase 1 calls (desktop app). Absent or empty: none. */
+  keys?: KeysSettings;
+}
+
+/** Where the keys to decrypt with are. Neither the keys nor the password are ever sent here, only where the files are. */
+export interface KeysSettings {
+  /** A KFDtool encrypted key container (.ekc): absolute, or relative to the config file's folder. */
+  ekcFile: string;
+  /** A file holding the container's password on its first line (mode 600). */
+  passwordFile: string;
 }
 
 export interface MonitorSettings {
@@ -477,7 +487,13 @@ export interface CallView {
   tone?: string | null;
   state: "recording" | "monitoring";
   reason: "ignored" | "unknown_tg" | "encrypted" | "no_source" | "no_recorder" | null;
+  /** Encrypted on the air. */
   encrypted: boolean;
+  /** Encrypted, and its voice is decoded with a key we hold. */
+  decrypted?: boolean;
+  /** The cipher (P25 ALGID) and key id an encrypted call named, when keys are loaded. */
+  algId?: number | null;
+  keyId?: number | null;
   emergency: boolean;
   startS: number;
   sources: number[];
@@ -521,6 +537,11 @@ export interface CallRecord {
   /** 1 / 0. */
   emergency: number;
   encrypted: number;
+  /** 1 when an encrypted call was decrypted with a key we hold. */
+  decrypted: number;
+  /** The cipher and key id an encrypted call named (-1: not known). */
+  alg_id: number;
+  key_id: number;
   phase2_tdma: number;
   duplex: number;
   /** Its P25 priority and service-option mode bit. */

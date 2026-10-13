@@ -13,6 +13,7 @@ guides; these pages list what each key does.
 | [recording.md](recording.md) | Where and how calls are saved (`recording`), per-system rules, file names |
 | [server-and-log.md](server-and-log.md) | The web server (`server`), the log (`log`), the dashboard's checks (`monitor`) |
 | [plugins.md](plugins.md) | Which plugins run and their settings (`plugins`) |
+| [encryption.md](encryption.md) | Decryption keys for P25 Phase 1 calls (`keys`) |
 
 ## Where the file is
 

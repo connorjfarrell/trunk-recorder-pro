@@ -1000,10 +1000,39 @@ pub struct Config {
     pub log: LogSettings,
     /// The dashboard's watch on the computer (desktop app).
     pub monitor: MonitorSettings,
+    /// Decryption keys for P25 Phase 1 calls. Not there (or empty): no decryption.
+    #[serde(skip_serializing_if = "KeysSettings::is_unset")]
+    pub keys: KeysSettings,
     /// Keys this version doesn't know (a newer version's, a hand edit's):
     /// kept, and saved back as they were.
     #[serde(flatten)]
     pub other: BTreeMap<String, serde_json::Value>,
+}
+
+/// Where the keys to decrypt calls with are: a KFDtool encrypted key
+/// container, and a file holding its password (so that neither is in this
+/// file, and the password isn't beside the keys). Both are read when
+/// recording starts. With no `ekcFile` nothing is decrypted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KeysSettings {
+    /// A KFDtool `.ekc`: absolute, or relative to the config file's folder.
+    pub ekc_file: String,
+    /// A file with the container's password, on its first line: absolute, or
+    /// relative to the config file's folder. On Linux and macOS it must be
+    /// readable by its owner alone (mode 600).
+    pub password_file: String,
+    /// Keys this version doesn't know (a newer version's, a hand edit's):
+    /// kept, and saved back as they were.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
+impl KeysSettings {
+    /// Nothing set: how a config with no `keys` section reads.
+    pub fn is_unset(&self) -> bool {
+        self.ekc_file.trim().is_empty() && self.password_file.trim().is_empty() && self.other.is_empty()
+    }
 }
 
 /// The log (desktop app), with Trunk Recorder's options: `logLevel`,
@@ -1077,6 +1106,7 @@ impl Default for Config {
             plugins: BTreeMap::new(),
             log: LogSettings::default(),
             monitor: MonitorSettings::default(),
+            keys: KeysSettings::default(),
         }
     }
 }
@@ -1495,6 +1525,8 @@ impl Config {
             capture_frames: self.recording.capture_frames,
             drop_duplicates: self.recording.drop_duplicate_calls,
             vocoder: trunk_core::mbe::Profile::from_name(&self.recording.vocoder).unwrap_or(trunk_core::mbe::Profile::Fixed),
+            // (Read from files by the caller: [`Session::set_keys`].)
+            keys: None,
         }
     }
 }
@@ -1524,6 +1556,36 @@ pub fn auto_center(ccs: &[f64], rate_hz: f64, guard_hz: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_with_no_keys_section_has_no_keys_and_is_saved_without_one() {
+        let c: Config = serde_json::from_str(r#"{"sources":[],"systems":[]}"#).unwrap();
+        assert!(c.keys.is_unset());
+        assert!(c.engine_config(0.0).keys.is_none());
+        let saved = serde_json::to_value(&c).unwrap();
+        assert!(saved.get("keys").is_none(), "an unset section is not written: {saved}");
+        // Nor does the default config have one.
+        assert!(serde_json::to_value(Config::default()).unwrap().get("keys").is_none());
+    }
+
+    #[test]
+    fn a_keys_section_reads_and_saves_back_and_keeps_what_it_doesnt_know() {
+        let json = r#"{"keys":{"ekcFile":"keys.ekc","passwordFile":"/etc/trunk/pw","futureOption":3}}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!((c.keys.ekc_file.as_str(), c.keys.password_file.as_str()), ("keys.ekc", "/etc/trunk/pw"));
+        assert!(!c.keys.is_unset());
+        let saved = serde_json::to_value(&c).unwrap();
+        assert_eq!(saved["keys"], serde_json::from_str::<serde_json::Value>(json).unwrap()["keys"]);
+        // The engine config never carries keys: they are read from the files by the caller.
+        assert!(c.engine_config(0.0).keys.is_none());
+    }
+
+    #[test]
+    fn an_older_programs_config_with_a_keys_key_of_its_own_still_reads() {
+        // A `keys` that isn't a section (some other version's) must not stop the config reading.
+        let r = serde_json::from_str::<Config>(r#"{"keys":"x"}"#);
+        assert!(r.is_err() || r.unwrap().keys.is_unset());
+    }
 
     #[test]
     fn usrp_label_names_the_device() {

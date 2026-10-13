@@ -104,6 +104,15 @@ impl Transmissions {
         }
     }
 
+    /// The cipher turned out to be one we hold the key for, at `t_s`: the
+    /// transmission going on then (or the next) is not to be left out.
+    pub fn mark_decrypted(&mut self, t_s: f64) {
+        match self.encrypted.last_mut() {
+            Some(e) if self.last_s.is_some_and(|l| t_s - l <= TRANSMISSION_GAP_S) => *e = false,
+            _ => self.encrypted_next = false,
+        }
+    }
+
     /// The transmission going on now is encrypted.
     pub fn current_encrypted(&self) -> bool {
         self.encrypted.last().copied().unwrap_or(self.encrypted_next)
@@ -160,7 +169,7 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
     let _ = write!(
         j,
         "{{\"call_num\":{},\"freq\":{},\"freq_error\":{},\"signal\":{},\"noise\":{},\"snr\":{},\"clean_voice_pct\":{},\"source_num\":0,\"recorder_num\":{},\"tdma_slot\":{},\"phase2_tdma\":{},\
-\"start_time\":{},\"stop_time\":{},\"start_time_ms\":{},\"stop_time_ms\":{},\"emergency\":{},\"priority\":{},\"mode\":{},\"duplex\":{},\"encrypted\":{},\
+\"start_time\":{},\"stop_time\":{},\"start_time_ms\":{},\"stop_time_ms\":{},\"emergency\":{},\"priority\":{},\"mode\":{},\"duplex\":{},\"encrypted\":{},\"decrypted\":{},\"alg_id\":{},\"key_id\":{},\
 \"call_length\":{},\"call_length_ms\":{},\"talkgroup\":{},\"talkgroup_tag\":\"{}\",\"talkgroup_description\":\"{}\",\"talkgroup_group_tag\":\"{}\",\
 \"talkgroup_group\":\"{}\",\"color_code\":{},\"ran\":{},\"tone_mode\":\"{}\",\"tone_detected\":\"{}\",\"tone_confidence\":{:.3},\
 \"audio_type\":\"{}\",\"short_name\":\"{}\",",
@@ -183,6 +192,9 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
         call.mode as u8,
         call.duplex as u8,
         call.encrypted as u8,
+        call.decrypted as u8,
+        call.alg_id.map_or(-1, i32::from),
+        call.key_id.map_or(-1, i32::from),
         secs.round() as i64,
         (secs * 1000.0).round() as i64,
         call.talkgroup,

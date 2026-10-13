@@ -80,6 +80,10 @@ pub enum TrackerOut {
     Audio(Vec<f32>, VoiceFrame),
     /// Link control named a source / emergency, or the call turned out encrypted.
     Info { source: Option<u32>, emergency: bool, encrypted: bool },
+    /// An encrypted call named its key (`key_id` under algorithm `algid`);
+    /// `decrypted` once its voice is being decoded with a key we hold. Only
+    /// given when keys were ([`VoiceDecoder::set_keys`]).
+    Crypto { algid: u8, key_id: u16, decrypted: bool },
     /// Analog FM voice (a SmartNet analog call, a conventional FM channel): 8 kHz audio, squelched.
     AnalogAudio(Vec<f32>),
     /// Analog FM: the same audio before the 300 Hz high-pass (CTCSS / DCS
@@ -150,6 +154,8 @@ pub trait VoiceDecoder: Send {
     fn flush(&mut self, _out: &mut Vec<VoiceOut>) {}
     /// Which slots are being recorded (DMR vocodes only those).
     fn listen(&mut self, _slots: [bool; 2]) {}
+    /// The keys to decrypt calls with (P25 Phase 1 so far).
+    fn set_keys(&mut self, _keys: std::sync::Arc<crate::crypto::KeyStore>) {}
     /// What the control channel says voice needs (Phase 2: the scrambler key).
     fn set_params(&mut self, _p: &VoiceParams) {}
     /// Analog: the carrier power that opens the squelch.
@@ -238,6 +244,9 @@ impl VoiceDecoder for P25Fdma {
     }
     fn report(&self, sink: &mut dyn Sink) {
         self.bank.report(sink);
+    }
+    fn set_keys(&mut self, keys: std::sync::Arc<crate::crypto::KeyStore>) {
+        self.tracker.set_keys(keys);
     }
     fn push(&mut self, iq: &[Complex32], out: &mut Vec<VoiceOut>) {
         (self.nac, self.air) = (None, None);
