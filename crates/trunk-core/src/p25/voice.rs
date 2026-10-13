@@ -284,3 +284,20 @@ pub fn decode_tdulc(fb: &[u8]) -> Option<LinkControl> {
     let ec = rs_decode(&mut hb, 12, 39);
     (0..=6).contains(&ec).then(|| parse_lcw(&hexbits_to_bytes(&hb, 39)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 12 hexbits (72 bits) → the 9 bytes of an MI, most significant first.
+    #[test]
+    fn hexbits_to_mi_bytes() {
+        let mut hb = [0u8; 63];
+        // 0x01 0x23 0x45 0x67 0x89 0xab 0xcd 0xef 0xfe as 6-bit groups.
+        let bits: Vec<u8> = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe].iter().flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1)).collect();
+        for (k, c) in bits.chunks(6).enumerate() {
+            hb[39 + k] = c.iter().fold(0, |v, &b| (v << 1) | b);
+        }
+        assert_eq!(hexbits_to_bytes(&hb, 39), [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe]);
+    }
+}

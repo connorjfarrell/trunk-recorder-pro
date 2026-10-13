@@ -193,6 +193,10 @@ struct Stats {
     kinds: [u64; 3],
 }
 
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn lc_json(key: &str, lc: Option<LinkControl>) -> String {
     let n = |v: Option<u32>| v.map_or(-1, |x| x as i64);
     match lc {
@@ -201,7 +205,7 @@ fn lc_json(key: &str, lc: Option<LinkControl>) -> String {
             ",\"{key}\":{{\"lco\":{},\"mfid\":{},\"raw\":\"{}\",\"prot\":{},\"svc\":{},\"tgid\":{},\"target\":{},\"src\":{}}}",
             lc.lco,
             lc.mfid,
-            lc.raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            hex(&lc.raw),
             lc.protected as u8,
             lc.svc_opts.map_or(-1, |v| v as i64),
             n(lc.tgid),
@@ -263,7 +267,7 @@ fn voice_line(
             } else {
                 match es {
                     Some(e) => {
-                        let _ = write!(s, ",\"es\":{{\"algid\":{},\"keyid\":{}}}", e.algid, e.keyid);
+                        let _ = write!(s, ",\"es\":{{\"algid\":{},\"keyid\":{},\"mi\":\"{}\"}}", e.algid, e.keyid, hex(&e.mi));
                     }
                     None => s.push_str(",\"es\":null"),
                 }
@@ -271,7 +275,7 @@ fn voice_line(
         }
         HDU => match decode_hdu(&f.raw) {
             Some(h) => {
-                let _ = write!(s, ",\"hdu\":{{\"algid\":{},\"keyid\":{},\"mfid\":{},\"tgid\":{}}}", h.es.algid, h.es.keyid, h.mfid, h.tgid);
+                let _ = write!(s, ",\"hdu\":{{\"algid\":{},\"keyid\":{},\"mi\":\"{}\",\"mfid\":{},\"tgid\":{}}}", h.es.algid, h.es.keyid, hex(&h.es.mi), h.mfid, h.tgid);
             }
             None => s.push_str(",\"hdu\":null"),
         },
