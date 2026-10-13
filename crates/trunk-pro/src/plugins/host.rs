@@ -334,8 +334,8 @@ impl PluginHost {
             HostMessage::CallEnd(_) => topic::CALL_END,
             HostMessage::Unit(_) => topic::UNIT,
             HostMessage::Status(_) => topic::STATUS,
-            HostMessage::Audio(_) => topic::AUDIO,
-            HostMessage::CallConcluded(_) => topic::CALL_CONCLUDED,
+            // (Audio and concluded calls carry what may be a decrypted call: they go only by
+            // `audio_frame` and `concluded`, which ask the guard. Never through here.)
             _ => return,
         };
         if self.shared.plugins.iter().any(|p| p.manifest.subscribes(t)) {

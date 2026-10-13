@@ -167,7 +167,7 @@ pub struct EngineConfig {
     pub drop_duplicates: bool,
     /// The IMBE vocoder for P25 Phase 1 voice, trunked and conventional.
     pub vocoder: mbe::Profile,
-    /// Keys to decrypt P25 Phase 1 calls with ([`crate::crypto`]); None: no decryption.
+    /// Keys to decrypt P25 Phase 1 and Phase 2 calls with ([`crate::crypto`]); None: no decryption.
     pub keys: Option<Arc<KeyStore>>,
 }
 
@@ -458,7 +458,7 @@ struct Radio {
     preroll_s: f64,
     capture_frames: bool,
     vocoder: mbe::Profile,
-    /// The keys P25 Phase 1 voice channels decrypt with, when there are any.
+    /// The keys P25 voice channels (Phase 1 and Phase 2) decrypt with, when there are any.
     keys: Option<Arc<KeyStore>>,
     tout: Vec<(usize, TrackerOut)>,
     /// What each system's control channel tells its voice channels (Phase 2: the scrambler key, once it gave it).

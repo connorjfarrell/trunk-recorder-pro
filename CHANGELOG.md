@@ -5,7 +5,7 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
-- **Decrypting P25 Phase 1 calls with keys you hold:** point the new `keys`
+- **Decrypting P25 Phase 1 and Phase 2 calls with keys you hold:** point the new `keys`
   section of the config at a KFDtool encrypted key container (`.ekc`) and the
   file with its password, and calls encrypted with DES-OFB, AES-256 or ADP
   under a key in the container are recorded decrypted, on Phase 1 and Phase 2

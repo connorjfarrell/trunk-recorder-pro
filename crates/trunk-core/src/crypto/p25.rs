@@ -1,10 +1,11 @@
-//! P25 Phase 1 voice decryption: TIA-102.AAAD (Block Encryption Protocol)
-//! for DES-OFB (ALGID 0x81) and AES-256 (0x84), and Motorola's ADP (0xAA, RC4,
-//! not in that standard).
+//! P25 voice decryption, Phase 1 and Phase 2: TIA-102.AAAD (Block Encryption
+//! Protocol) for DES-OFB (ALGID 0x81) and AES-256 (0x84), and Motorola's ADP
+//! (0xAA, RC4, not in that standard).
 //!
 //! Phase 2 TDMA (see [`Keystream::apply_tdma`]) uses the same keystream, with
-//! the layout of op25 and DSD-FME (TIA-102.AAAD-B, which defines it, is not
-//! public): 18 voice frames of 7 octets in a superframe.
+//! 18 voice frames of 7 octets in a superframe (TIA-102.AAAD-B). DES-OFB and
+//! AES-256 are checked against that standard's worked examples; ADP on Phase 2
+//! follows the layout op25 and DSD-FME share.
 //!
 //! A superframe (an LDU1 and an LDU2) carries 213 octets that are encrypted,
 //! numbered 1 to 213 in the standard's tables 5-2, 5-5 and 5-6: 3 reserved,
@@ -442,7 +443,8 @@ mod tests {
 
     /// Phase 2: frame f takes octets 7f+1.. of the same keystream, 49 bits of the 56. The
     /// expected values were made by a separate implementation (Python) of the same layout
-    /// op25 and DSD-FME use; no standard or capture checks them.
+    /// op25 and DSD-FME use. (TIA-102.AAAD-B's worked examples check DES-OFB and AES-256 separately; ADP has
+    /// no standard, and no Phase 2 capture checks it.)
     #[test]
     fn tdma_frames_take_seven_keystream_octets_each() {
         let plain = hex("0CEE42225F6180");
