@@ -169,7 +169,7 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
     let _ = write!(
         j,
         "{{\"call_num\":{},\"freq\":{},\"freq_error\":{},\"signal\":{},\"noise\":{},\"snr\":{},\"clean_voice_pct\":{},\"source_num\":0,\"recorder_num\":{},\"tdma_slot\":{},\"phase2_tdma\":{},\
-\"start_time\":{},\"stop_time\":{},\"start_time_ms\":{},\"stop_time_ms\":{},\"emergency\":{},\"priority\":{},\"mode\":{},\"duplex\":{},\"encrypted\":{},\"decrypted\":{},\"alg_id\":{},\"key_id\":{},\
+\"start_time\":{},\"stop_time\":{},\"start_time_ms\":{},\"stop_time_ms\":{},\"emergency\":{},\"priority\":{},\"mode\":{},\"duplex\":{},\"encrypted\":{},{}\
 \"call_length\":{},\"call_length_ms\":{},\"talkgroup\":{},\"talkgroup_tag\":\"{}\",\"talkgroup_description\":\"{}\",\"talkgroup_group_tag\":\"{}\",\
 \"talkgroup_group\":\"{}\",\"color_code\":{},\"ran\":{},\"tone_mode\":\"{}\",\"tone_detected\":\"{}\",\"tone_confidence\":{:.3},\
 \"audio_type\":\"{}\",\"short_name\":\"{}\",",
@@ -192,9 +192,11 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
         call.mode as u8,
         call.duplex as u8,
         call.encrypted as u8,
-        call.decrypted as u8,
-        call.alg_id.map_or(-1, i32::from),
-        call.key_id.map_or(-1, i32::from),
+        // Only for a call that named its key: the JSON is as it was for anyone without keys.
+        match (call.alg_id, call.key_id) {
+            (Some(a), Some(k)) => format!("\"decrypted\":{},\"alg_id\":{a},\"key_id\":{k},", call.decrypted as u8),
+            _ => String::new(),
+        },
         secs.round() as i64,
         (secs * 1000.0).round() as i64,
         call.talkgroup,

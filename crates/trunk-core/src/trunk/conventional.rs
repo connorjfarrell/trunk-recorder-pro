@@ -938,15 +938,6 @@ impl Conventional {
             l.call.color_code = h.color_code;
             changed = true;
         }
-        if let Some((algid, key_id, decrypted)) = h.crypto {
-            if decrypted {
-                l.tx.mark_decrypted(now_s);
-            }
-            if (l.call.alg_id, l.call.key_id, l.call.decrypted) != (Some(algid), Some(key_id), decrypted) || !l.call.encrypted {
-                (l.call.alg_id, l.call.key_id, l.call.decrypted, l.call.encrypted) = (Some(algid), Some(key_id), decrypted, true);
-                changed = true;
-            }
-        }
         for (src, emergency, encrypted) in h.infos {
             if encrypted {
                 l.tx.mark_encrypted(now_s);
@@ -964,6 +955,16 @@ impl Conventional {
                     l.call.sources.push(CallSource { src: s, time_s: now_s, emergency });
                     changed = true;
                 }
+            }
+        }
+        // (After the link control's word that it is encrypted, which may be in the same run: it follows.)
+        if let Some((algid, key_id, decrypted)) = h.crypto {
+            if decrypted {
+                l.tx.mark_decrypted(now_s);
+            }
+            if (l.call.alg_id, l.call.key_id, l.call.decrypted) != (Some(algid), Some(key_id), decrypted) || !l.call.encrypted {
+                (l.call.alg_id, l.call.key_id, l.call.decrypted, l.call.encrypted) = (Some(algid), Some(key_id), decrypted, true);
+                changed = true;
             }
         }
         if changed {

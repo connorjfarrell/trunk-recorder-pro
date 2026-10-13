@@ -586,4 +586,24 @@ mod tests {
         assert!(call_record(&m.calls[0], &info).0.contains("\"short_name\":\"s\",\"patched_talkgroups\":[101,65001],\"freqList\""));
         assert!(!call_record(&m.calls[1], &info).0.contains("patched"));
     }
+
+    #[test]
+    fn the_call_json_names_the_key_only_for_a_call_that_named_one() {
+        let mut m = manager();
+        let mut ev = Vec::new();
+        m.handle(&[msg(MessageType::Grant, 0.5, 101)], &mut Host, &mut ev);
+        let errors = Default::default();
+        let info = ConcludeInfo { short_name: "s", epoch_ms_at_zero: 0.0, audio_seconds: 1.0, errors: &errors, recorder_num: 0, end_s: 1.0, units: None, unit_tags: None, freq_error_hz: 0, reception: Default::default() };
+        // Anyone without keys: the JSON has none of the new fields.
+        let plain = call_record(&m.calls[0], &info).0;
+        assert!(!plain.contains("decrypted") && !plain.contains("alg_id") && !plain.contains("key_id"));
+        let c = &mut m.calls[0];
+        (c.encrypted, c.decrypted, c.alg_id, c.key_id) = (true, true, Some(0x84), Some(1235));
+        let j = call_record(c, &info).0;
+        assert!(j.contains("\"encrypted\":1,\"decrypted\":1,\"alg_id\":132,\"key_id\":1235,"), "{j}");
+        c.decrypted = false;
+        assert!(call_record(c, &info).0.contains("\"encrypted\":1,\"decrypted\":0,\"alg_id\":132"));
+        // Still valid JSON, and no key in it.
+        serde_json::from_str::<serde_json::Value>(&call_record(c, &info).0).unwrap();
+    }
 }

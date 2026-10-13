@@ -537,11 +537,11 @@ export interface CallRecord {
   /** 1 / 0. */
   emergency: number;
   encrypted: number;
-  /** 1 when an encrypted call was decrypted with a key we hold. */
-  decrypted: number;
-  /** The cipher and key id an encrypted call named (-1: not known). */
-  alg_id: number;
-  key_id: number;
+  /** Only on an encrypted call that named its key (keys are loaded): 1 when it was decrypted with a key we hold. */
+  decrypted?: number;
+  /** The cipher and key id it named. */
+  alg_id?: number;
+  key_id?: number;
   phase2_tdma: number;
   duplex: number;
   /** Its P25 priority and service-option mode bit. */

@@ -133,7 +133,7 @@ It is written on a single line.
 | `start_time`, `stop_time` | Start and end, seconds since 1970 |
 | `start_time_ms`, `stop_time_ms` | The same in milliseconds |
 | `emergency`, `encrypted` | `1` or `0`. `encrypted` is what the air said, so it stays `1` for a call [decrypted with your keys](../configuration/encryption.md) |
-| `decrypted`, `alg_id`, `key_id` | `1` when an encrypted call was decrypted with a key you loaded. `alg_id` and `key_id`: the cipher (P25 algorithm id, decimal) and key id the call named, `-1` when not known (only learned when keys are loaded). Never the key |
+| `decrypted`, `alg_id`, `key_id` | Only on an encrypted call that named its key, which is only learned when [keys are loaded](../configuration/encryption.md): `decrypted` is `1` when it was decrypted with a key you loaded; `alg_id` and `key_id` are the cipher (P25 algorithm id, decimal) and key id it named. Never the key. Without keys these fields are not written |
 | `priority`, `mode`, `duplex` | As Trunk Recorder writes them (`mode` and `duplex` are always `0` on conventional calls) |
 | `call_length`, `call_length_ms` | Length of the saved audio, seconds (rounded) and milliseconds |
 | `talkgroup` | Talkgroup number |

@@ -98,11 +98,11 @@
         },
         "decrypted": {
           "type": "number",
-          "description": "1 when an encrypted call was decrypted with a key we hold."
+          "description": "Only on an encrypted call that named its key (keys are loaded): 1 when it was decrypted with a key we hold."
         },
         "alg_id": {
           "type": "number",
-          "description": "The cipher and key id an encrypted call named (-1: not known)."
+          "description": "The cipher and key id it named."
         },
         "key_id": {
           "type": "number"
@@ -326,9 +326,6 @@
         "call_length_ms",
         "emergency",
         "encrypted",
-        "decrypted",
-        "alg_id",
-        "key_id",
         "phase2_tdma",
         "duplex",
         "priority",

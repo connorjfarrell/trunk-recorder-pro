@@ -887,7 +887,7 @@ pub(crate) fn identity_json(id: &Identity) -> Value {
 
 /// `patched`: the talkgroups patched with it ([`Session::tg_names`]).
 fn call_view(c: &Call, system_name: &str, patched: Vec<Value>) -> Value {
-    json!({
+    let mut v = json!({
         "id": c.id,
         // (65535: a conventional channel)
         "system": c.system,
@@ -907,14 +907,18 @@ fn call_view(c: &Call, system_name: &str, patched: Vec<Value>) -> Value {
         "state": if c.recording { "recording" } else { "monitoring" },
         "reason": c.reason.map(|r| r.as_str()),
         "encrypted": c.encrypted,
-        "decrypted": c.decrypted,
-        "algId": c.alg_id,
-        "keyId": c.key_id,
         "emergency": c.emergency,
         "startS": c.start_s,
         "sources": c.sources.iter().map(|s| s.src).collect::<Vec<_>>(),
         "patched": patched,
-    })
+    });
+    // The key an encrypted call named, once keys are loaded (never the key); nothing otherwise.
+    if let (Some(a), Some(k)) = (c.alg_id, c.key_id) {
+        v["decrypted"] = json!(c.decrypted);
+        v["algId"] = json!(a);
+        v["keyId"] = json!(k);
+    }
+    v
 }
 
 #[cfg(test)]
