@@ -45,11 +45,35 @@ impl KeyState {
         self.0.lock().unwrap().store.clone()
     }
 
+    /// Where the key state is: counts every change (a refresh, a lock, an unlock, a config change). Read
+    /// it before taking the settings you will act on, and give it back to [`KeyState::refresh_at`] or
+    /// [`KeyState::unlock`], so that work begun on settings a newer change has replaced is dropped.
+    pub fn generation(&self) -> u64 {
+        self.0.lock().unwrap().generation
+    }
+
+    /// [`KeyState::refresh`], but only if nothing changed the keys since `started` ([`KeyState::generation`]):
+    /// else `s` may be stale, and the newer change has its own refresh coming.
+    pub fn refresh_at(&self, started: u64, s: &KeysSettings, config_dir: &Path) -> Notes {
+        if self.generation() != started {
+            return Notes::new();
+        }
+        self.refresh_checked(Some(started), s, config_dir)
+    }
+
     /// Bring what is held in line with the config. With a password file the keys are read from
     /// the files; with only a container, what was unlocked by a password stays while the
     /// container is the same one, else it is locked; with neither, nothing is held.
     pub fn refresh(&self, s: &KeysSettings, config_dir: &Path) -> Notes {
+        self.refresh_checked(None, s, config_dir)
+    }
+
+    fn refresh_checked(&self, started: Option<u64>, s: &KeysSettings, config_dir: &Path) -> Notes {
         let mut g = self.0.lock().unwrap();
+        // (Checked again under the lock: a change may have come between the caller's check and here.)
+        if started.is_some_and(|n| g.generation != n) {
+            return Notes::new();
+        }
         // (What the browsers show: which keys, not only how many; a replaced container with as many keys changes it.)
         let shown = |g: &Inner| (g.store.as_ref().map(|k| k.list()), g.from_prompt, g.problem.clone());
         g.generation += 1;
@@ -80,19 +104,19 @@ impl KeyState {
 
     /// Open the container the config names with `password`, typed in. The keys are held, in
     /// memory, if it opens; if not, nothing changes. Tries are at least a second apart.
-    pub fn unlock(&self, s: &KeysSettings, config_dir: &Path, password: &str) -> Result<Notes, String> {
+    ///
+    /// `started` is [`KeyState::generation`] read BEFORE `s` was taken from the config: if the keys
+    /// were changed since (a config change, a lock, a refresh), `s` may be out of date and nothing is installed.
+    pub fn unlock(&self, started: u64, s: &KeysSettings, config_dir: &Path, password: &str) -> Result<Notes, String> {
         if s.ekc_file.trim().is_empty() {
             return Err("No key container is set (keys.ekcFile).".into());
         }
-        let started;
         {
             let mut g = self.0.lock().unwrap();
             if g.last_try.is_some_and(|t| t.elapsed() < TRY_EVERY) {
                 return Err("Wait a moment before trying again.".into());
             }
             g.last_try = Some(Instant::now());
-            // (Taken in the same hold of the mutex: any change from here on is newer than this unlock.)
-            started = g.generation;
         }
         if password.is_empty() {
             return Err("Enter the container's password.".into());
@@ -122,8 +146,13 @@ impl KeyState {
     /// A change to the keys section of the config is being applied: any unlock still opening a
     /// container is dropped, not installed (call this before anything else is awaited; the refresh
     /// that follows would otherwise be the first thing to invalidate it).
-    pub fn invalidate(&self) {
-        self.0.lock().unwrap().generation += 1;
+    ///
+    /// Returns the generation now: the refresh for this config change is `refresh_at` it, so that
+    /// a still newer change drops it.
+    pub fn invalidate(&self) -> u64 {
+        let mut g = self.0.lock().unwrap();
+        g.generation += 1;
+        g.generation
     }
 
     /// Forget what is held (a password file's keys come back at the next refresh). The recorder is
@@ -208,13 +237,13 @@ mod tests {
         let s = settings("k.ekc", "");
         k.refresh(&s, &d);
         let version = k.status_json(&s)["version"].as_u64().unwrap();
-        assert!(k.unlock(&s, &d, "nope").unwrap_err().contains("could not decrypt"));
+        assert!(k.unlock(k.generation(), &s, &d, "nope").unwrap_err().contains("could not decrypt"));
         assert_eq!(state(&k, &s), "locked");
         assert_eq!(k.status_json(&s)["version"].as_u64().unwrap(), version);
         // (Tries are spaced.)
-        assert!(k.unlock(&s, &d, "testing1234").unwrap_err().contains("Wait"));
+        assert!(k.unlock(k.generation(), &s, &d, "testing1234").unwrap_err().contains("Wait"));
         std::thread::sleep(TRY_EVERY + Duration::from_millis(50));
-        k.unlock(&s, &d, "testing1234").unwrap();
+        k.unlock(k.generation(), &s, &d, "testing1234").unwrap();
         let st = k.status_json(&s);
         assert_eq!((st["state"].as_str(), st["source"].as_str(), st["count"].as_u64()), (Some("unlocked"), Some("password"), Some(3)));
         assert!(st["version"].as_u64().unwrap() > version);
@@ -224,9 +253,9 @@ mod tests {
         assert!(k.store().is_some());
         k.refresh(&settings("other.ekc", ""), &d);
         assert!(k.store().is_none());
-        k.unlock(&s, &d, "testing1234").ok();
+        k.unlock(k.generation(), &s, &d, "testing1234").ok();
         std::thread::sleep(TRY_EVERY + Duration::from_millis(50));
-        k.unlock(&s, &d, "testing1234").unwrap();
+        k.unlock(k.generation(), &s, &d, "testing1234").unwrap();
         k.lock();
         assert_eq!(state(&k, &s), "locked");
         assert!(k.store().is_none());
@@ -237,7 +266,7 @@ mod tests {
         let (d, k) = (dir("list"), KeyState::default());
         let s = settings("k.ekc", "");
         std::thread::sleep(Duration::from_millis(10));
-        k.unlock(&s, &d, "testing1234").unwrap();
+        k.unlock(k.generation(), &s, &d, "testing1234").unwrap();
         let list = k.list_json();
         assert_eq!(list["keys"].as_array().unwrap().len(), 3);
         assert!(list["keys"][0]["name"].is_string());
@@ -299,5 +328,33 @@ mod tests {
         let started = k.0.lock().unwrap().generation;
         k.commit_unlock(started, &s, open()).unwrap();
         assert!(k.store().is_some());
+    }
+
+    /// A reload of settings that a newer config change has replaced is dropped, not applied after it.
+    #[test]
+    fn a_stale_refresh_does_not_overwrite_a_newer_one() {
+        let (d, k) = (dir("stale"), KeyState::default());
+        std::fs::write(d.join("pw"), "testing1234\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("pw"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let old = settings("k.ekc", "pw");
+        let new = settings("", "");
+        // The old config's reload begins; a new config (no keys) is applied and refreshed first.
+        let started_old = k.generation();
+        let started_new = k.invalidate();
+        k.refresh_at(started_new, &new, &d);
+        assert!(k.store().is_none());
+        // Then the old one's reload gets its turn: it must not bring the old keys back.
+        assert!(k.refresh_at(started_old, &old, &d).is_empty());
+        assert!(k.store().is_none(), "the newer config stands");
+        // Two config changes in a row: the first one's refresh is dropped.
+        let first = k.invalidate();
+        let second = k.invalidate();
+        assert!(k.refresh_at(first, &old, &d).is_empty() && k.store().is_none());
+        k.refresh_at(second, &old, &d);
+        assert!(k.store().is_some(), "the latest change's own refresh applies");
     }
 }

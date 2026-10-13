@@ -852,15 +852,17 @@ async fn keys_unlock(ctx: &Arc<Ctx>, peer: Peer, u: Unlock) -> Value {
 
 /// Unlock, lock or re-read the decryption keys, and tell the running session and the browsers.
 fn keys_command(ctx: &Arc<Ctx>, kind: &str, password: &str) -> Result<(), String> {
+    // (The state is read before the settings: a config change that comes after drops this work, not the other way about.)
+    let started = ctx.keys.generation();
     let settings = ctx.config.lock().unwrap().keys.clone();
     let dir = ctx.config_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
     let notes = match kind {
-        "keysUnlock" => ctx.keys.unlock(&settings, &dir, password)?,
+        "keysUnlock" => ctx.keys.unlock(started, &settings, &dir, password)?,
         "keysLock" => {
             ctx.keys.lock();
             Vec::new()
         }
-        _ => ctx.keys.refresh(&settings, &dir),
+        _ => ctx.keys.refresh_at(started, &settings, &dir),
     };
     keys_changed(ctx, &settings);
     for (problem, text) in notes {
@@ -982,9 +984,7 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                 let old = std::mem::replace(&mut *ctx.config.lock().unwrap(), c.clone());
                 // A change to the keys section wins over an unlock that is still opening its container,
                 // from this moment, not from when the refresh below gets its turn.
-                if old.keys != c.keys {
-                    ctx.keys.invalidate();
-                }
+                let keys_generation = (old.keys != c.keys).then(|| ctx.keys.invalidate());
                 // A talkgroup file changed while recording (an Ignore flag set): the session takes it now.
                 if ctx.runner.lock().unwrap().is_some() {
                     let mut cmds = ctx.engine_cmds.lock().unwrap();
@@ -1001,10 +1001,11 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                     let (ctx2, c2) = (ctx.clone(), c.clone());
                     let _ = tokio::task::spawn_blocking(move || ctx2.plugins.reload(&c2)).await;
                 }
-                if old.keys != c.keys {
+                if let Some(generation) = keys_generation {
                     let (ctx2, keys) = (ctx.clone(), c.keys.clone());
                     let _ = tokio::task::spawn_blocking(move || {
-                        for (problem, text) in ctx2.keys.refresh(&keys, ctx2.config_path.parent().unwrap_or(std::path::Path::new("."))) {
+                        // (Dropped if a still newer change to the keys came meanwhile: that one refreshes.)
+                        for (problem, text) in ctx2.keys.refresh_at(generation, &keys, ctx2.config_path.parent().unwrap_or(std::path::Path::new("."))) {
                             if problem {
                                 log::warn!("{text}");
                             } else {

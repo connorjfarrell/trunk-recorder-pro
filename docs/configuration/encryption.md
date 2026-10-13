@@ -29,8 +29,9 @@ Keys come from a **KFDtool encrypted key container** (`.ekc`), made in
 [KFDtool](https://github.com/KFDtool/KFDtool) with its password. Keep the password in a separate file:
 
 ```bash
-printf '%s\n' 'the container password' > /etc/trunk-pro/keys.pw
-chmod 600 /etc/trunk-pro/keys.pw
+# (bash) Asks for the password without showing it, and makes the file private before the password goes in.
+(umask 077; read -r -s -p 'Container password: ' pw; echo; printf '%s\n' "$pw" > /etc/trunk-pro/keys.pw)
+unset pw
 ```
 
 Then add a `keys` section to the config:
