@@ -331,6 +331,8 @@ stdout with a summary on stderr. Where a tool takes `--rate`, `--fs` is accepted
 | `tool nxdnscan` | Every NXDN carrier in a capture |
 | `tool nxdn` | One NXDN channel's messages |
 | `tool nxdnsynth` | Make a synthetic NXDN capture |
+| `tool p25synth` | Make a synthetic P25 Phase 1 call, encrypted if asked ([Encryption keys](configuration/encryption.md#trying-it-without-a-radio)) |
+| `tool ekc` | List what a KFDtool key container holds (never the keys) |
 | `tool snr` | Weak-signal curves: decode a strong channel again with noise added |
 | `tool revoice` | Run a call's saved vocoder frames through the vocoder again |
 

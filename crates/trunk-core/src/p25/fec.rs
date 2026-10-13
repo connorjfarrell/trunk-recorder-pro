@@ -174,13 +174,18 @@ pub fn golay23_decode_soft(r: u32, w: &[f32]) -> Fec {
 }
 
 /// op25_hamming.h hmg1063EncTbl / hmg1063Dec: the corrected 6-bit hexbit.
-pub fn hamming1063_decode(data6: u32, parity4: u32) -> u8 {
+/// Hamming(10,6,3): the 4 parity bits of 6 data bits.
+pub fn hamming1063_parity(data6: u32) -> u8 {
     const ENC: [u8; 64] = [
         0, 12, 3, 15, 7, 11, 4, 8, 11, 7, 8, 4, 12, 0, 15, 3, 13, 1, 14, 2, 10, 6, 9, 5, 6, 10, 5, 9, 1, 13, 2, 14, 14, 2, 13, 1, 9, 5, 10,
         6, 5, 9, 6, 10, 2, 14, 1, 13, 3, 15, 0, 12, 4, 8, 7, 11, 8, 4, 11, 7, 15, 3, 12, 0,
     ];
+    ENC[(data6 & 63) as usize]
+}
+
+pub fn hamming1063_decode(data6: u32, parity4: u32) -> u8 {
     const DEC: [u8; 16] = [0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 8, 1, 16, 32, 0];
-    ((data6 as u8) ^ DEC[(ENC[(data6 & 63) as usize] ^ (parity4 & 15) as u8) as usize]) & 63
+    ((data6 as u8) ^ DEC[(hamming1063_parity(data6) ^ (parity4 & 15) as u8) as usize]) & 63
 }
 
 // ── Reed-Solomon over GF(64): primitive 0x43, first root α¹ (ezpwd) ──────────
@@ -229,6 +234,34 @@ fn gdiv(a: i32, b: i32) -> i32 {
 #[inline]
 fn gpow(e: i32) -> i32 {
     gf().exp[e.rem_euclid(63) as usize] as i32
+}
+
+/// Fill in the `nroots` parity symbols at the end of `cw` (data first, as [`rs_decode`] reads
+/// it; a shortened code's data starts later, the symbols before it zero).
+pub fn rs_encode(cw: &mut [u8; 63], nroots: usize) {
+    // The generator ∏ (x − α^j), j = 1..=nroots, lowest degree first.
+    let mut g = vec![0i32; nroots + 1];
+    g[0] = 1;
+    for j in 1..=nroots {
+        let r = gpow(j as i32);
+        for i in (0..=j).rev() {
+            let lower = if i > 0 { g[i - 1] } else { 0 };
+            g[i] = gmul(g[i], r) ^ lower;
+        }
+    }
+    let k = 63 - nroots;
+    let mut parity = vec![0i32; nroots];
+    for &m in &cw[..k] {
+        let fb = m as i32 ^ parity[0];
+        parity.rotate_left(1);
+        parity[nroots - 1] = 0;
+        for (j, p) in parity.iter_mut().enumerate() {
+            *p ^= gmul(fb, g[nroots - 1 - j]);
+        }
+    }
+    for (c, p) in cw[k..].iter_mut().zip(parity) {
+        *c = p as u8;
+    }
 }
 
 /// Decode a 63-symbol codeword in place (data first, `nroots` parity last).
@@ -336,6 +369,47 @@ pub fn rs_decode_erasures(cw: &mut [u8; 63], nroots: usize, erasures: &[usize], 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What rs_encode makes, rs_decode finds clean, and corrects as far as the code allows.
+    #[test]
+    fn rs_encode_makes_what_rs_decode_accepts() {
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // The three shortened codes the voice frames use: (24,12), (24,16), (36,20).
+        for (nroots, first) in [(12usize, 39usize), (8, 39), (16, 27)] {
+            for _ in 0..50 {
+                let mut cw = [0u8; 63];
+                for c in &mut cw[first..63 - nroots] {
+                    *c = (rnd() & 63) as u8;
+                }
+                rs_encode(&mut cw, nroots);
+                let mut clean = cw;
+                assert_eq!(rs_decode(&mut clean, nroots, first), 0, "{nroots} roots");
+                // Up to nroots / 2 symbol errors are corrected.
+                let mut bad = cw;
+                for e in 0..nroots / 2 {
+                    let at = first + (rnd() as usize % (63 - first));
+                    bad[at] ^= 1 + (e as u8 % 62);
+                    let _ = at;
+                }
+                let n = rs_decode(&mut bad, nroots, first);
+                assert!(n >= 0, "{nroots} roots: {n}");
+                assert_eq!(bad, cw);
+            }
+        }
+    }
+
+    #[test]
+    fn hamming1063_parity_is_what_decode_expects() {
+        for d in 0..64u32 {
+            assert_eq!(hamming1063_decode(d, hamming1063_parity(d) as u32) as u32, d);
+        }
+    }
 
     #[test]
     fn hamming15_soft_matches_brute_force() {

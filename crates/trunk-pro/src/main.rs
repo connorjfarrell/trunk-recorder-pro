@@ -69,7 +69,7 @@
 //! trunk-pro tool cc|voice|frames <capture.cu8> --center Hz --rate Hz (--cc Hz | --freq Hz) [options]
 //!     One P25 channel's decode, as JSON lines (the research/native-bench
 //!     format); `frames` only counts the frames of each type.
-//! trunk-pro tool p2 | smartnet | dmr | dmrscan | nxdn | nxdnscan | nxdnsynth | snr | ekc …
+//! trunk-pro tool p2 | smartnet | dmr | dmrscan | nxdn | nxdnscan | nxdnsynth | p25synth | snr | ekc …
 //!     Phase 2 slots, a SmartNet control channel, one DMR / NXDN channel,
 //!     every DMR / NXDN carrier in a capture, a synthetic NXDN capture,
 //!     weak-signal curves (each tool's module documents its options).
@@ -90,6 +90,7 @@ mod keystate;
 mod logging;
 mod monitor;
 mod nxdntool;
+mod p25synth;
 mod paths;
 mod platform;
 mod snrtool;
@@ -239,6 +240,8 @@ usage:
   trunk-pro tool ekc <keys.ekc> [--password-file path]   (or TRUNK_EKC_PASSWORD)
   trunk-pro tool nxdnsynth <out.cu8> --center Hz [--kind conv|typeC|typeD] [--nxdn 48|96]
       A synthetic NXDN capture, for checking a setup.
+  trunk-pro tool p25synth <out.cu8> [--freq Hz --center Hz] [--algid N --kid N (--key hex | --ekc f --password-file f)] [--start header|ldu1|ldu2]
+      A synthetic P25 Phase 1 call, encrypted if asked: for checking decryption end to end.
   trunk-pro tool snr <capture.cu8> --center Hz --rate Hz --freq Hz --kind dmr|p25|smartnet|p2 [--snr 40,20,…]
       Weak-signal curves: one channel decoded again with noise added.
   trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile fixed|enhanced|mbelib]

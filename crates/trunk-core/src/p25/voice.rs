@@ -35,7 +35,7 @@ fn extract(cw: &[u8], begin: usize, end: usize) -> u32 {
     cw[begin..end].iter().fold(0, |v, &b| (v << 1) | (b & 1) as u32)
 }
 #[inline]
-fn pngen(pr: &mut u32, nbits: u32) -> u32 {
+pub(crate) fn pngen(pr: &mut u32, nbits: u32) -> u32 {
     let mut n = 0;
     for i in (0..nbits).rev() {
         *pr = (173 * *pr + 13849) & 0xffff;

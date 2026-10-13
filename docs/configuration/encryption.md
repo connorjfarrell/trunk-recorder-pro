@@ -105,3 +105,20 @@ holds (algorithm, key id, name), to check it.
   it is followed as before too.
 - Link control in an encrypted call may itself be encrypted. It isn't decrypted yet, so talker
   aliases and radio ids of such calls aren't read.
+
+## Trying it without a radio
+
+`trunk-pro tool p25synth` makes a synthetic Phase 1 call as a capture file, encrypted under a key
+from your container, and `replay` then decrypts it with the same container:
+
+```bash
+trunk-pro tool p25synth call.cu8 --algid 0x84 --kid 1235 --ekc keys.ekc --password-file keys.pw
+trunk-pro replay call.cu8 --center 155150000 --rate 2400000 --p25 155200000 \
+    --ekc keys.ekc --password-file keys.pw --out calls/
+```
+
+The call is a test pattern, not speech, so it shows the path works (the receiver, your keys, the
+cipher, saving), not what a real system sounds like. Without `--ekc` on the `replay` the same file
+writes no call. `--start ldu1` or `ldu2` joins the call part-way, and `--key <hex>` gives a key
+directly. It makes Phase 1 only.
+

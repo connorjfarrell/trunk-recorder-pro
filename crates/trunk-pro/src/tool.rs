@@ -47,7 +47,7 @@ use trunk_core::p25::voice::{decode_hdu, decode_ldu1_lc, decode_ldu2_es, decode_
 use crate::{die, Args};
 
 pub fn run(a: &Args) {
-    let mode = a.positional.first().map(String::as_str).unwrap_or_else(|| die("tool cc|voice|frames|p2|smartnet|dmr|dmrscan|nxdn|nxdnscan|nxdnsynth|snr|revoice|ekc|sdr … (trunk-pro --help)"));
+    let mode = a.positional.first().map(String::as_str).unwrap_or_else(|| die("tool cc|voice|frames|p2|smartnet|dmr|dmrscan|nxdn|nxdnscan|nxdnsynth|snr|revoice|ekc|p25synth|sdr … (trunk-pro --help)"));
     if mode == "p2" {
         return run_p2(a);
     }
@@ -71,6 +71,9 @@ pub fn run(a: &Args) {
     }
     if mode == "sdr" {
         return run_sdr(a);
+    }
+    if mode == "p25synth" {
+        return crate::p25synth::run(a);
     }
     if mode == "ekc" {
         return run_ekc(a);
@@ -293,7 +296,7 @@ fn voice_line(
     s
 }
 
-fn num_any(a: &Args, key: &str) -> u32 {
+pub(crate) fn num_any(a: &Args, key: &str) -> u32 {
     a.get(key).map_or(0, |v| {
         let v = v.trim();
         if let Some(h) = v.strip_prefix("0x") { u32::from_str_radix(h, 16) } else { v.parse() }.unwrap_or_else(|_| die(&format!("--{key}: not a number")))
