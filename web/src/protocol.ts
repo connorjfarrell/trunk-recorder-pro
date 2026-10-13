@@ -322,7 +322,7 @@ export interface KeysSettings {
   passwordFile: string;
   /** Config file only: let a private-network address unlock the keys (plain HTTP: the password is not encrypted on the way). */
   allowLanUnlock?: boolean;
-  /** Config file only: plugin id → the sentence (docs/configuration/encryption.md) that lets a plugin sending outside this network be given decrypted calls. */
+  /** Config file only: plugin id → the sentence (docs/configuration/encryption.md) that lets that plugin be given decrypted calls. None are allowed by default. */
   shareDecrypted?: Record<string, string>;
 }
 

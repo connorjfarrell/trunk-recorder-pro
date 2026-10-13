@@ -198,6 +198,10 @@ impl PluginHost {
                     }
                     // From here on a copy goes by its label: its notes, its data folder.
                     s.id = super::copy_label(&s.id, s.copy);
+                    // Said every time it starts, where it can't be missed.
+                    if let super::guard::Verdict::Acknowledged(to) = &s.decrypted {
+                        notes(Note::Log { plugin: s.id.clone(), level: Level::Warn, text: format!("RECEIVES DECRYPTED CALLS (keys.shareDecrypted): every call decrypted with your keys is sent to it, and it sends to {to}. Remove keys.shareDecrypted.{} to stop.", super::parse_label(&s.id).0) });
+                    }
                     // Not set up yet (the interface says so too): it would only fail.
                     let unset = unset_required(m.config.as_ref(), &s.config);
                     if !unset.is_empty() {
@@ -513,7 +517,7 @@ impl Shared {
                     self.note_log(
                         &p.id,
                         Level::Warn,
-                        format!("is not given decrypted calls: {why}. To allow it, say so in the config: keys.shareDecrypted.{} = \"{}\"", super::parse_label(&p.id).0, super::guard::PHRASE),
+                        format!("is NOT given decrypted calls: {why}. Sending decrypted calls out is risky (a call uploaded can't be taken back, and may become public). Only if you are sure and authorized, set keys.shareDecrypted.{} to \"{}\" in the config file", super::parse_label(&p.id).0, super::guard::PHRASE),
                     );
                 }
                 continue;
@@ -761,12 +765,12 @@ mod tests {
     #[test]
     fn a_decrypted_call_goes_only_to_the_plugins_allowed_it() {
         use super::super::guard::Verdict;
-        let (local, local_rx) = test_plugin("rdioscanner", Verdict::Local);
+        let (allowed, local_rx) = test_plugin("rdioscanner", Verdict::Acknowledged("192.168.1.5 (on your network)".into()));
         let (public, public_rx) = test_plugin("openmhz", Verdict::Withheld("it sends to api.openmhz.com, which isn't on this network".into()));
         let said = Arc::new(Mutex::new(Vec::<String>::new()));
         let log = said.clone();
         let sh = Shared {
-            plugins: vec![local, public],
+            plugins: vec![allowed, public],
             stopping: AtomicBool::new(false),
             go: Arc::new(AtomicBool::new(true)),
             notes: Arc::new(move |n| {
@@ -780,16 +784,11 @@ mod tests {
         assert!(local_rx.try_recv().is_ok() && public_rx.try_recv().is_ok(), "a clear call goes to both");
         sh.dispatch(topic::CALL_CONCLUDED, &msg, true);
         sh.dispatch(topic::AUDIO, &msg, true);
-        assert!(local_rx.try_recv().is_ok() && local_rx.try_recv().is_ok(), "the local plugin gets the call and its audio");
+        assert!(local_rx.try_recv().is_ok() && local_rx.try_recv().is_ok(), "the plugin that was allowed gets the call and its audio");
         assert!(public_rx.try_recv().is_err(), "the public one gets neither");
         // It is told once, with how to allow it, never the key.
         let said = said.lock().unwrap();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].starts_with("openmhz: is not given decrypted calls") && said[0].contains("keys.shareDecrypted.openmhz"), "{said:?}");
-        let (hosts, none) = (
-            [Verdict::Local, Verdict::Acknowledged].iter().all(Verdict::allowed),
-            !Verdict::Withheld(String::new()).allowed(),
-        );
-        assert!(hosts && none);
     }
 }

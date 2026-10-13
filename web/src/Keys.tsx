@@ -55,6 +55,10 @@ export function KeysPanel() {
             Details
           </a>
         </p>
+        <p className="bad-text small" role="note">
+          <strong>Decrypted calls are never sent to plugins (uploaders, streamers) unless you allow each one in the config file.</strong> Uploading them is risky: a call
+          uploaded can't be taken back and may become public. Allow it only if you are sure and authorized (<code>keys.shareDecrypted</code>, see Details).
+        </p>
         <div className="row wrap" style={{ alignItems: "flex-start", gap: 8 }}>
           <div className="field" style={{ flex: 1, minWidth: "16em" }}>
             <label className="field-label" htmlFor="keys-ekc">

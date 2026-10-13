@@ -1,59 +1,54 @@
 //! Which plugins may be given decrypted calls.
 //!
-//! A call decrypted with keys the operator holds is not for public services: an upload to
-//! OpenMHz or Broadcastify would publish what the system's owner encrypted. So, by default, a
-//! plugin is given a decrypted call (its live audio and its concluded files) only when every
-//! place it sends to is on this network (a private or loopback address, or a name that can only
-//! be local). Any other plugin is withheld from them unless the config says, in the plugin's
-//! own entry under `keys.shareDecrypted`, the sentence in [`PHRASE`]. That is for the config
-//! file only: the interface never offers it.
+//! A call decrypted with keys the operator holds is not for upload by default, anywhere: not to a
+//! public service (which would publish what the system's owner encrypted), and not to a server of
+//! your own either (which may be reachable from outside, or copy calls onward). Every plugin is
+//! withheld from decrypted calls (their live audio and concluded files) unless the config says,
+//! in that plugin's own entry under `keys.shareDecrypted`, the sentence in [`PHRASE`]. That is
+//! for the config file only: the interface never offers it. Where a plugin sends to (read from
+//! its settings) is only reported, in the log, so the choice is made with it in view.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use serde_json::Value;
 
-/// What a config must say, for a plugin that sends elsewhere, to be given decrypted calls.
-pub const PHRASE: &str = "I understand decrypted calls will leave my own network";
+/// What a config must say, for each plugin that is to be given decrypted calls.
+pub const PHRASE: &str = "I accept that decrypted calls will be sent to this plugin and may become public, and I am authorized to share them";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Everything it sends to is on this network.
-    Local,
-    /// The config said, in the words asked for, that it may.
-    Acknowledged,
+    /// The config said, in the words asked for, that it may: where it sends to, for the log.
+    Acknowledged(String),
     /// Not given decrypted calls: why.
     Withheld(String),
 }
 
 impl Verdict {
     pub fn allowed(&self) -> bool {
-        !matches!(self, Verdict::Withheld(_))
+        matches!(self, Verdict::Acknowledged(_))
     }
 }
 
-/// Whether plugin `id` (a plugin's id, not a copy's label) may be given decrypted calls, from its
-/// settings (recorder-wide `global`, and each system's) and `shareDecrypted`.
+/// Whether plugin `id` (a plugin's id, not a copy's label) may be given decrypted calls, from
+/// `shareDecrypted`; its settings (recorder-wide `global`, and each system's) say where it sends.
 pub fn judge(id: &str, global: &Value, per_system: &BTreeMap<String, Value>, share: &BTreeMap<String, String>) -> Verdict {
     let mut hosts = destinations(global);
     for v in per_system.values() {
         hosts.extend(destinations(v));
     }
-    if !hosts.is_empty() && hosts.iter().all(|h| is_local_host(h)) {
-        return Verdict::Local;
-    }
-    match share.get(id).map(|s| s.trim()) {
-        Some(p) if p == PHRASE => return Verdict::Acknowledged,
-        Some(_) => return Verdict::Withheld(format!("keys.shareDecrypted.{id} is not the exact sentence asked for")),
-        None => {}
-    }
-    let why = if hosts.is_empty() {
-        "it names no place on this network it sends to".to_string()
+    hosts.sort();
+    hosts.dedup();
+    let sends_to = if hosts.is_empty() {
+        "somewhere its settings don't say".to_string()
     } else {
-        let outside: Vec<&str> = hosts.iter().filter(|h| !is_local_host(h)).map(String::as_str).collect();
-        format!("it sends to {}, which isn't on this network", outside.join(", "))
+        hosts.iter().map(|h| format!("{h} ({})", if is_local_host(h) { "on your network" } else { "OUTSIDE your network" })).collect::<Vec<_>>().join(", ")
     };
-    Verdict::Withheld(why)
+    match share.get(id).map(|s| s.trim()) {
+        Some(p) if p == PHRASE => Verdict::Acknowledged(sends_to),
+        Some(_) => Verdict::Withheld(format!("keys.shareDecrypted.{id} is not the exact sentence asked for (it sends to {sends_to})")),
+        None => Verdict::Withheld(format!("it sends to {sends_to}, and keys.shareDecrypted doesn't allow it")),
+    }
 }
 
 /// The hosts a plugin's settings name: the host of every URL in them, and the value of keys that
@@ -153,30 +148,32 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_is_judged_by_everywhere_it_sends() {
-        let local = json!({ "server": "http://192.168.1.5:3000" });
-        assert_eq!(judge("rdioscanner", &local, &BTreeMap::new(), &none()), Verdict::Local);
-        // One place outside the network is enough.
-        let mut systems = BTreeMap::new();
-        systems.insert("sys".to_string(), json!({ "server": "https://api.openmhz.com" }));
-        assert!(!judge("openmhz", &local, &systems, &none()).allowed());
-        // Public by default, and a plugin that names nowhere is unknown, which is withheld too.
-        assert!(!judge("openmhz", &json!({ "server": "https://api.openmhz.com" }), &BTreeMap::new(), &none()).allowed());
-        assert!(!judge("broadcastify", &json!({}), &BTreeMap::new(), &none()).allowed());
-        assert!(!judge("upload-script", &json!({ "command": "curl -T" }), &BTreeMap::new(), &none()).allowed());
+    fn no_plugin_is_given_decrypted_calls_without_the_sentence() {
+        // Not a LAN one, not a public one, not one that names nowhere.
+        for settings in [json!({ "server": "http://192.168.1.5:3000" }), json!({ "server": "https://api.openmhz.com" }), json!({})] {
+            let v = judge("p", &settings, &BTreeMap::new(), &none());
+            assert!(!v.allowed(), "{settings}: {v:?}");
+        }
+        // It says where the plugin sends to, for the one deciding.
+        let v = judge("p", &json!({ "server": "https://api.openmhz.com" }), &BTreeMap::new(), &none());
+        assert!(matches!(&v, Verdict::Withheld(w) if w.contains("api.openmhz.com (OUTSIDE your network)")), "{v:?}");
+        let v = judge("p", &json!({ "server": "http://192.168.1.5:3000" }), &BTreeMap::new(), &none());
+        assert!(matches!(&v, Verdict::Withheld(w) if w.contains("192.168.1.5 (on your network)")), "{v:?}");
     }
 
     #[test]
-    fn only_the_exact_sentence_lets_an_outside_plugin_through() {
+    fn only_the_exact_sentence_lets_a_plugin_through() {
         let public = json!({ "server": "https://api.openmhz.com" });
         let mut share = BTreeMap::new();
         share.insert("openmhz".to_string(), PHRASE.to_string());
-        assert_eq!(judge("openmhz", &public, &BTreeMap::new(), &share), Verdict::Acknowledged);
-        share.insert("openmhz".to_string(), "yes".to_string());
         let v = judge("openmhz", &public, &BTreeMap::new(), &share);
-        assert!(matches!(&v, Verdict::Withheld(w) if w.contains("exact sentence")), "{v:?}");
-        share.insert("openmhz".to_string(), PHRASE.to_ascii_uppercase());
-        assert!(!judge("openmhz", &public, &BTreeMap::new(), &share).allowed());
+        assert!(matches!(&v, Verdict::Acknowledged(w) if w.contains("OUTSIDE")), "{v:?}");
+        // The same for a plugin on the LAN: it is no exception.
+        assert!(judge("openmhz", &json!({ "server": "http://10.0.0.5" }), &BTreeMap::new(), &share).allowed());
+        for wrong in ["yes", "true", "I understand decrypted calls will leave my own network", &PHRASE.to_ascii_uppercase(), ""] {
+            share.insert("openmhz".to_string(), wrong.to_string());
+            assert!(!judge("openmhz", &public, &BTreeMap::new(), &share).allowed(), "{wrong:?}");
+        }
         // Another plugin's sentence isn't this one's.
         let mut other = BTreeMap::new();
         other.insert("broadcastify".to_string(), PHRASE.to_string());
