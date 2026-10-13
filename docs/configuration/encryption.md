@@ -14,13 +14,12 @@ unless [`recordEncrypted`](recording.md#recording-keys) is on).
 DMR and NXDN calls aren't decrypted. A key for another algorithm in your container
 (3DES, Motorola DES-XL) is ignored, and the log says so.
 
-**Phase 2 is newer than Phase 1 and less checked.** Phase 1 is verified against the standard
-(TIA-102.AAAD) and against captures from real radios. The standard's text for Phase 2 voice
-(TIA-102.AAAD-B) isn't public; the layout used here (18 voice frames of 7 keystream octets in each
-superframe, the MI in the MAC_PTT and each superframe's ESS) is the one op25 and DSD-FME agree on,
-and it is tested against a separate implementation of the same layout, not against a capture from
-a Phase 2 system. If your Phase 2 call decrypts to noise with the right key, tell us (with the
-algorithm and a capture if you can).
+**How well each is checked.** DES-OFB and AES-256 are checked against the worked examples in the
+standards (TIA-102.AAAD and its Phase 2 edition AAAD-B: the keystream, the frame positions and the
+encrypted frames) for both Phase 1 and Phase 2. Phase 1 DES-OFB, AES-256 and ADP are also checked
+against captures from real radios. ADP is Motorola's and isn't in the standards; on Phase 2 it uses
+the layout op25 and DSD-FME share, and has not been checked against a Phase 2 radio. If a known-key
+call decrypts to noise, tell us (with the algorithm, and a capture if you can).
 
 ## Setting it up
 

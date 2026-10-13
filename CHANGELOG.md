@@ -9,7 +9,7 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   section of the config at a KFDtool encrypted key container (`.ekc`) and the
   file with its password, and calls encrypted with DES-OFB, AES-256 or ADP
   under a key in the container are recorded decrypted, on Phase 1 and Phase 2
-  (Phase 2 is checked against other decoders, not yet a real system). Calls under any other
+  (checked against the standards' examples; ADP on Phase 2 against other decoders only). Calls under any other
   key are handled as before. Without a `keys` section nothing changes. The
   password file must be readable by you alone (`chmod 600`). Call JSON gains
   `decrypted`, `alg_id` and `key_id` (`encrypted` still means encrypted on the
