@@ -60,9 +60,27 @@ struct Slot {
     aliases: MacAliases,
     /// Decryption, when keys were given ([`TdmaTracker::set_keys`]).
     crypto: Option<Crypto>,
+    /// Whether the call's cipher is known: from its PTT, or an ESS. Joined mid-call it isn't until
+    /// the first ESS, at the end of a superframe; with keys, the voice before it is held.
+    known: bool,
+    /// The 4V bursts' frames since the last superframe's end, held until the cipher is known.
+    held: Vec<AmbeFrame>,
 }
 
 impl Slot {
+    /// The cipher is known now (an ESS): the frames held for it. Of a clear call they are voice,
+    /// a little late; of an encrypted one, they are a whole superframe's 4V frames only when 16
+    /// were held (so their places are known) and are decrypted then; else they are lost.
+    fn release_held(&mut self, c: usize, out: &mut Vec<(usize, TrackerOut)>) {
+        let held = std::mem::take(&mut self.held);
+        if self.encrypted && held.len() != 16 {
+            return;
+        }
+        for (i, f) in held.into_iter().enumerate() {
+            self.voice_frame(c, Some(i), f, out);
+        }
+    }
+
     /// One voice frame of logical channel `c`, `idx`th of its superframe
     /// (None: its place isn't known): decrypted when the call is encrypted
     /// and its key and MI are known, vocoded, and given to `out`. What the
@@ -103,6 +121,8 @@ impl Slot {
             talkgroup: None,
             aliases: MacAliases::default(),
             crypto: None,
+            known: false,
+            held: Vec::new(),
         }
     }
 }
@@ -205,6 +225,8 @@ impl TdmaTracker {
                 if let Some(cr) = &mut s.crypto {
                     cr.reset();
                 }
+                s.known = false;
+                s.held.clear();
             }
             s.end_s = t;
             // ESS (op25 handle_4V2V_ess)
@@ -222,11 +244,23 @@ impl TdmaTracker {
                 if let Some(cr) = &mut s.crypto {
                     cr.dec.sync(&EncryptionSync { algid: ess.algid, keyid: ess.keyid, mi: ess.mi });
                 }
+                s.known = true;
+                s.release_held(c, out);
             }
             let at: &[usize] = if kind == BURST_4V { &[11, 48, 96, 133] } else { &[11, 48] };
             for (k, &a) in at.iter().enumerate() {
                 let f = decode_vcw(&x[a..a + 36], self.soft.then(|| rel(a)));
                 self.frames += 1;
+                if s.crypto.is_some() && !s.known {
+                    // Clear or encrypted isn't known yet: a 4V burst's frames wait for the ESS.
+                    if kind == BURST_4V {
+                        s.held.push(f);
+                        if s.held.len() > 16 {
+                            s.held.remove(0);
+                        }
+                    }
+                    continue;
+                }
                 // Which of the superframe's 18 frames it is: 4 to each 4V burst, the 2V's 2 last
                 // (a 4V burst out of step has no place in it).
                 let idx = match kind {
@@ -238,6 +272,8 @@ impl TdmaTracker {
                 }
             }
             if kind == BURST_2V {
+                // (The superframe is over; what is still held had no ESS to say what it was.)
+                s.held.clear();
                 let a = s.next_algid;
                 Self::set_encryption(s, c, a, out);
                 // The superframe is over: the MI its ESS gave (or the LFSR's step) is the next one's.
@@ -267,6 +303,8 @@ impl TdmaTracker {
                         cr.reset();
                         cr.dec.header(&EncryptionSync { algid: ptt.algid, keyid: ptt.keyid, mi: ptt.mi });
                     }
+                    s.known = true;
+                    s.held.clear();
                     out.push((c, TrackerOut::Info { source: (ptt.source != 0).then_some(ptt.source), emergency: false, encrypted: s.encrypted }));
                 }
                 MAC_END_PTT => {
@@ -276,6 +314,8 @@ impl TdmaTracker {
                     if let Some(cr) = &mut s.crypto {
                         cr.reset();
                     }
+                    s.known = false;
+                    s.held.clear();
                 }
                 MAC_ACTIVE => s.first4v = if pdu.offset > 4 { 0 } else { pdu.offset as i32 },
                 _ => {}

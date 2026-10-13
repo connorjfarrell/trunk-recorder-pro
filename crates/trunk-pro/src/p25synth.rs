@@ -1,7 +1,9 @@
-//! `trunk-pro tool p25synth <out.cu8> [--center Hz] [--freq Hz] [--rate Hz] [--nac N] [--tg N]
-//! [--src N] [--superframes N] [--start header|ldu1|ldu2] [--algid N --kid N (--key hex | --ekc
-//! file [--password-file file]) [--mi hex]]` — a synthetic P25 Phase 1 call as a capture
-//! (rtl_sdr's cu8), in noise: one conventional channel at `--freq`. With `--algid` its voice is
+//! `trunk-pro tool p25synth <out.cu8> [--phase2 [--channel 0|1] [--sysid N --wacn N]] [--center Hz]
+//! [--freq Hz] [--rate Hz] [--nac N] [--tg N] [--src N] [--superframes N] [--start header|ldu1|ldu2]
+//! [--algid N --kid N (--key hex | --ekc file [--password-file file]) [--mi hex]]` — a synthetic P25
+//! call as a capture (rtl_sdr's cu8), in noise: one channel at `--freq`, Phase 1 (C4FM) or, with
+//! `--phase2`, one logical channel of a Phase 2 (H-DQPSK) voice channel (decode it with `tool p2
+//! --nac N --sysid N --wacn N`). With `--algid` its voice is
 //! encrypted: under `--key`, or the key the container holds for that algorithm and key id, so
 //! a capture made from a container is decrypted by the same container. Its voice is a test
 //! pattern, not speech. For checking a setup end to end (`replay --p25 <freq> --ekc …`), or
@@ -57,6 +59,9 @@ pub fn run(a: &Args) {
         m[..8].copy_from_slice(&mi);
         Crypt { algid, kid, key, mi: m }
     });
+    if a.flag("phase2") {
+        return run_phase2(a, path, center, freq, fs, start, crypt);
+    }
     let call = Call { nac: if a.get("nac").is_some() { crate::tool::num_any(a, "nac") as u16 } else { 0x293 }, tgid: a.num("tg", 1001.0) as u16, source: a.num("src", 4_567_890.0) as u32, crypt, superframes: a.num("superframes", 5.0) as usize, start };
     let frames = call.frames(imbe).unwrap_or_else(|e| die(&format!("{e}")));
 
@@ -102,3 +107,72 @@ pub fn run(a: &Args) {
         call.crypt.as_ref().map_or(String::new(), |c| format!(", encrypted: algorithm {:#04x}, key id {}", c.algid, c.kid))
     );
 }
+
+fn run_phase2(a: &Args, path: &str, center: f64, freq: f64, fs: f64, start: Start, crypt: Option<Crypt>) {
+    use trunk_core::nxdn::synth::ambe;
+    use trunk_core::p25::synth_p2::{modulate, Call};
+    let num = |k: &str, d: u32| if a.get(k).is_some() { crate::tool::num_any(a, k) } else { d };
+    let call = Call {
+        nac: num("nac", 0x293),
+        sys_id: num("sysid", 0x2a5),
+        wacn: num("wacn", 0xbee00),
+        tgid: a.num("tg", 1001.0) as u16,
+        source: a.num("src", 4_567_890.0) as u32,
+        crypt,
+        superframes: a.num("superframes", 5.0) as usize,
+        channel: a.num("channel", 0.0) as usize & 1,
+        start,
+    };
+    if (fs / 6000.0).fract() != 0.0 {
+        die("--rate: a whole number of samples per symbol at 6000 baud (a multiple of 6000)");
+    }
+    let dibits = call.dibits(ambe).unwrap_or_else(|e| die(&format!("{e}")));
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut noise = |n: usize| -> Vec<Complex32> {
+        (0..n)
+            .map(|_| {
+                let mut u = || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+                };
+                let (x, y) = (u(), u());
+                let r = (-2.0 * x.ln()).sqrt() * 0.01;
+                let t = 2.0 * std::f64::consts::PI * y;
+                Complex32::new((r * t.cos()) as f32, (r * t.sin()) as f32)
+            })
+            .collect()
+    };
+    let mut iq = noise((fs * 0.3) as usize);
+    let mut phase = 0.0;
+    let mut tx = modulate(&dibits, fs, freq - center, 0.25, &mut phase);
+    for (t, n) in tx.iter_mut().zip(noise(tx_len(&dibits, fs))) {
+        *t += n;
+    }
+    iq.extend(tx);
+    iq.extend(noise((fs * 0.5) as usize));
+    let mut w = BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| die(&format!("{path}: {e}"))));
+    for v in &iq {
+        w.write_all(&[(v.re * 127.5 + 127.5).clamp(0.0, 255.0) as u8, (v.im * 127.5 + 127.5).clamp(0.0, 255.0) as u8]).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    }
+    w.flush().unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    eprintln!(
+        "{path}: {:.1} s at {fs} S/s, centre {center} Hz; Phase 2 channel {freq} Hz, logical channel {}, NAC {:#x}, system {:#x}, WACN {:#x}, talkgroup {}, {} superframes{}",
+        iq.len() as f64 / fs,
+        call.channel,
+        call.nac,
+        call.sys_id,
+        call.wacn,
+        call.tgid,
+        call.superframes,
+        call.crypt.as_ref().map_or(String::new(), |c| format!(", encrypted: algorithm {:#04x}, key id {}", c.algid, c.kid))
+    );
+}
+
+/// How many samples the modulated call has (its symbols, and the pulse filter's tail).
+fn tx_len(dibits: &[u8], fs: f64) -> usize {
+    let sps = (fs / 6000.0) as usize;
+    dibits.len() * sps + 8 * sps + 1
+}
+

@@ -95,8 +95,10 @@ holds (algorithm, key id, name), to check it.
   `decrypted`, `algId` and `keyId`.
 - A Phase 1 call joined part-way through is decrypted from its first superframe on: the receiver
   works out the call's cipher state from the next encryption sync, and the first 180 ms of such a call
-  are held until it has. A Phase 2 call joined part-way through (without its start) is decrypted from
-  the first superframe's last burst on, up to 360 ms in.
+  are held until it has. A Phase 2 call joined without its start learns its cipher at the end of the
+  first superframe it sees (its ESS); with keys loaded the voice until then is held, so a call
+  joined at a superframe's start loses nothing, and one joined part-way through loses that
+  first partial superframe (up to 360 ms).
 - **Wrong keys give noise.** P25 voice has no check that a key is right, so a call whose key id is
   loaded with the wrong key sounds like static, as it does in a real radio.
 - While keys are loaded, a call flagged encrypted is recorded from its grant (the grant doesn't say
@@ -120,5 +122,11 @@ trunk-pro replay call.cu8 --center 155150000 --rate 2400000 --p25 155200000 \
 The call is a test pattern, not speech, so it shows the path works (the receiver, your keys, the
 cipher, saving), not what a real system sounds like. Without `--ekc` on the `replay` the same file
 writes no call. `--start ldu1` or `ldu2` joins the call part-way, and `--key <hex>` gives a key
-directly. It makes Phase 1 only.
+directly.
+
+`--phase2` makes a Phase 2 call instead (one logical channel of a TDMA voice channel, `--channel 0`
+or `1`, scrambled for `--nac`, `--sysid` and `--wacn`). Phase 2 voice needs its system's control
+channel for those numbers, so `replay` can't play it alone; `trunk-pro tool p2 call.cu8 --nac …
+--sysid … --wacn …` decodes it, and it is IQ for any other decoder to try (DSD-FME, op25) with the
+same key.
 

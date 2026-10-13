@@ -7,6 +7,7 @@ pub mod fec;
 pub mod frame;
 pub mod phase2;
 pub mod synth;
+pub mod synth_p2;
 pub mod tsbk;
 pub mod voice;
 
