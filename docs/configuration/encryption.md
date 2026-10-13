@@ -17,7 +17,9 @@ DMR and NXDN calls aren't decrypted. A key for another algorithm in your contain
 **How well each is checked.** DES-OFB and AES-256 are checked against the worked examples in the
 standards (TIA-102.AAAD and its Phase 2 edition AAAD-B: the keystream, the frame positions and the
 encrypted frames) for both Phase 1 and Phase 2. Phase 1 DES-OFB, AES-256 and ADP are also checked
-against captures from real radios. ADP is Motorola's and isn't in the standards; on Phase 2 it uses
+against captures from real radios, and Phase 2 AES-256 has been used on a live system's own traffic
+with its keys (a Phase 2 trunked system, decoded with an SDRplay). DES-OFB on Phase 2 has not been
+tried on a live system. ADP is Motorola's and isn't in the standards; on Phase 2 it uses
 the layout op25 and DSD-FME share, and has not been checked against a Phase 2 radio. If a known-key
 call decrypts to noise, tell us (with the algorithm, and a capture if you can).
 
