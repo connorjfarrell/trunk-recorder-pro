@@ -371,8 +371,9 @@ function take(m: FromRecorder): void {
       break;
     case "keys": {
       const { type: _, ...keys } = m;
-      // What is held changed (or it is the first we hear): the list is asked for again.
-      if (state.keys?.version !== keys.version && keys.state !== "off") transport.send({ type: "keysQuery" });
+      // Every status that isn't "off" asks again: the list (when what is held changed), and what this
+      // connection may do (which the recorder decides, and the config can change without the keys changing).
+      if (keys.state !== "off") transport.send({ type: "keysQuery" });
       set({ keys, ...(keys.count === 0 ? { heldKeys: [] } : {}) });
       break;
     }

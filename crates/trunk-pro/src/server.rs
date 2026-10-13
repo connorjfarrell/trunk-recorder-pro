@@ -864,7 +864,7 @@ fn keys_command(ctx: &Arc<Ctx>, kind: &str, password: &str) -> Result<(), String
         }
         _ => ctx.keys.refresh_at(started, &settings, &dir),
     };
-    keys_changed(ctx, &settings);
+    keys_changed(ctx);
     for (problem, text) in notes {
         if problem {
             log::warn!("{text}");
@@ -885,11 +885,14 @@ pub(crate) fn keys_result(v: &Value, result: Result<(), String>) -> Value {
 }
 
 /// What is held changed: the running session uses it from the next call, and browsers are told.
-pub(crate) fn keys_changed(ctx: &Ctx, settings: &trunk_app::config::KeysSettings) {
+pub(crate) fn keys_changed(ctx: &Ctx) {
     if ctx.runner.lock().unwrap().is_some() {
         ctx.engine_cmds.lock().unwrap().push(crate::runtime::EngineCmd::Keys(ctx.keys.store()));
     }
-    publish(&ctx.hub, ctx.keys.status_json(settings));
+    // (The config as it is now, not the settings the caller worked from: a slower, older task that
+    // finishes last must not show the browsers a state for settings that have been replaced.)
+    let settings = ctx.config.lock().unwrap().keys.clone();
+    publish(&ctx.hub, ctx.keys.status_json(&settings));
     warn_if_exposed(ctx);
 }
 
@@ -1012,7 +1015,7 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                                 log::info!("{text}");
                             }
                         }
-                        keys_changed(&ctx2, &keys);
+                        keys_changed(&ctx2);
                     })
                     .await;
                 }

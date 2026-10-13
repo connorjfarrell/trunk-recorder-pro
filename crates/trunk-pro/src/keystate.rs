@@ -69,8 +69,11 @@ impl KeyState {
     }
 
     fn refresh_checked(&self, started: Option<u64>, s: &KeysSettings, config_dir: &Path) -> Notes {
+        // The files are read before the lock is taken: opening the container takes a moment, and a Lock
+        // or a newer change of config must not wait behind it (it would find this refresh still current).
+        let loaded = (!s.ekc_file.trim().is_empty() && !s.password_file.trim().is_empty()).then(|| keyfiles::load(s, config_dir));
         let mut g = self.0.lock().unwrap();
-        // (Checked again under the lock: a change may have come between the caller's check and here.)
+        // (Checked under the lock: whatever changed the keys while the files were read wins.)
         if started.is_some_and(|n| g.generation != n) {
             return Notes::new();
         }
@@ -79,7 +82,7 @@ impl KeyState {
         g.generation += 1;
         let before = shown(&g);
         let mut notes = Notes::new();
-        if s.ekc_file.trim().is_empty() || s.password_file.trim().is_empty() {
+        let Some(loaded) = loaded else {
             if !(g.from_prompt && !s.ekc_file.trim().is_empty() && g.ekc == s.ekc_file) {
                 g.store = None;
                 g.from_prompt = false;
@@ -88,13 +91,16 @@ impl KeyState {
             if s.ekc_file.trim().is_empty() && !s.password_file.trim().is_empty() {
                 notes.push((true, "Decryption is off: keys.passwordFile is set but keys.ekcFile is not".into()));
             }
-        } else {
-            let loaded = keyfiles::load(s, config_dir);
-            g.problem = loaded.keys.is_none().then(|| loaded.notes.iter().find(|n| n.0).map_or("no usable keys".to_string(), |n| n.1.clone()));
-            g.store = loaded.keys;
-            g.from_prompt = false;
-            notes = loaded.notes;
-        }
+            g.ekc = s.ekc_file.clone();
+            if before != shown(&g) {
+                g.version += 1;
+            }
+            return notes;
+        };
+        g.problem = loaded.keys.is_none().then(|| loaded.notes.iter().find(|n| n.0).map_or("no usable keys".to_string(), |n| n.1.clone()));
+        g.store = loaded.keys;
+        g.from_prompt = false;
+        notes = loaded.notes;
         g.ekc = s.ekc_file.clone();
         if before != shown(&g) {
             g.version += 1;
