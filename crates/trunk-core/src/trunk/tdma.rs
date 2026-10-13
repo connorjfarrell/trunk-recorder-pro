@@ -511,7 +511,7 @@ mod tests {
                     s.crypto.as_mut().unwrap().dec.sync(&es(next_mi(&mi), 7));
                 }
                 s.voice_frame(0, Some(n), sent(&mi, n), &mut out);
-                for (_, o) in out.drain(..).collect::<Vec<_>>() {
+                for (_, o) in std::mem::take(&mut out) {
                     match o {
                         TrackerOut::Info { encrypted: true, .. } => tx.mark_encrypted(t),
                         TrackerOut::Crypto { decrypted: true, .. } => tx.mark_decrypted(t),
