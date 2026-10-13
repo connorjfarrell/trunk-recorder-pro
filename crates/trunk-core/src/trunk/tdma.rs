@@ -351,11 +351,23 @@ impl TdmaTracker {
         }
     }
 
+    /// The algorithm the next superframe is under (an ESS said so, or the last one goes on). The call's
+    /// own "encrypted" flag, in the engine, is sticky; the slot's follows the algorithm both ways, so
+    /// the voice of a stretch that goes clear is not put through the decryptor and dropped.
     fn set_encryption(s: &mut Slot, c: usize, algid: u8, out: &mut Vec<(usize, TrackerOut)>) {
         s.algid = algid;
-        if s.active && algid != ALGID_CLEAR && !s.encrypted {
+        if !s.active {
+            return;
+        }
+        if algid != ALGID_CLEAR && !s.encrypted {
             s.encrypted = true;
             out.push((c, TrackerOut::Info { source: None, emergency: false, encrypted: true }));
+        } else if algid == ALGID_CLEAR && s.encrypted {
+            s.encrypted = false;
+            // (If it turns encrypted again, what the call names is told again, and counts as decrypted again.)
+            if let Some(cr) = &mut s.crypto {
+                cr.reported = None;
+            }
         }
     }
 }
@@ -502,6 +514,21 @@ mod tests {
         assert!(s.voice_frame(0, Some(3), AmbeFrame { bits: clear(3), errs: 0 }, &mut out).is_some());
         assert_eq!(audio(&out)[0][..], clear(3)[..]);
         assert!(events(&out).is_empty());
+    }
+
+    /// A stretch that goes clear is clear in the slot too (its voice isn't put through the decryptor and
+    /// dropped), and becoming encrypted again says so again.
+    #[test]
+    fn a_slot_follows_the_algorithm_to_clear_and_back() {
+        let mut s = slot(true);
+        let mut out = Vec::new();
+        assert!(s.encrypted);
+        TdmaTracker::set_encryption(&mut s, 0, ALGID_CLEAR, &mut out);
+        assert!(!s.encrypted && out.is_empty());
+        assert!(s.crypto.as_ref().unwrap().reported.is_none());
+        TdmaTracker::set_encryption(&mut s, 0, ALGID_DES_OFB, &mut out);
+        assert!(s.encrypted);
+        assert!(matches!(out.as_slice(), [(0, TrackerOut::Info { encrypted: true, .. })]));
     }
 
     /// What the engine makes of a decrypted call's outputs, superframe after superframe: the

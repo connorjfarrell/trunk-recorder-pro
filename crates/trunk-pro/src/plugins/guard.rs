@@ -55,13 +55,15 @@ pub fn judge(id: &str, global: &Value, per_system: &BTreeMap<String, Value>, sha
 /// taken as decrypted: it is withheld, never released on a classification that isn't certain.
 pub fn call_json_decrypted(json: &str) -> bool {
     match serde_json::from_str::<Value>(json) {
-        Ok(v) => match &v["decrypted"] {
-            Value::Bool(b) => *b,
-            Value::Number(n) => n.as_i64() != Some(0),
-            Value::Null => false,
-            _ => true,
+        // Only a record with no `decrypted` at all is a clear one (what the recorder writes when
+        // no key was named). A null, a flag of another kind, or JSON that isn't a record is withheld.
+        Ok(Value::Object(m)) => match m.get("decrypted") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Number(n)) => n.as_i64() != Some(0),
+            Some(_) => true,
         },
-        Err(_) => true,
+        _ => true,
     }
 }
 
@@ -185,6 +187,12 @@ mod tests {
         assert!(call_json_decrypted(r#"{"talkgroup":1,"decrypt"#));
         assert!(call_json_decrypted(""));
         assert!(call_json_decrypted(r#"{"decrypted":"yes"}"#));
+        // Valid JSON that isn't a record with a proper flag: withheld too.
+        assert!(call_json_decrypted(r#"{"decrypted":null}"#));
+        assert!(call_json_decrypted("[]"));
+        assert!(call_json_decrypted("null"));
+        assert!(call_json_decrypted(r#""decrypted""#));
+        assert!(call_json_decrypted("42"));
     }
 
     #[test]

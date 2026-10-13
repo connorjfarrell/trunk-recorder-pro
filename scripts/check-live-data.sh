@@ -110,6 +110,10 @@ rule "a home-directory path" '.*' '' '(/Users/|/home/)[A-Za-z0-9._-]+'
 rule "a SDR serial number or MAC address" '.*' '' '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|[Ss]erial[^A-Za-z0-9]{1,4}0?x?[0-9A-Fa-f]{16}($|[^0-9A-Za-z])'
 
 # ── Your own terms ──────────────────────────────────────────────────────────────────────────────
+if [ -n "$deny_file" ] && ! { [ -f "$deny_file" ] && [ -r "$deny_file" ]; }; then
+  echo "check-live-data: --denylist $deny_file is not a readable file; not running with fewer checks than asked for." >&2
+  exit 2
+fi
 { [ -n "$deny_file" ] && cat "$deny_file"; printf '%s\n' "${LIVE_DATA_DENYLIST:-}"; } | grep -v -E '^\s*(#|$)' > "$tmp/deny.txt" || true
 n=0
 terms=0

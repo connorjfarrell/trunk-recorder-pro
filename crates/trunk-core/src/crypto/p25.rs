@@ -296,10 +296,17 @@ impl Decryptor {
     pub fn sync(&mut self, es: &EncryptionSync) {
         self.name(es);
         if es.algid == ALGID_CLEAR {
+            // Nothing is encrypted now: no MI is kept from what was.
+            self.mi = None;
+            self.next = None;
+            self.stream = None;
             return;
         }
-        if self.mi.is_none() {
-            self.mi = Some(prev_mi(&es.mi));
+        // This sync is authoritative: the superframe it ends is the one before the MI it carries.
+        // (If a whole earlier superframe's sync was missed, the MI held is one behind: rebased here.)
+        let current = prev_mi(&es.mi);
+        if self.mi != Some(current) {
+            self.mi = Some(current);
             self.stream = None;
         }
         self.next = Some(es.mi);
@@ -469,6 +476,26 @@ mod tests {
         assert_ne!(b, orig);
         ks.apply_tdma(9, &mut b);
         assert_eq!(b, orig);
+    }
+
+    /// A sync is authoritative: after a whole superframe whose sync was missed, the next one rebases the MI;
+    /// a clear sync forgets it.
+    #[test]
+    fn a_sync_rebases_the_mi_and_a_clear_one_forgets_it() {
+        let key = Arc::new({
+            let mut s = KeyStore::new();
+            s.insert(crate::crypto::Key::new(ALGID_DES_OFB, 7, "k".into(), 0, true, hex(DES_KEY)));
+            s
+        });
+        let es = |mi: Mi, algid: u8| EncryptionSync { algid, keyid: 7, mi };
+        let (m1, m2, m3) = (mi(HEADER_MI), next_mi(&mi(HEADER_MI)), next_mi(&next_mi(&mi(HEADER_MI))));
+        let mut d = Decryptor::new(key);
+        d.header(&es(m1, ALGID_DES_OFB));
+        // Superframe 1's whole sync (and its end) was missed. Superframe 2's sync tells m3: the MI now is m2.
+        d.sync(&es(m3, ALGID_DES_OFB));
+        assert_eq!(d.mi, Some(m2), "rebased, not left one behind");
+        d.sync(&es(m3, ALGID_CLEAR));
+        assert_eq!((d.mi, d.next), (None, None), "a clear sync forgets the MI");
     }
 
     #[test]
