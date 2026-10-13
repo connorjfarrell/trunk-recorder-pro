@@ -962,10 +962,7 @@ impl Conventional {
             if decrypted {
                 l.tx.mark_decrypted(now_s);
             }
-            if (l.call.alg_id, l.call.key_id, l.call.decrypted) != (Some(algid), Some(key_id), decrypted) || !l.call.encrypted {
-                (l.call.alg_id, l.call.key_id, l.call.decrypted, l.call.encrypted) = (Some(algid), Some(key_id), decrypted, true);
-                changed = true;
-            }
+            changed |= l.call.note_crypto(algid, key_id, decrypted);
         }
         if changed {
             out.push(ConvOut::Update(l.call.clone()));

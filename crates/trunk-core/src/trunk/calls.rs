@@ -136,6 +136,21 @@ impl Call {
         (self.phase2_tdma || self.color_code.is_some()).then_some(self.tdma_slot)
     }
 
+    /// An encrypted call named its key (`key_id` under algorithm `algid`),
+    /// and whether its voice is being decoded with a key we hold. Once any of
+    /// its voice was, the call stays `decrypted` and keeps that key's name; a
+    /// later transmission under a key we lack doesn't unsay it. True when
+    /// that changed the call.
+    pub fn note_crypto(&mut self, algid: u8, key_id: u16, decrypted: bool) -> bool {
+        let before = (self.alg_id, self.key_id, self.decrypted, self.encrypted);
+        if decrypted || !self.decrypted {
+            (self.alg_id, self.key_id) = (Some(algid), Some(key_id));
+        }
+        self.decrypted |= decrypted;
+        self.encrypted = true;
+        before != (self.alg_id, self.key_id, self.decrypted, self.encrypted)
+    }
+
     /// Fold in the talkgroups patched with it now (`members`); true when that added any.
     fn note_patch(&mut self, members: Vec<u32>) -> bool {
         let n = self.patched_talkgroups.len();
@@ -438,7 +453,14 @@ impl CallManager {
         } else {
             match host.record(c) {
                 Ok(()) => c.recording = true,
-                Err(r) => c.reason = Some(r),
+                Err(r) => {
+                    c.reason = Some(r);
+                    // (Reached by an encrypted call only when keys might decrypt it:) no
+                    // recorder for it, then at least its link control, as without keys.
+                    if c.encrypted && !cfg.record_encrypted {
+                        host.follow(c);
+                    }
+                }
             }
         }
     }
@@ -463,11 +485,13 @@ mod tests {
         keys: bool,
         recorded: usize,
         followed: usize,
+        /// No recorder is free.
+        full: bool,
     }
     impl RecorderHost for KeyedHost {
         fn record(&mut self, _: &Call) -> Result<(), Reason> {
             self.recorded += 1;
-            Ok(())
+            if self.full { Err(Reason::NoRecorder) } else { Ok(()) }
         }
         fn follow(&mut self, _: &Call) -> bool {
             self.followed += 1;
@@ -483,14 +507,30 @@ mod tests {
     fn a_call_flagged_encrypted_is_recorded_only_when_keys_might_decrypt_it() {
         let enc = |t: f64| Message { encrypted: true, ..msg(MessageType::Grant, t, 101) };
         // No keys: followed for its link control, as ever.
-        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: false, recorded: 0, followed: 0 });
+        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: false, recorded: 0, followed: 0, full: false });
         m.handle(&[enc(0.0)], &mut h, &mut ev);
         assert_eq!((h.recorded, h.followed, m.calls[0].recording, m.calls[0].reason), (0, 1, false, Some(Reason::Encrypted)));
         // Keys: recorded, in case its key is one of them.
-        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: true, recorded: 0, followed: 0 });
+        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: true, recorded: 0, followed: 0, full: false });
         m.handle(&[enc(0.0)], &mut h, &mut ev);
         assert_eq!((h.recorded, h.followed, m.calls[0].recording, m.calls[0].reason), (1, 0, true, None));
         assert!(m.calls[0].encrypted && !m.calls[0].decrypted);
+        // Keys, but no recorder free: still followed for its link control.
+        let (mut m, mut ev, mut h) = (manager(), Vec::new(), KeyedHost { keys: true, recorded: 0, followed: 0, full: true });
+        m.handle(&[enc(0.0)], &mut h, &mut ev);
+        assert_eq!((h.recorded, h.followed, m.calls[0].recording, m.calls[0].reason), (1, 1, false, Some(Reason::NoRecorder)));
+    }
+
+    #[test]
+    fn a_call_stays_decrypted_once_any_of_it_was() {
+        let mut c = Call::default();
+        assert!(c.note_crypto(0x84, 7, false));
+        assert_eq!((c.encrypted, c.decrypted, c.alg_id, c.key_id), (true, false, Some(0x84), Some(7)));
+        assert!(!c.note_crypto(0x84, 7, false), "nothing new");
+        assert!(c.note_crypto(0x84, 7, true));
+        // A later transmission under another key we don't hold: not unsaid, key not renamed.
+        assert!(!c.note_crypto(0x81, 9, false));
+        assert_eq!((c.decrypted, c.alg_id, c.key_id), (true, Some(0x84), Some(7)));
     }
 
     fn msg(kind: MessageType, t: f64, tg: u32) -> Message {

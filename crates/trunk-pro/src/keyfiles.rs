@@ -20,12 +20,20 @@ fn resolve(file: &str, config_dir: &Path) -> PathBuf {
 
 /// Secrets mounted by Docker and Kubernetes are root-owned and world-readable
 /// inside the one container that has them; their mode is not ours to ask for.
+/// Where the file really is decides (a `..` or a link out of the mount doesn't count).
+#[cfg(unix)]
 fn is_secret_mount(path: &Path) -> bool {
-    path.starts_with("/run/secrets") || path.starts_with("/var/run/secrets")
+    std::fs::canonicalize(path).is_ok_and(|real| under_secret_mount(&real))
+}
+
+/// Whether `real` (a canonical path) is under a secrets mount.
+#[cfg(unix)]
+fn under_secret_mount(real: &Path) -> bool {
+    real.starts_with("/run/secrets") || real.starts_with("/var/run/secrets")
 }
 
 /// A password file other users can read is as good as no password: refuse it
-/// (as ssh does a private key), on systems that have modes.
+/// (as ssh does a private key), on systems that have modes (Windows doesn't).
 #[cfg(unix)]
 fn check_password_perms(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -42,7 +50,6 @@ fn check_password_perms(path: &Path) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn check_password_perms(path: &Path) -> Result<(), String> {
-    let _ = is_secret_mount;
     if !path.is_file() {
         return Err(format!("{}: not a file", path.display()));
     }
@@ -57,7 +64,8 @@ fn read_password(path: &Path) -> Result<zeroize::Zeroizing<String>, String> {
         return Err(format!("{}: too large for a password file", path.display()));
     }
     let text = zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?);
-    let first = text.split(['\r', '\n']).next().unwrap_or("");
+    // (An editor's byte-order mark isn't part of the password.)
+    let first = text.strip_prefix('\u{feff}').unwrap_or(&text).split(['\r', '\n']).next().unwrap_or("");
     if first.is_empty() {
         return Err(format!("{}: the first line, the password, is empty", path.display()));
     }
@@ -98,22 +106,38 @@ pub fn load(s: &KeysSettings, config_dir: &Path) -> Loaded {
         Err(e) => return off(format!("{}: {e}", ekc_path.display())),
     };
     let mut notes = Vec::new();
-    for k in container.keys.list() {
-        if !p25::supported(k.algid) {
-            notes.push((true, format!("Key {:?} (algorithm {:#04x}, key id {}) is for an algorithm that is not supported; it is not used", k.name, k.algid, k.kid)));
-        }
-    }
+    let mut keys = container.keys;
+    notes.extend(vet(&mut keys));
     for sk in &container.skipped {
         notes.push((false, format!("Key {:?} not loaded: {}", sk.name, sk.reason)));
     }
-    let usable = container.keys.list().iter().filter(|k| p25::supported(k.algid)).count();
-    notes.push((false, format!("Decryption keys: {usable} loaded from {}", ekc_path.display())));
-    Loaded { keys: (usable > 0).then(|| Arc::new(container.keys)), notes }
+    notes.push((false, format!("Decryption keys: {} loaded from {}", keys.len(), ekc_path.display())));
+    #[cfg(not(unix))]
+    notes.push((false, "The password file's permissions are not checked on this system: keep it readable by you alone".to_string()));
+    Loaded { keys: (!keys.is_empty()).then(|| Arc::new(keys)), notes }
+}
+
+/// Take out the keys that can never decrypt (an algorithm that isn't supported, a
+/// size the algorithm doesn't take), saying so for each.
+fn vet(keys: &mut KeyStore) -> Vec<(bool, String)> {
+    let mut notes = Vec::new();
+    for info in keys.list() {
+        let len = keys.get(info.algid, info.kid).map_or(0, |k| k.bytes().len());
+        let why = match p25::key_len(info.algid) {
+            None => "is for an algorithm that is not supported".to_string(),
+            Some(want) if want != len => format!("is {len} bytes, not the {want} that algorithm takes"),
+            Some(_) => continue,
+        };
+        notes.push((true, format!("Key {:?} (algorithm {:#04x}, key id {}) {why}; it is not used", info.name, info.algid, info.kid)));
+    }
+    keys.retain(|k| p25::key_len(k.algid) == Some(k.bytes().len()));
+    notes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trunk_core::crypto::Key;
 
     // trunk-core's test container: throwaway keys.
     fn ekc_bytes() -> Vec<u8> {
@@ -156,7 +180,8 @@ mod tests {
         let l = load(&settings(&e, &p), &d);
         let keys = l.keys.unwrap();
         // The test container holds ADP, AES-256, DES-OFB and a DES-XL key; DES-XL isn't supported.
-        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.len(), 3);
+        assert!(keys.get(0x9f, 1236).is_none());
         assert!(l.notes.iter().any(|(bad, t)| *bad && t.contains("0x9f")));
         assert!(l.notes.iter().any(|(bad, t)| !*bad && t.contains("3 loaded")));
         assert!(l.notes.iter().all(|(_, t)| !t.contains("testing1234")));
@@ -170,6 +195,30 @@ mod tests {
             let p = write(&d, name, body, 0o600);
             assert!(load(&settings(&e, &p), &d).keys.is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_not_part_of_the_password() {
+        let d = dir("bom");
+        let e = write(&d, "k.ekc", ekc_bytes(), 0o600);
+        let p = write(&d, "k.pw", "\u{feff}testing1234\r\n", 0o600);
+        assert!(load(&settings(&e, &p), &d).keys.is_some());
+    }
+
+    #[test]
+    fn keys_that_can_never_decrypt_are_named_and_left_out() {
+        let k = |algid: u8, kid: u16, len: usize| Key::new(algid, kid, format!("key{kid}"), 0, true, vec![0; len]);
+        let mut s = KeyStore::new();
+        for key in [k(0x84, 1, 32), k(0x84, 2, 16), k(0x81, 3, 8), k(0x81, 4, 7), k(0xaa, 5, 5), k(0x83, 6, 24)] {
+            s.insert(key);
+        }
+        let notes = vet(&mut s);
+        assert_eq!(s.list().iter().map(|k| k.kid).collect::<Vec<_>>(), [3, 1, 5]);
+        assert_eq!(notes.len(), 3);
+        assert!(notes.iter().all(|(bad, _)| *bad));
+        assert!(notes.iter().any(|(_, t)| t.contains("key2") && t.contains("16 bytes, not the 32")));
+        assert!(notes.iter().any(|(_, t)| t.contains("key6") && t.contains("not supported")));
+        assert!(notes.iter().all(|(_, t)| !t.contains("0, 0, 0")));
     }
 
     #[test]
@@ -211,10 +260,18 @@ mod tests {
         }
     }
 
+    /// Only a file really inside the secrets mount is exempt, by where it is, not by how its path is spelled.
+    #[cfg(unix)]
     #[test]
-    fn container_mounted_secrets_are_not_held_to_a_mode() {
-        assert!(is_secret_mount(Path::new("/run/secrets/keys_pw")));
-        assert!(is_secret_mount(Path::new("/var/run/secrets/kubernetes.io/x")));
-        assert!(!is_secret_mount(Path::new("/tmp/run/secrets/x")));
+    fn the_secrets_mount_exemption_is_by_real_location() {
+        assert!(under_secret_mount(Path::new("/run/secrets/keys_pw")));
+        assert!(under_secret_mount(Path::new("/var/run/secrets/kubernetes.io/x")));
+        assert!(!under_secret_mount(Path::new("/tmp/run/secrets/x")));
+        let d = dir("mount");
+        let f = write(&d, "k.pw", "x", 0o644);
+        // A file elsewhere isn't exempt however its path is written; nor is one that isn't there.
+        assert!(!is_secret_mount(&d.join(&f)));
+        assert!(!is_secret_mount(&d.join("sub/../k.pw")));
+        assert!(!is_secret_mount(Path::new("/run/secrets/../nonexistent")));
     }
 }

@@ -467,6 +467,13 @@ struct Radio {
 }
 
 impl Radio {
+    /// A call's recording taken out of the pool, its recorder free again.
+    fn take_recording(&mut self, id: CallId) -> Option<Recording> {
+        let rec = self.recordings.remove(&id)?;
+        self.free_nums.push(rec.recorder_num);
+        Some(rec)
+    }
+
     fn source_for(&self, hz: f64) -> Option<usize> {
         self.sources.iter().position(|s| (hz - s.cfg.center_hz).abs() <= s.cfg.usable_half_width())
     }
@@ -653,7 +660,7 @@ impl RecorderHost for SysHost<'_> {
 
     fn can_decrypt(&self, call: &Call) -> bool {
         // (Only Phase 1 so far.)
-        self.radio.keys.is_some() && !call.analog && !call.phase2_tdma && call.color_code.is_none() && call.nxdn.is_none()
+        self.radio.keys.is_some() && VoiceKind::of(call) == VoiceKind::Fdma
     }
 
     fn release(&mut self, call: &Call) {
@@ -1562,31 +1569,19 @@ impl Engine {
                             rec.tx.mark_decrypted(now);
                         }
                     }
-                    let mut no_key_recorded = false;
                     let record_encrypted = t.calls.cfg.record_encrypted;
-                    if let Some(c) = t.calls.call_mut(id) {
-                        let mut changed = (c.alg_id, c.key_id) != (Some(algid), Some(key_id)) || c.decrypted != decrypted;
-                        (c.alg_id, c.key_id, c.decrypted) = (Some(algid), Some(key_id), decrypted);
-                        if !c.encrypted {
-                            c.encrypted = true;
-                            changed = true;
-                        }
-                        // An encrypted call we hold no key for was recorded only in case we did:
-                        // with no audio yet, it is followed instead, as one flagged encrypted is.
-                        no_key_recorded = !decrypted && c.recording && !record_encrypted;
-                        if changed {
-                            self.call_events.push(CallEvent::Update(c.clone()));
-                        }
+                    let Some(c) = t.calls.call_mut(id) else { continue };
+                    let mut changed = c.note_crypto(algid, key_id, decrypted);
+                    // An encrypted call we hold no key for was recorded only in case we did: with
+                    // no audio yet, it is followed instead, as one flagged encrypted is without keys.
+                    if !decrypted && c.recording && !record_encrypted && self.radio.recordings.get(&id).is_some_and(|rec| rec.audio.is_empty()) {
+                        self.radio.take_recording(id);
+                        c.recording = false;
+                        c.reason = Some(Reason::Encrypted);
+                        changed = true;
                     }
-                    if no_key_recorded && self.radio.recordings.get(&id).is_some_and(|rec| rec.audio.is_empty()) {
-                        if let Some(rec) = self.radio.recordings.remove(&id) {
-                            self.radio.free_nums.push(rec.recorder_num);
-                        }
-                        if let Some(c) = t.calls.call_mut(id) {
-                            c.recording = false;
-                            c.reason = Some(Reason::Encrypted);
-                            self.call_events.push(CallEvent::Update(c.clone()));
-                        }
+                    if changed {
+                        self.call_events.push(CallEvent::Update(c.clone()));
                     }
                 }
                 // (Only conventional FM asks for it.)
@@ -1645,8 +1640,7 @@ impl Engine {
 
     /// A call ended: save it, or (multi-site) the best of its copies once the last one ends.
     fn conclude(&mut self, call: &Call) {
-        let held = self.radio.recordings.remove(&call.id).map(|rec| {
-            self.radio.free_nums.push(rec.recorder_num);
+        let held = self.radio.take_recording(call.id).map(|rec| {
             Held { call: call.clone(), audio: rec.audio, frames: rec.frames, recorder_num: rec.recorder_num, tx: rec.tx, reception: rec.reception, freq_error_hz: (rec.freq_error.1 > 0).then(|| rec.freq_error.0 / rec.freq_error.1 as f64) }
         });
         let trunks = &self.trunks;
@@ -1872,6 +1866,106 @@ mod tests {
         grant(&mut e, f, 1.5, 303, true, 0);
         assert_eq!(e.radio.channels.len(), 1);
         assert!(e.radio.channels[&(0, f)].calls.iter().all(Option::is_some));
+    }
+
+    /// An engine with a key for DES-OFB key id 7, and a call flagged encrypted on TG 101.
+    fn keyed_engine_with_call() -> (Engine, CallId) {
+        use crate::crypto::{Key, KeyStore};
+        let mut store = KeyStore::new();
+        store.insert(Key::new(0x81, 7, "k".into(), 0, true, vec![0; 8]));
+        let sys = SystemConfig { short_name: "s".into(), control_channels: vec![851.0125e6], save: SaveRules { normalize: false, ..Default::default() }, ..Default::default() };
+        let cfg = EngineConfig {
+            systems: vec![sys],
+            sources: vec![SourceConfig { center_hz: 851e6, rate_hz: 2.4e6, auto_tune: false, guard_hz: DEFAULT_GUARD_HZ }],
+            keys: Some(Arc::new(store)),
+            ..Default::default()
+        };
+        let mut e = Engine::new(cfg).unwrap();
+        let Engine { trunks, radio, call_events, .. } = &mut e;
+        let mut host = trunks[0].host(radio);
+        let m = Message { kind: MessageType::Grant, time_s: 0.0, talkgroup: 101, freq_hz: 851_500_000, encrypted: true, ..Default::default() };
+        trunks[0].calls.handle(&[m], &mut host, call_events);
+        let id = trunks[0].calls.calls[0].id;
+        (e, id)
+    }
+
+    fn audio_out() -> TrackerOut {
+        use super::super::frames::{Codec, VoiceFrame};
+        let f = VoiceFrame { codec: Codec::Imbe, bits: vec![0; 88], e0: 0, errs: 0, erased: false, kind: mbe::Kind::Voice };
+        TrackerOut::Audio(vec![0.1; mbe::FRAME_SAMPLES], f)
+    }
+
+    /// A call flagged encrypted is recorded while keys are loaded; when its
+    /// voice is decrypted its audio is saved (not left out as encrypted) and
+    /// its call says which key.
+    #[test]
+    fn a_decrypted_call_is_saved_with_its_audio() {
+        let (mut e, id) = keyed_engine_with_call();
+        assert!(e.trunks[0].calls.calls[0].recording, "recorded from the grant, in case a key fits");
+        // What the tracker says for a call joined mid-superframe, then later LDU1s.
+        e.radio.pending.push((0, id, TrackerOut::Info { source: Some(5), emergency: false, encrypted: true }));
+        e.radio.pending.push((0, id, TrackerOut::Crypto { algid: 0x81, key_id: 7, decrypted: true }));
+        for _ in 0..9 {
+            e.radio.pending.push((0, id, audio_out()));
+        }
+        e.radio.pending.push((0, id, TrackerOut::Info { source: Some(5), emergency: false, encrypted: false }));
+        for _ in 0..9 {
+            e.radio.pending.push((0, id, audio_out()));
+        }
+        e.apply_pending();
+        let c = &e.trunks[0].calls.calls[0];
+        assert!(c.recording && c.encrypted && c.decrypted);
+        assert_eq!((c.alg_id, c.key_id), (Some(0x81), Some(7)));
+        e.emit_call_events();
+        e.drain_events();
+        let Engine { trunks, radio, call_events, .. } = &mut e;
+        let mut host = trunks[0].host(radio);
+        trunks[0].calls.tick(30.0, &mut host, call_events);
+        e.emit_call_events();
+        let ev = e.drain_events();
+        let k = ev.iter().find_map(|x| if let Event::Concluded(k) = x { Some(k) } else { None }).expect("the call is saved");
+        assert_eq!(k.audio.len(), 18 * mbe::FRAME_SAMPLES, "all of its audio");
+        assert!(k.json.contains("\"encrypted\":1,\"decrypted\":1,\"alg_id\":129,\"key_id\":7,"), "{}", k.json);
+        assert!(!k.json.contains("00000000"), "no key in it");
+    }
+
+    /// With no key for what it named, a call recorded in case is followed instead, and its recorder freed.
+    #[test]
+    fn a_call_with_no_key_gives_its_recorder_back() {
+        let (mut e, id) = keyed_engine_with_call();
+        let num = e.radio.recordings[&id].recorder_num;
+        e.radio.pending.push((0, id, TrackerOut::Info { source: None, emergency: false, encrypted: true }));
+        e.radio.pending.push((0, id, TrackerOut::Crypto { algid: 0x81, key_id: 9, decrypted: false }));
+        e.apply_pending();
+        let c = &e.trunks[0].calls.calls[0];
+        assert!(!c.recording && c.reason == Some(Reason::Encrypted) && !c.decrypted);
+        assert_eq!((c.alg_id, c.key_id), (Some(0x81), Some(9)));
+        assert!(e.radio.recordings.is_empty());
+        assert!(e.radio.free_nums.contains(&num), "the recorder is free for another call");
+        assert!(e.radio.channels.contains_key(&(0, 851_500_000)), "its voice channel stays, for the link control");
+        // Nothing left to save when it ends.
+        e.emit_call_events();
+        e.drain_events();
+        let Engine { trunks, radio, call_events, .. } = &mut e;
+        let mut host = trunks[0].host(radio);
+        trunks[0].calls.tick(30.0, &mut host, call_events);
+        e.emit_call_events();
+        assert!(saved(&e.drain_events()).is_empty());
+        // (Frames that did decode stop a call being dropped for a key we lack: not here, none did.)
+    }
+
+    /// Audio already recorded keeps the recording, even when a later transmission's key is missing.
+    #[test]
+    fn a_call_with_audio_keeps_its_recording_when_a_later_key_is_missing() {
+        let (mut e, id) = keyed_engine_with_call();
+        e.radio.pending.push((0, id, TrackerOut::Crypto { algid: 0x81, key_id: 7, decrypted: true }));
+        e.radio.pending.push((0, id, audio_out()));
+        e.radio.pending.push((0, id, TrackerOut::Crypto { algid: 0x81, key_id: 9, decrypted: false }));
+        e.apply_pending();
+        let c = &e.trunks[0].calls.calls[0];
+        assert!(c.recording && c.decrypted);
+        assert_eq!((c.alg_id, c.key_id), (Some(0x81), Some(7)), "the key that decrypted");
+        assert_eq!(e.radio.recordings.len(), 1);
     }
 
     fn saved(ev: &[Event]) -> Vec<CallId> {

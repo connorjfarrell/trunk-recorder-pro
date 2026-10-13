@@ -38,6 +38,20 @@ struct Crypto {
     reported: Option<(u8, u16, bool)>,
 }
 
+impl Crypto {
+    /// A new call or transmission: nothing named, held or reported.
+    fn reset(&mut self) {
+        self.dec.reset();
+        self.held.clear();
+        self.reported = None;
+    }
+
+    /// Its voice is being decrypted: the call is no longer news as "encrypted".
+    fn decrypting(&self) -> bool {
+        matches!(self.reported, Some((_, _, true)))
+    }
+}
+
 pub struct VoiceTracker {
     dec: mbe::Decoder,
     active: bool,
@@ -120,14 +134,14 @@ impl VoiceTracker {
                             if svc & 0x40 != 0 && self.algid == ALGID_CLEAR as i32 {
                                 self.set_encryption(ALGID_UNKNOWN, out);
                             }
-                            out.push(TrackerOut::Info { source: lc.source, emergency: svc & 0x80 != 0, encrypted: self.encrypted });
+                            out.push(TrackerOut::Info { source: lc.source, emergency: svc & 0x80 != 0, encrypted: self.reports_encrypted() });
                         } else if let Some(a) = self.aliases.lcw(&lc.raw, self.talker, self.tgid) {
                             out.push(TrackerOut::Alias(a));
                         }
                     }
                 } else if let Some(es) = best_es(g) {
                     self.set_encryption(es.algid as i32, out);
-                    self.ldu2_sync(&es, out);
+                    self.ldu2_sync(&es);
                 }
                 // A cut frame (the next sync came early, in every receiver):
                 // from the first codeword that fails its FEC or runs past the
@@ -136,10 +150,7 @@ impl VoiceTracker {
                 let cut_at = (!complete).then(|| best.raw.len());
                 let chosen = best_imbe(g);
                 let ldu2 = best.nid.duid == LDU2;
-                if ldu2 {
-                    // Whatever the LDU1 before it held either has its MI now or never will.
-                    self.release_held(out);
-                }
+                self.begin_ldu(ldu2, out);
                 let mut erased = false;
                 for (k, p) in chosen.iter().enumerate() {
                     if cut_at.is_some_and(|c| p.errs > 2 || ldu_codeword_end_bit(k) >= c) {
@@ -176,8 +187,7 @@ impl VoiceTracker {
                 self.active = false;
                 self.algid = ALGID_CLEAR as i32;
                 if let Some(c) = &mut self.crypto {
-                    c.dec.reset();
-                    c.held.clear();
+                    c.reset();
                 }
             }
             _ => {}
@@ -193,9 +203,7 @@ impl VoiceTracker {
         self.end_s = t;
         self.call_frames = 0;
         if let Some(c) = &mut self.crypto {
-            c.dec.reset();
-            c.held.clear();
-            c.reported = None;
+            c.reset();
         }
     }
 
@@ -205,8 +213,7 @@ impl VoiceTracker {
             self.active = false;
             self.algid = ALGID_CLEAR as i32;
             if let Some(c) = &mut self.crypto {
-                c.dec.reset();
-                c.held.clear();
+                c.reset();
             }
         }
         if !self.active {
@@ -226,11 +233,30 @@ impl VoiceTracker {
     /// An LDU2's encryption sync, before its voice: it names the key and
     /// the next superframe's MI, which also tells a receiver that joined
     /// mid-call the MI of the superframe it is in.
-    fn ldu2_sync(&mut self, es: &EncryptionSync, out: &mut Vec<TrackerOut>) {
+    fn ldu2_sync(&mut self, es: &EncryptionSync) {
         if let Some(c) = &mut self.crypto {
             c.dec.ldu2_sync(es);
         }
-        self.release_held(out);
+    }
+
+    /// An LDU's voice is about to be handled. An LDU2's sync, if it came,
+    /// gave the MI of the LDU1 before it: the frames that LDU1 held are
+    /// decrypted now, or are lost. Frames still held when the next LDU1
+    /// begins belong to an LDU1 whose LDU2 never came, and are dropped
+    /// (their MI would be the wrong one).
+    fn begin_ldu(&mut self, ldu2: bool, out: &mut Vec<TrackerOut>) {
+        if ldu2 {
+            self.release_held(out);
+        } else if let Some(c) = &mut self.crypto {
+            c.held.clear();
+        }
+    }
+
+    /// Whether to tell the call it is encrypted: not once its voice is
+    /// being decrypted (each LDU1's word that it is would mark the
+    /// transmission as one to leave out).
+    fn reports_encrypted(&self) -> bool {
+        self.encrypted && !self.crypto.as_ref().is_some_and(Crypto::decrypting)
     }
 
     /// Decrypt the frames of an LDU1 that were waiting for their MI, if it is known now.
@@ -369,7 +395,8 @@ mod tests {
             assert_eq!(g[..], clear(k)[..], "frame {k}");
         }
         // The LDU2: its sync names the next MI, the voice is still this one's.
-        t.ldu2_sync(&es(next_mi(&MI), 7), &mut out);
+        t.ldu2_sync(&es(next_mi(&MI), 7));
+        t.begin_ldu(true, &mut out);
         out.clear();
         for k in 0..9 {
             t.voice_frame(sent(&MI, 9 + k), 0, 0, false, (true, k), &mut out);
@@ -394,7 +421,8 @@ mod tests {
         }
         assert!(out.is_empty(), "nothing is said before the MI is known");
         // The LDU2's sync tells the next MI; the one before it is this superframe's.
-        t.ldu2_sync(&es(next_mi(&MI), 7), &mut out);
+        t.ldu2_sync(&es(next_mi(&MI), 7));
+        t.begin_ldu(true, &mut out);
         assert_eq!(crypto_events(&out), [(0x81, 7, true)]);
         let got = frame_bits(&out);
         assert_eq!(got.len(), 9);
@@ -415,7 +443,7 @@ mod tests {
             t.voice_frame(sent(&MI, k), 0, 0, false, (false, k), &mut out);
         }
         // The LDU2 comes, its sync lost: nothing can be said of these frames.
-        t.release_held(&mut out);
+        t.begin_ldu(true, &mut out);
         assert!(out.is_empty());
         assert!(t.crypto.as_ref().unwrap().held.is_empty());
     }
@@ -439,13 +467,65 @@ mod tests {
         for k in 0..9 {
             t.voice_frame(sent(&MI, k), 0, 0, false, (false, k), &mut out);
         }
-        t.ldu2_sync(&es(next_mi(&MI), 7), &mut out);
+        t.ldu2_sync(&es(next_mi(&MI), 7));
+        t.begin_ldu(true, &mut out);
         assert!(out.is_empty());
         assert_eq!(t.frames, 9);
         // An empty key store is no keys.
         let mut t = tracker(false);
         t.set_keys(Arc::new(KeyStore::new()));
         assert!(t.crypto.is_none());
+    }
+
+    /// Each LDU1's link control says whether the call is encrypted; once its
+    /// voice is being decrypted it must stop saying so, or the engine marks
+    /// every transmission as encrypted again and leaves the audio out when saving.
+    #[test]
+    fn a_call_being_decrypted_stops_reporting_itself_encrypted() {
+        let mut t = tracker(true);
+        t.crypto.as_mut().unwrap().dec.header(&es(MI, 7));
+        assert!(t.reports_encrypted(), "before any voice: encrypted");
+        let mut out = Vec::new();
+        t.voice_frame(sent(&MI, 0), 0, 0, false, (false, 0), &mut out);
+        assert!(!t.reports_encrypted(), "decrypting");
+        // A transmission's start (the next header) begins again.
+        t.start(1.0, None);
+        assert!(t.reports_encrypted() == t.encrypted);
+        // A key we lack: still encrypted.
+        let mut t = tracker(true);
+        t.crypto.as_mut().unwrap().dec.header(&es(MI, 8));
+        t.voice_frame(sent(&MI, 0), 0, 0, false, (false, 0), &mut out);
+        assert!(t.reports_encrypted());
+        // No keys at all: as it was.
+        assert!(tracker(false).reports_encrypted());
+        assert!(!VoiceTracker::new(mbe::lcg(1), mbe::Profile::Enhanced).reports_encrypted());
+    }
+
+    /// Held frames whose LDU2 never came are not decrypted under a later LDU's MI.
+    #[test]
+    fn frames_held_for_an_ldu2_that_never_came_are_dropped_at_the_next_ldu1() {
+        let mut t = tracker(true);
+        t.algid = ALGID_UNKNOWN;
+        let mut out = Vec::new();
+        for k in 0..9 {
+            t.voice_frame(sent(&MI, k), 0, 0, false, (false, k), &mut out);
+        }
+        assert_eq!(t.crypto.as_ref().unwrap().held.len(), 9);
+        // The next superframe's LDU1 (the LDU2 between was lost).
+        t.begin_ldu(false, &mut out);
+        assert!(t.crypto.as_ref().unwrap().held.is_empty());
+        let m2 = next_mi(&MI);
+        for k in 0..9 {
+            t.voice_frame(sent(&m2, k), 0, 0, false, (false, k), &mut out);
+        }
+        // Its LDU2: the sync gives the MI after m2, so these frames are m2's.
+        t.ldu2_sync(&es(next_mi(&m2), 7));
+        t.begin_ldu(true, &mut out);
+        let got = frame_bits(&out);
+        assert_eq!(got.len(), 9);
+        for (k, g) in got.iter().enumerate() {
+            assert_eq!(g[..], clear(k)[..], "frame {k}");
+        }
     }
 
     #[test]

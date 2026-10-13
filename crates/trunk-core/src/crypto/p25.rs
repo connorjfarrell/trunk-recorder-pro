@@ -23,7 +23,7 @@ use des::Des;
 use zeroize::Zeroizing;
 
 use super::KeyStore;
-use crate::p25::voice::EncryptionSync;
+use crate::p25::voice::{EncryptionSync, ALGID_CLEAR};
 
 pub const ALGID_DES_OFB: u8 = 0x81;
 pub const ALGID_AES256: u8 = 0x84;
@@ -94,7 +94,17 @@ impl std::error::Error for CryptError {}
 
 /// Whether [`Keystream`] can make a stream for the algorithm.
 pub fn supported(algid: u8) -> bool {
-    matches!(algid, ALGID_DES_OFB | ALGID_AES256 | ALGID_ADP)
+    key_len(algid).is_some()
+}
+
+/// The size of a key for the algorithm, bytes (None: not supported).
+pub fn key_len(algid: u8) -> Option<usize> {
+    match algid {
+        ALGID_DES_OFB => Some(8),
+        ALGID_AES256 => Some(32),
+        ALGID_ADP => Some(5),
+        _ => None,
+    }
 }
 
 /// The keystream for one superframe: `octet(n)` is the one that goes with
@@ -146,12 +156,7 @@ fn rc4(key: &[u8], skip: usize, out: &mut [u8]) {
 impl Keystream {
     /// The superframe whose MI is `mi`, under `key`.
     pub fn new(algid: u8, key: &[u8], mi: &Mi) -> Result<Keystream, CryptError> {
-        let want = match algid {
-            ALGID_DES_OFB => 8,
-            ALGID_AES256 => 32,
-            ALGID_ADP => 5,
-            a => return Err(CryptError::UnsupportedAlgorithm(a)),
-        };
+        let want = key_len(algid).ok_or(CryptError::UnsupportedAlgorithm(algid))?;
         if key.len() != want {
             return Err(CryptError::KeyLength { algid, got: key.len(), want });
         }
@@ -229,12 +234,12 @@ pub enum Skip {
 
 impl Decryptor {
     pub fn new(keys: Arc<KeyStore>) -> Self {
-        Decryptor { keys, algid: 0x80, kid: 0, mi: None, next: None, stream: None }
+        Decryptor { keys, algid: ALGID_CLEAR, kid: 0, mi: None, next: None, stream: None }
     }
 
     /// A new call (or a transmission's end).
     pub fn reset(&mut self) {
-        self.algid = 0x80;
+        self.algid = ALGID_CLEAR;
         self.kid = 0;
         self.mi = None;
         self.next = None;
@@ -243,7 +248,7 @@ impl Decryptor {
 
     /// The algorithm and key id the call names, once seen.
     pub fn key_named(&self) -> Option<(u8, u16)> {
-        (self.algid != 0x80).then_some((self.algid, self.kid))
+        (self.algid != ALGID_CLEAR).then_some((self.algid, self.kid))
     }
 
     fn name(&mut self, es: &EncryptionSync) {
@@ -258,7 +263,7 @@ impl Decryptor {
     pub fn header(&mut self, es: &EncryptionSync) {
         self.name(es);
         self.next = None;
-        self.mi = (es.algid != 0x80).then_some(es.mi);
+        self.mi = (es.algid != ALGID_CLEAR).then_some(es.mi);
         self.stream = None;
     }
 
@@ -267,7 +272,7 @@ impl Decryptor {
     /// no MI for this superframe yet; it is the one before the sync's.
     pub fn ldu2_sync(&mut self, es: &EncryptionSync) {
         self.name(es);
-        if es.algid == 0x80 {
+        if es.algid == ALGID_CLEAR {
             return;
         }
         if self.mi.is_none() {

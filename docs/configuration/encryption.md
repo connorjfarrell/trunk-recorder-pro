@@ -41,13 +41,16 @@ Then add a `keys` section to the config:
 With no `keys` section, or an empty `ekcFile`, **nothing is decrypted** and nothing else changes.
 Both files are read when recording starts, so changes apply the next time you start it.
 
-- **The password file must be readable by you alone** (mode `600` or `400`) on Linux and macOS. A
-  file others can read is refused, and the log tells you to `chmod 600` it. Files under
-  `/run/secrets` (Docker and Kubernetes secrets) are exempt, as their mode is set by the platform.
-  Windows has no mode to check.
+- **The password file must be readable by you alone** on Linux and macOS: no access for group or
+  others (`600` is usual). A file others can read is refused, and the log tells you to `chmod 600`
+  it. Files that really are under `/run/secrets` (Docker and Kubernetes secrets) are exempt, as the
+  platform sets their mode. Windows has no mode to check: keep the file out of reach yourself.
+  An editor's byte-order mark at the start of the file is ignored.
 - If a file is missing, the password is wrong, or the container is damaged, the recorder **keeps
   recording with decryption off** and logs why, rather than not starting. Look for a line starting
   `Decryption is off` in the log.
+- A key of the wrong size for its algorithm (a 16-byte AES-256 key, say) can never decrypt: it is
+  left out, and the log names it.
 - The keys are held in memory only. They are not in the config, the interface, the API, the call JSON
   or the log. The log lists how many keys loaded, and names any it couldn't use, never their bytes.
 - A call is matched to a key by the **algorithm id and key id it names on the air**, as a radio does.
@@ -61,7 +64,8 @@ holds (algorithm, key id, name), to check it.
 ## What you get
 
 - A decrypted call is recorded like any other. Its call JSON has `"encrypted": 1` (it was encrypted on
-  the air), `"decrypted": 1`, and the `alg_id` and `key_id` it named. The interface's live calls carry
+  the air), `"decrypted": 1`, and the `alg_id` and `key_id` it named. A call stays `decrypted` once
+  any of it was, with the key that decrypted it, even if a later talker uses a key you don't hold. The interface's live calls carry
   `decrypted`, `algId` and `keyId`.
 - A call joined part-way through is decrypted from its first superframe on: the receiver works out the
   call's cipher state from the next encryption sync, and the first 180 ms of such a call are held until
@@ -70,6 +74,7 @@ holds (algorithm, key id, name), to check it.
   loaded with the wrong key sounds like static, as it does in a real radio.
 - While keys are loaded, a call flagged encrypted is recorded from its grant (the grant doesn't say
   which key it uses). One whose key turns out not to be loaded, with no audio yet, is dropped from
-  recording and followed for its link control as before.
+  recording and followed for its link control as before. If no recorder is free when it is granted,
+  it is followed as before too.
 - Link control in an encrypted call may itself be encrypted. It isn't decrypted yet, so talker
   aliases and radio ids of such calls aren't read.

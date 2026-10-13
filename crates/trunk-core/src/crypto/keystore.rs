@@ -71,6 +71,11 @@ impl KeyStore {
         }
     }
 
+    /// Keep the keys `f` says to.
+    pub fn retain(&mut self, mut f: impl FnMut(&Key) -> bool) {
+        self.keys.retain(|_, k| f(k));
+    }
+
     /// The key a transmission names.
     pub fn get(&self, algid: u8, kid: u16) -> Option<&Key> {
         self.keys.get(&(algid, kid))
@@ -122,6 +127,16 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s.get(0x81, 7).is_none());
         assert!(s.has_algorithm(0x84) && !s.has_algorithm(0x81));
+    }
+
+    #[test]
+    fn retain_keeps_what_it_is_told() {
+        let mut s = KeyStore::new();
+        s.insert(key(1, true, 1));
+        s.insert(key(2, true, 2));
+        s.retain(|k| k.kid == 2);
+        assert_eq!(s.len(), 1);
+        assert!(s.get(0x84, 2).is_some() && s.get(0x84, 1).is_none());
     }
 
     #[test]
