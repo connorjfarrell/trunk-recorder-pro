@@ -159,7 +159,7 @@ impl VoiceTracker {
                     self.voice_frame(p.u, p.e0, p.errs, erased, (ldu2, k), out);
                 }
                 if let (true, Some(c)) = (ldu2, &mut self.crypto) {
-                    c.dec.ldu2_done();
+                    c.dec.superframe_done();
                 }
             }
             TDU | TDULC => {
@@ -235,7 +235,7 @@ impl VoiceTracker {
     /// mid-call the MI of the superframe it is in.
     fn ldu2_sync(&mut self, es: &EncryptionSync) {
         if let Some(c) = &mut self.crypto {
-            c.dec.ldu2_sync(es);
+            c.dec.sync(es);
         }
     }
 
@@ -401,7 +401,7 @@ mod tests {
         for k in 0..9 {
             t.voice_frame(sent(&MI, 9 + k), 0, 0, false, (true, k), &mut out);
         }
-        t.crypto.as_mut().unwrap().dec.ldu2_done();
+        t.crypto.as_mut().unwrap().dec.superframe_done();
         assert_eq!(frame_bits(&out).iter().enumerate().filter(|(k, g)| g[..] == clear(9 + k)[..]).count(), 9);
         // The next superframe is under the next MI.
         out.clear();

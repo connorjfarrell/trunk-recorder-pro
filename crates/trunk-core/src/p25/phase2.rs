@@ -178,6 +178,8 @@ pub fn decode_acch(burst: &[u8], fast: bool) -> Option<MacPdu> {
 pub struct MacPtt {
     pub algid: u8,
     pub keyid: u16,
+    /// The message indicator for the first superframe (9 octets, the last reserved).
+    pub mi: [u8; 9],
     pub source: u32,
     pub group: u32,
 }
@@ -185,6 +187,7 @@ pub struct MacPtt {
 /// MAC_PTT fields (op25 handle_mac_ptt).
 pub fn parse_mac_ptt(b: &[u8]) -> MacPtt {
     MacPtt {
+        mi: b[1..10].try_into().unwrap(),
         algid: b[10],
         keyid: (b[11] as u16) << 8 | b[12] as u16,
         source: (b[13] as u32) << 16 | (b[14] as u32) << 8 | b[15] as u32,
@@ -213,6 +216,20 @@ pub fn read_ess_a(x: &[u8]) -> [u8; 28] {
 pub struct Ess {
     pub algid: u8,
     pub keyid: u16,
+    /// The message indicator of the next superframe (9 octets, the last reserved).
+    pub mi: [u8; 9],
+}
+
+/// The 16 hexbits of a decoded ESS: 8 bits ALGID, 16 KID, 72 of MI (MSB first).
+fn ess_fields(b: &[u8]) -> Ess {
+    let mut mi = [0u8; 9];
+    for (i, o) in mi.iter_mut().enumerate() {
+        let bit = 6 * 4 + 8 * i;
+        let (h, r) = (bit / 6, bit % 6);
+        let two = (b[h] as u16) << 6 | b[h + 1] as u16;
+        *o = (two >> (4 - r)) as u8;
+    }
+    Ess { algid: ((b[0] as u16) << 2 | (b[1] as u16) >> 4) as u8, keyid: ((b[1] as u16 & 15) << 12) | (b[2] as u16) << 6 | b[3] as u16, mi }
 }
 
 /// op25 handle_4V2V_ess: rs28.decode(ESS_B, ESS_A), ≤ 14 corrections.
@@ -228,8 +245,7 @@ pub fn decode_ess(ess_b: &[u8; 16], ess_a: &[u8; 28]) -> Option<Ess> {
     if !(0..=14).contains(&ec) {
         return None;
     }
-    let b = &cw[19..35];
-    Some(Ess { algid: ((b[0] as u16) << 2 | (b[1] as u16) >> 4) as u8, keyid: ((b[1] as u16 & 15) << 12) | (b[2] as u16) << 6 | b[3] as u16 })
+    Some(ess_fields(&cw[19..35]))
 }
 
 // ── Framer (p25p2_framer.cc + p25p2_sync.cc) ─────────────────────────────────
@@ -409,13 +425,25 @@ mod tests {
         assert_eq!((f.errs, f.bits), (2, decode_vcw(&x[11..47], None).bits));
     }
 
+    /// ALGID 0x84, KID 0x1234, MI 12 34 56 78 90 AB CD EF 00 as 16 hexbits.
+    #[test]
+    fn ess_fields_unpack_algid_kid_and_mi() {
+        let bytes = [0x84u8, 0x12, 0x34, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x00];
+        let bits: Vec<u8> = bytes.iter().flat_map(|b| (0..8).rev().map(move |i| b >> i & 1)).collect();
+        let hex: Vec<u8> = bits.chunks(6).map(|c| c.iter().fold(0, |v, &b| v << 1 | b)).collect();
+        assert_eq!(hex.len(), 16);
+        let e = ess_fields(&hex);
+        assert_eq!((e.algid, e.keyid), (0x84, 0x1234));
+        assert_eq!(e.mi, [0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x00]);
+    }
+
     #[test]
     fn mac_ptt() {
         let m = xor_mask(0x443, 0x445, 0xbee00);
         let mut x = descramble(&dibits(PTT), 10, &m);
         let pdu = decode_acch(&x, false).expect("PTT decodes");
         assert_eq!((pdu.opcode, pdu.offset), (MAC_PTT, 0));
-        assert_eq!(parse_mac_ptt(&pdu.bytes), MacPtt { algid: 0x80, keyid: 0, source: 1118562, group: 2207 });
+        assert_eq!(parse_mac_ptt(&pdu.bytes), MacPtt { algid: 0x80, keyid: 0, mi: [0; 9], source: 1118562, group: 2207 });
         // RS(63,35) corrects symbol errors in the payload.
         for i in [20, 60, 70, 150] {
             x[i] ^= 3;

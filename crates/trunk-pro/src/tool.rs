@@ -492,11 +492,11 @@ fn run_p2(a: &Args) {
                     match decode_acch(&x, kind == BURST_FACCH_S || kind == BURST_FACCH_U) {
                         Some(pdu) => {
                             macs += 1;
-                            let hex: String = pdu.bytes.iter().map(|b| format!("{b:02x}")).collect();
-                            let _ = write!(line, ",\"mac\":{{\"op\":{},\"offset\":{},\"hex\":\"{hex}\"}}", pdu.opcode, pdu.offset);
+                            let pdu_hex = hex(&pdu.bytes);
+                            let _ = write!(line, ",\"mac\":{{\"op\":{},\"offset\":{},\"hex\":\"{pdu_hex}\"}}", pdu.opcode, pdu.offset);
                             if pdu.opcode == MAC_PTT {
                                 let m = parse_mac_ptt(&pdu.bytes);
-                                let _ = write!(line, ",\"ptt\":{{\"algid\":{},\"keyid\":{},\"src\":{},\"tg\":{}}}", m.algid, m.keyid, m.source, m.group);
+                                let _ = write!(line, ",\"ptt\":{{\"algid\":{},\"keyid\":{},\"mi\":\"{}\",\"src\":{},\"tg\":{}}}", m.algid, m.keyid, hex(&m.mi), m.source, m.group);
                             }
                         }
                         None => {

@@ -1,6 +1,6 @@
 # Encryption Keys
 
-Trunk Recorder Pro can decrypt **P25 Phase 1** calls when you hold the key, as a radio or console that
+Trunk Recorder Pro can decrypt **P25 Phase 1 and Phase 2** calls when you hold the key, as a radio or console that
 has been keyloaded does. It only uses keys you give it: nothing here recovers or guesses a key.
 Calls whose key isn't loaded are handled as they always were (flagged encrypted, and not recorded
 unless [`recordEncrypted`](recording.md#recording-keys) is on).
@@ -11,8 +11,16 @@ unless [`recordEncrypted`](recording.md#recording-keys) is on).
 | AES-256 | `0x84` | 32 bytes |
 | ADP (Motorola, RC4) | `0xAA` | 5 bytes |
 
-Phase 2 TDMA, DMR and NXDN calls aren't decrypted. A key for another algorithm in your container
+DMR and NXDN calls aren't decrypted. A key for another algorithm in your container
 (3DES, Motorola DES-XL) is ignored, and the log says so.
+
+**Phase 2 is newer than Phase 1 and less checked.** Phase 1 is verified against the standard
+(TIA-102.AAAD) and against captures from real radios. The standard's text for Phase 2 voice
+(TIA-102.AAAD-B) isn't public; the layout used here (18 voice frames of 7 keystream octets in each
+superframe, the MI in the MAC_PTT and each superframe's ESS) is the one op25 and DSD-FME agree on,
+and it is tested against a separate implementation of the same layout, not against a capture from
+a Phase 2 system. If your Phase 2 call decrypts to noise with the right key, tell us (with the
+algorithm and a capture if you can).
 
 ## Setting it up
 
@@ -67,9 +75,10 @@ holds (algorithm, key id, name), to check it.
   the air), `"decrypted": 1`, and the `alg_id` and `key_id` it named. A call stays `decrypted` once
   any of it was, with the key that decrypted it, even if a later talker uses a key you don't hold. The interface's live calls carry
   `decrypted`, `algId` and `keyId`.
-- A call joined part-way through is decrypted from its first superframe on: the receiver works out the
-  call's cipher state from the next encryption sync, and the first 180 ms of such a call are held until
-  it has.
+- A Phase 1 call joined part-way through is decrypted from its first superframe on: the receiver
+  works out the call's cipher state from the next encryption sync, and the first 180 ms of such a call
+  are held until it has. A Phase 2 call joined part-way through (without its start) is decrypted from
+  the first superframe's last burst on, up to 360 ms in.
 - **Wrong keys give noise.** P25 voice has no check that a key is right, so a call whose key id is
   loaded with the wrong key sounds like static, as it does in a real radio.
 - While keys are loaded, a call flagged encrypted is recorded from its grant (the grant doesn't say

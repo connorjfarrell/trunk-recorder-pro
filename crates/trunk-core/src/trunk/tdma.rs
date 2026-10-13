@@ -4,9 +4,13 @@
 //! (TDMA slots 0 and 1) share the frequency; each has its own vocoder and
 //! burst counting. After op25 p25p2_tdma.cc handle_packet.
 
+use std::sync::Arc;
+
 use super::frames::{Codec, VoiceFrame};
 use super::voice::TrackerOut;
-use crate::ambe::decode_vcw;
+use crate::ambe::{decode_vcw, AmbeFrame};
+use crate::crypto::p25::{Decryptor, Skip};
+use crate::crypto::KeyStore;
 use crate::mbe::{self, Kind, FRAME_SAMPLES};
 use crate::p25::alias::{is_alias_msg, mac_messages, mac_talker, AliasLc, MacAliases};
 use crate::p25::phase2::{
@@ -14,7 +18,31 @@ use crate::p25::phase2::{
     BURST_FACCH_S, BURST_FACCH_U, BURST_LCCH_S, BURST_SACCH_S, BURST_SACCH_U, BURST_DIBITS, MAC_ACTIVE, MAC_END_PTT, MAC_HANGTIME, MAC_IDLE, MAC_PTT,
     MAC_SIGNAL, SLOT_CHANNEL, SLOT_DIBITS,
 };
-use crate::p25::voice::ALGID_CLEAR;
+use crate::p25::voice::{EncryptionSync, ALGID_CLEAR};
+
+/// A slot's decryption: the keys, and what was last reported to its call.
+struct Crypto {
+    dec: Decryptor,
+    /// (algorithm, key id, decrypted), as [`TrackerOut::Crypto`] said it.
+    reported: Option<(u8, u16, bool)>,
+}
+
+impl Crypto {
+    /// A new transmission: nothing named or reported.
+    fn reset(&mut self) {
+        self.dec.reset();
+        self.reported = None;
+    }
+
+    fn report(&mut self, c: usize, decrypted: bool, out: &mut Vec<(usize, TrackerOut)>) {
+        if let Some((algid, key_id)) = self.dec.key_named()
+            && self.reported != Some((algid, key_id, decrypted))
+        {
+            self.reported = Some((algid, key_id, decrypted));
+            out.push((c, TrackerOut::Crypto { algid, key_id, decrypted }));
+        }
+    }
+}
 
 struct Slot {
     dec: mbe::Decoder,
@@ -30,9 +58,36 @@ struct Slot {
     talker: Option<u32>,
     talkgroup: Option<u32>,
     aliases: MacAliases,
+    /// Decryption, when keys were given ([`TdmaTracker::set_keys`]).
+    crypto: Option<Crypto>,
 }
 
 impl Slot {
+    /// One voice frame of logical channel `c`, `idx`th of its superframe
+    /// (None: its place isn't known): decrypted when the call is encrypted
+    /// and its key and MI are known, vocoded, and given to `out`. What the
+    /// vocoder made of it, when it made audio.
+    fn voice_frame(&mut self, c: usize, idx: Option<usize>, f: AmbeFrame, out: &mut Vec<(usize, TrackerOut)>) -> Option<Kind> {
+        let mut bits = f.bits;
+        if self.encrypted {
+            let cr = self.crypto.as_mut()?;
+            match idx.map(|i| cr.dec.decrypt_tdma(i, &mut bits)) {
+                Some(Ok(())) => cr.report(c, true, out),
+                Some(Err(Skip::NoKey | Skip::BadKey)) => {
+                    cr.report(c, false, out);
+                    return None;
+                }
+                Some(Err(Skip::NoMi)) | None => return None,
+            }
+        }
+        let mut buf = [0f32; FRAME_SAMPLES];
+        let kind = self.dec.ambe(&bits, f.errs, &mut buf);
+        mbe::to_limited(&mut buf);
+        let frame = VoiceFrame { codec: Codec::Ambe, bits: bits.to_vec(), e0: 0, errs: f.errs, erased: false, kind };
+        out.push((c, TrackerOut::Audio(buf.to_vec(), frame)));
+        Some(kind)
+    }
+
     fn new(rng: mbe::Rng) -> Self {
         Slot {
             dec: mbe::Decoder::new(rng, mbe::Profile::Enhanced),
@@ -47,6 +102,7 @@ impl Slot {
             talker: None,
             talkgroup: None,
             aliases: MacAliases::default(),
+            crypto: None,
         }
     }
 }
@@ -77,6 +133,14 @@ impl TdmaTracker {
             bad_frames: 0,
             undecodable: 0,
             mac_pdus: 0,
+        }
+    }
+
+    /// Decrypt calls whose key `keys` holds (on both slots). With none, an
+    /// encrypted call is flagged and its voice not decoded, as it always was.
+    pub fn set_keys(&mut self, keys: Arc<KeyStore>) {
+        for s in &mut self.slots {
+            s.crypto = (!keys.is_empty()).then(|| Crypto { dec: Decryptor::new(keys.clone()), reported: None });
         }
     }
 
@@ -138,6 +202,9 @@ impl TdmaTracker {
                 s.active = true;
                 s.encrypted = false;
                 s.algid = ALGID_CLEAR;
+                if let Some(cr) = &mut s.crypto {
+                    cr.reset();
+                }
             }
             s.end_s = t;
             // ESS (op25 handle_4V2V_ess)
@@ -150,26 +217,33 @@ impl TdmaTracker {
                 if ess.algid != ALGID_CLEAR {
                     Self::set_encryption(s, c, ess.algid, out);
                 }
+                // It names the key, and the next superframe's MI (which, to a receiver
+                // that joined mid-call, also gives this one's).
+                if let Some(cr) = &mut s.crypto {
+                    cr.dec.sync(&EncryptionSync { algid: ess.algid, keyid: ess.keyid, mi: ess.mi });
+                }
             }
             let at: &[usize] = if kind == BURST_4V { &[11, 48, 96, 133] } else { &[11, 48] };
-            for &a in at {
+            for (k, &a) in at.iter().enumerate() {
                 let f = decode_vcw(&x[a..a + 36], self.soft.then(|| rel(a)));
                 self.frames += 1;
-                if s.encrypted {
-                    continue;
-                }
-                let mut buf = [0f32; FRAME_SAMPLES];
-                let kind = s.dec.ambe(&f.bits, f.errs, &mut buf);
-                if kind != Kind::Voice {
+                // Which of the superframe's 18 frames it is: 4 to each 4V burst, the 2V's 2 last
+                // (a 4V burst out of step has no place in it).
+                let idx = match kind {
+                    BURST_4V => (s.burst_id < 4).then(|| s.burst_id as usize * 4 + k),
+                    _ => Some(16 + k),
+                };
+                if s.voice_frame(c, idx, f, out).is_some_and(|k| k != Kind::Voice) {
                     self.bad_frames += 1;
                 }
-                mbe::to_limited(&mut buf);
-                let frame = VoiceFrame { codec: Codec::Ambe, bits: f.bits.to_vec(), e0: 0, errs: f.errs, erased: false, kind };
-                out.push((c, TrackerOut::Audio(buf.to_vec(), frame)));
             }
             if kind == BURST_2V {
                 let a = s.next_algid;
                 Self::set_encryption(s, c, a, out);
+                // The superframe is over: the MI its ESS gave (or the LFSR's step) is the next one's.
+                if let Some(cr) = &mut s.crypto {
+                    cr.dec.superframe_done();
+                }
             }
             return;
         }
@@ -189,12 +263,19 @@ impl TdmaTracker {
                     s.burst_id = -1;
                     s.talker = (ptt.source != 0).then_some(ptt.source);
                     s.talkgroup = (ptt.group != 0).then_some(ptt.group);
+                    if let Some(cr) = &mut s.crypto {
+                        cr.reset();
+                        cr.dec.header(&EncryptionSync { algid: ptt.algid, keyid: ptt.keyid, mi: ptt.mi });
+                    }
                     out.push((c, TrackerOut::Info { source: (ptt.source != 0).then_some(ptt.source), emergency: false, encrypted: s.encrypted }));
                 }
                 MAC_END_PTT => {
                     s.active = false;
                     s.algid = ALGID_CLEAR;
                     s.talker = None;
+                    if let Some(cr) = &mut s.crypto {
+                        cr.reset();
+                    }
                 }
                 MAC_ACTIVE => s.first4v = if pdu.offset > 4 { 0 } else { pdu.offset as i32 },
                 _ => {}
@@ -226,5 +307,150 @@ impl TdmaTracker {
             s.encrypted = true;
             out.push((c, TrackerOut::Info { source: None, emergency: false, encrypted: true }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::p25::{next_mi, Keystream, ALGID_DES_OFB};
+    use crate::crypto::Key;
+
+    const KEY: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    const MI: [u8; 9] = [0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0];
+
+    fn keys() -> Arc<KeyStore> {
+        let mut s = KeyStore::new();
+        s.insert(Key::new(ALGID_DES_OFB, 7, "k".into(), 0, true, KEY.to_vec()));
+        Arc::new(s)
+    }
+
+    fn es(mi: [u8; 9], kid: u16) -> EncryptionSync {
+        EncryptionSync { algid: ALGID_DES_OFB, keyid: kid, mi }
+    }
+
+    /// The clear bits of frame `n` (0 to 17) of a superframe.
+    fn clear(n: usize) -> [u8; 49] {
+        std::array::from_fn(|i| (((i * 5 + n * 11) / 2) & 1) as u8)
+    }
+
+    /// Frame `n` as sent under `mi`.
+    fn sent(mi: &[u8; 9], n: usize) -> AmbeFrame {
+        let mut bits = clear(n);
+        Keystream::new(ALGID_DES_OFB, &KEY, mi).unwrap().apply_tdma(n, &mut bits);
+        AmbeFrame { bits, errs: 0 }
+    }
+
+    fn slot(with_keys: bool) -> Slot {
+        let mut s = Slot::new(mbe::lcg(1));
+        if with_keys {
+            s.crypto = Some(Crypto { dec: Decryptor::new(keys()), reported: None });
+        }
+        s.active = true;
+        s.encrypted = true;
+        s
+    }
+
+    fn audio(out: &[(usize, TrackerOut)]) -> Vec<Vec<u8>> {
+        out.iter().filter_map(|(_, o)| if let TrackerOut::Audio(_, f) = o { Some(f.bits.clone()) } else { None }).collect()
+    }
+
+    fn events(out: &[(usize, TrackerOut)]) -> Vec<(usize, u8, u16, bool)> {
+        out.iter().filter_map(|(c, o)| if let TrackerOut::Crypto { algid, key_id, decrypted } = o { Some((*c, *algid, *key_id, *decrypted)) } else { None }).collect()
+    }
+
+    #[test]
+    fn a_call_from_its_ptt_is_decrypted_through_the_superframes() {
+        let mut s = slot(true);
+        s.crypto.as_mut().unwrap().dec.header(&es(MI, 7));
+        let mut out = Vec::new();
+        for n in 0..18 {
+            // This superframe's last burst: its ESS names the next MI before its 2 frames.
+            if n == 16 {
+                s.crypto.as_mut().unwrap().dec.sync(&es(next_mi(&MI), 7));
+            }
+            assert!(s.voice_frame(1, Some(n), sent(&MI, n), &mut out).is_some());
+        }
+        s.crypto.as_mut().unwrap().dec.superframe_done();
+        assert_eq!(events(&out), [(1, 0x81, 7, true)], "said once, on the slot's channel");
+        let got = audio(&out);
+        assert_eq!(got.len(), 18);
+        for (n, g) in got.iter().enumerate() {
+            assert_eq!(g[..], clear(n)[..], "frame {n}");
+        }
+        // The next superframe is under the next MI.
+        out.clear();
+        s.voice_frame(1, Some(0), sent(&next_mi(&MI), 0), &mut out);
+        assert_eq!(audio(&out)[0][..], clear(0)[..]);
+        assert!(events(&out).is_empty());
+    }
+
+    /// Joined mid-superframe: the 4V bursts before the first 2V can't be placed or decrypted;
+    /// from the 2V on (its ESS gives the MI), everything is.
+    #[test]
+    fn a_call_joined_mid_superframe_is_decrypted_from_its_first_2v_burst() {
+        let mut s = slot(true);
+        let mut out = Vec::new();
+        for n in 0..8 {
+            assert!(s.voice_frame(0, Some(n), sent(&MI, n), &mut out).is_none(), "no MI yet: frame {n} is dropped");
+        }
+        assert!(out.is_empty());
+        s.crypto.as_mut().unwrap().dec.sync(&es(next_mi(&MI), 7));
+        for n in 16..18 {
+            s.voice_frame(0, Some(n), sent(&MI, n), &mut out);
+        }
+        s.crypto.as_mut().unwrap().dec.superframe_done();
+        assert_eq!(audio(&out).iter().enumerate().filter(|(i, g)| g[..] == clear(16 + i)[..]).count(), 2);
+        out.clear();
+        for n in 0..4 {
+            s.voice_frame(0, Some(n), sent(&next_mi(&MI), n), &mut out);
+        }
+        assert_eq!(audio(&out).len(), 4);
+    }
+
+    #[test]
+    fn a_key_we_do_not_hold_is_reported_once_and_nothing_decoded() {
+        let mut s = slot(true);
+        s.crypto.as_mut().unwrap().dec.header(&es(MI, 8));
+        let mut out = Vec::new();
+        for n in 0..18 {
+            assert!(s.voice_frame(0, Some(n), sent(&MI, n), &mut out).is_none());
+        }
+        assert!(audio(&out).is_empty());
+        assert_eq!(events(&out), [(0, 0x81, 8, false)]);
+    }
+
+    #[test]
+    fn a_frame_out_of_place_is_not_decrypted() {
+        let mut s = slot(true);
+        s.crypto.as_mut().unwrap().dec.header(&es(MI, 7));
+        let mut out = Vec::new();
+        assert!(s.voice_frame(0, None, sent(&MI, 0), &mut out).is_none());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn with_no_keys_an_encrypted_call_is_as_it_always_was() {
+        let mut s = slot(false);
+        let mut out = Vec::new();
+        for n in 0..18 {
+            assert!(s.voice_frame(0, Some(n), sent(&MI, n), &mut out).is_none());
+        }
+        assert!(out.is_empty());
+        let mut t = TdmaTracker::new(1);
+        t.set_keys(Arc::new(KeyStore::new()));
+        assert!(t.slots.iter().all(|s| s.crypto.is_none()));
+        t.set_keys(keys());
+        assert!(t.slots.iter().all(|s| s.crypto.is_some()));
+    }
+
+    #[test]
+    fn a_clear_call_never_touches_the_decryptor() {
+        let mut s = slot(true);
+        s.encrypted = false;
+        let mut out = Vec::new();
+        assert!(s.voice_frame(0, Some(3), AmbeFrame { bits: clear(3), errs: 0 }, &mut out).is_some());
+        assert_eq!(audio(&out)[0][..], clear(3)[..]);
+        assert!(events(&out).is_empty());
     }
 }

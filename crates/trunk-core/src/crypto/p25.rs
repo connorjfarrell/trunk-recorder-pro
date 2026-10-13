@@ -2,6 +2,10 @@
 //! for DES-OFB (ALGID 0x81) and AES-256 (0x84), and Motorola's ADP (0xAA, RC4,
 //! not in that standard).
 //!
+//! Phase 2 TDMA (see [`Keystream::apply_tdma`]) uses the same keystream, with
+//! the layout of op25 and DSD-FME (TIA-102.AAAD-B, which defines it, is not
+//! public): 18 voice frames of 7 octets in a superframe.
+//!
 //! A superframe (an LDU1 and an LDU2) carries 213 octets that are encrypted,
 //! numbered 1 to 213 in the standard's tables 5-2, 5-5 and 5-6: 3 reserved,
 //! the 8 octets of link control, the 18 IMBE frames of 11 octets, and 4 octets
@@ -182,6 +186,18 @@ impl Keystream {
         Ok(Keystream(out))
     }
 
+    /// Decrypt (or encrypt) AMBE+2 frame `f` (0 to 17) of a Phase 2
+    /// superframe: its 49 bits (u0..u3, MSB first) with the first 49 bits
+    /// of its 7 keystream octets, which follow the first block's. Frame
+    /// `f` is `4 * burst + k` in the 4V bursts 0 to 3 and `16 + k` in the 2V.
+    pub fn apply_tdma(&self, f: usize, bits: &mut [u8; 49]) {
+        debug_assert!(f < TDMA_FRAMES);
+        let first = TDMA_OCTETS * f + 1;
+        for (i, b) in bits.iter_mut().enumerate() {
+            *b ^= (self.octet(first + i / 8) >> (7 - i % 8)) & 1;
+        }
+    }
+
     /// The keystream octet for plain text octet number `n` (1 to 213).
     pub fn octet(&self, n: usize) -> u8 {
         self.0[n - 1]
@@ -197,6 +213,11 @@ impl Keystream {
     }
 }
 
+/// Voice frames in a Phase 2 superframe on one logical channel: four 4V bursts and a 2V.
+pub const TDMA_FRAMES: usize = 18;
+/// Keystream octets a Phase 2 voice frame takes (56 bits for 49).
+const TDMA_OCTETS: usize = 7;
+
 /// The plain text octet number of the first octet of IMBE frame `k` (0 to 8)
 /// of an LDU1 or LDU2 (standard tables 5-5 and 5-6): 3 reserved and 8 link
 /// control octets come first, 2 low-speed data octets sit before the 9th
@@ -208,8 +229,9 @@ pub fn frame_octet(ldu2: bool, k: usize) -> usize {
 }
 
 /// A call's decryption state: the key named by the call, and the MI of the
-/// superframe in progress. Feed it the header and each LDU2's encryption
-/// sync; it decrypts frames when it holds the key and knows the MI.
+/// superframe in progress. Feed it the header (Phase 1's HDU, Phase 2's
+/// MAC_PTT) and the encryption sync that ends each superframe (an LDU2's,
+/// a 2V burst's ESS); it decrypts frames when it holds the key and knows the MI.
 pub struct Decryptor {
     keys: Arc<KeyStore>,
     algid: u8,
@@ -267,10 +289,10 @@ impl Decryptor {
         self.stream = None;
     }
 
-    /// An LDU2's encryption sync, before its voice: it names the key and
-    /// carries the next superframe's MI. A receiver that joined mid-call has
-    /// no MI for this superframe yet; it is the one before the sync's.
-    pub fn ldu2_sync(&mut self, es: &EncryptionSync) {
+    /// A superframe's encryption sync (an LDU2's, a Phase 2 ESS): it names
+    /// the key and carries the next superframe's MI. A receiver that joined
+    /// mid-call has no MI for this superframe yet; it is the one before the sync's.
+    pub fn sync(&mut self, es: &EncryptionSync) {
         self.name(es);
         if es.algid == ALGID_CLEAR {
             return;
@@ -282,9 +304,9 @@ impl Decryptor {
         self.next = Some(es.mi);
     }
 
-    /// An LDU2's voice is done: the next superframe's MI takes over (stepped
-    /// from this one when the sync was lost).
-    pub fn ldu2_done(&mut self) {
+    /// A superframe's voice is done: the next superframe's MI takes over
+    /// (stepped from this one when the sync was lost).
+    pub fn superframe_done(&mut self) {
         let next = self.next.take().or_else(|| self.mi.as_ref().map(next_mi));
         if next != self.mi {
             self.stream = None;
@@ -292,14 +314,25 @@ impl Decryptor {
         self.mi = next;
     }
 
-    /// Decrypt IMBE frame `k` of the LDU in progress.
-    pub fn decrypt(&mut self, ldu2: bool, k: usize, bits: &mut [u8; 88]) -> Result<(), Skip> {
+    /// The keystream of the superframe in progress, made when first needed.
+    fn stream(&mut self) -> Result<&Keystream, Skip> {
         let Some(mi) = self.mi else { return Err(Skip::NoMi) };
         if self.stream.is_none() {
             let Some(key) = self.keys.get(self.algid, self.kid) else { return Err(Skip::NoKey) };
             self.stream = Some(Keystream::new(self.algid, key.bytes(), &mi).map_err(|_| Skip::BadKey)?);
         }
-        self.stream.as_ref().unwrap().apply(ldu2, k, bits);
+        Ok(self.stream.as_ref().unwrap())
+    }
+
+    /// Decrypt IMBE frame `k` of the LDU in progress (Phase 1).
+    pub fn decrypt(&mut self, ldu2: bool, k: usize, bits: &mut [u8; 88]) -> Result<(), Skip> {
+        self.stream()?.apply(ldu2, k, bits);
+        Ok(())
+    }
+
+    /// Decrypt AMBE+2 frame `f` (0 to 17) of the superframe in progress (Phase 2).
+    pub fn decrypt_tdma(&mut self, f: usize, bits: &mut [u8; 49]) -> Result<(), Skip> {
+        self.stream()?.apply_tdma(f, bits);
         Ok(())
     }
 }
@@ -399,6 +432,44 @@ mod tests {
         assert_eq!(enc(ALGID_AES256, AES_KEY, true, 8), hex("FF78FEE22104B84EB7DE6B"));
     }
 
+    /// Phase 2: frame f takes octets 7f+1.. of the same keystream, 49 bits of the 56. The
+    /// expected values were made by a separate implementation (Python) of the same layout
+    /// op25 and DSD-FME use; no standard or capture checks them.
+    #[test]
+    fn tdma_frames_take_seven_keystream_octets_each() {
+        let plain = hex("0CEE42225F6180");
+        let enc = |algid: u8, key: &str, f: usize| {
+            let ks = Keystream::new(algid, &hex(key), &mi(HEADER_MI)).unwrap();
+            let mut b: [u8; 49] = std::array::from_fn(|i| (plain[i / 8] >> (7 - i % 8)) & 1);
+            ks.apply_tdma(f, &mut b);
+            // The 49 bits as 7 octets, the 56th bit 0.
+            let mut o = [0u8; 7];
+            for (i, v) in b.iter().enumerate() {
+                o[i / 8] |= v << (7 - i % 8);
+            }
+            o.to_vec()
+        };
+        type Case<'a> = (u8, &'a str, [(usize, &'a str); 6]);
+        let cases: [Case; 3] = [
+            (ALGID_DES_OFB, DES_KEY, [(0, "5179287218E780"), (3, "A99CE14124E880"), (4, "05AF41890CCD00"), (15, "02809B38430B00"), (16, "BF123D578E3200"), (17, "725CB673C65900")]),
+            (ALGID_AES256, AES_KEY, [(0, "A84A10023A4200"), (3, "77DF3D9A046800"), (4, "44398C43CC7580"), (15, "2364E66A9AB900"), (16, "BDBF5996B87380"), (17, "4DE90681D6BB00")]),
+            (ALGID_ADP, "deadbeef69", [(0, "3C6682A2E64800"), (3, "22336E7D52A400"), (4, "D8BFDBEE787F80"), (15, "0142A78D317400"), (16, "536742514F7C00"), (17, "ECA419821AF380")]),
+        ];
+        for (algid, key, frames) in cases {
+            for (f, want) in frames {
+                assert_eq!(enc(algid, key, f), hex(want), "algorithm {algid:#04x} frame {f}");
+            }
+        }
+        // Applied twice, it is the plain text again.
+        let ks = Keystream::new(ALGID_AES256, &hex(AES_KEY), &mi(HEADER_MI)).unwrap();
+        let orig: [u8; 49] = std::array::from_fn(|i| (plain[i / 8] >> (7 - i % 8)) & 1);
+        let mut b = orig;
+        ks.apply_tdma(9, &mut b);
+        assert_ne!(b, orig);
+        ks.apply_tdma(9, &mut b);
+        assert_eq!(b, orig);
+    }
+
     #[test]
     fn rc4_matches_the_classic_vector() {
         let mut out = [0u8; 10];
@@ -458,13 +529,13 @@ mod tests {
                 assert_eq!(b, clear(f), "superframe {sf} frame {f}");
             }
             // This LDU2 tells the next superframe's MI; its own voice uses this one's.
-            d.ldu2_sync(&es(next_mi(&m), 7));
+            d.sync(&es(next_mi(&m), 7));
             for (f, fr) in frames.iter().enumerate().skip(9) {
                 let mut b = *fr;
                 d.decrypt(true, f - 9, &mut b).unwrap();
                 assert_eq!(b, clear(f), "superframe {sf} frame {f}");
             }
-            d.ldu2_done();
+            d.superframe_done();
         }
     }
 
@@ -473,14 +544,14 @@ mod tests {
         let (m1, m2) = (mi(HEADER_MI), next_mi(&mi(HEADER_MI)));
         let mut d = Decryptor::new(store());
         // No header, no LDU1: the first thing heard is an LDU2 telling m2.
-        d.ldu2_sync(&es(m2, 7));
+        d.sync(&es(m2, 7));
         let frames = superframe(&m1);
         for (f, fr) in frames.iter().enumerate().skip(9) {
             let mut b = *fr;
             d.decrypt(true, f - 9, &mut b).unwrap();
             assert_eq!(b, clear(f));
         }
-        d.ldu2_done();
+        d.superframe_done();
         let frames = superframe(&m2);
         let mut b = frames[0];
         d.decrypt(false, 0, &mut b).unwrap();
@@ -492,7 +563,7 @@ mod tests {
         let (m1, m2) = (mi(HEADER_MI), next_mi(&mi(HEADER_MI)));
         let mut d = Decryptor::new(store());
         d.header(&es(m1, 7));
-        d.ldu2_done(); // this LDU2's sync did not decode
+        d.superframe_done(); // this LDU2's sync did not decode
         let mut b = superframe(&m2)[0];
         d.decrypt(false, 0, &mut b).unwrap();
         assert_eq!(b, clear(0));

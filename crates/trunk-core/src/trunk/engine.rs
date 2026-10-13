@@ -659,8 +659,8 @@ impl RecorderHost for SysHost<'_> {
     }
 
     fn can_decrypt(&self, call: &Call) -> bool {
-        // (Only Phase 1 so far.)
-        self.radio.keys.is_some() && VoiceKind::of(call) == VoiceKind::Fdma
+        // (P25: Phase 1 and Phase 2.)
+        self.radio.keys.is_some() && matches!(VoiceKind::of(call), VoiceKind::Fdma | VoiceKind::Tdma)
     }
 
     fn release(&mut self, call: &Call) {

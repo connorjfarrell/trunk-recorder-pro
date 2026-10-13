@@ -304,6 +304,9 @@ impl VoiceDecoder for P25Tdma {
             out.extend(self.tout.drain(..).map(|(slot, o)| VoiceOut { slot: slot as u8, t, out: o }));
         }
     }
+    fn set_keys(&mut self, keys: std::sync::Arc<crate::crypto::KeyStore>) {
+        self.tracker.set_keys(keys);
+    }
     fn set_params(&mut self, p: &VoiceParams) {
         if let Some((nac, sys, wacn)) = p.tdma_key {
             self.tracker.set_key(nac, sys, wacn);

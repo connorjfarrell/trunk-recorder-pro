@@ -8,12 +8,12 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 - **Decrypting P25 Phase 1 calls with keys you hold:** point the new `keys`
   section of the config at a KFDtool encrypted key container (`.ekc`) and the
   file with its password, and calls encrypted with DES-OFB, AES-256 or ADP
-  under a key in the container are recorded decrypted. Calls under any other
+  under a key in the container are recorded decrypted, on Phase 1 and Phase 2
+  (Phase 2 is checked against other decoders, not yet a real system). Calls under any other
   key are handled as before. Without a `keys` section nothing changes. The
   password file must be readable by you alone (`chmod 600`). Call JSON gains
   `decrypted`, `alg_id` and `key_id` (`encrypted` still means encrypted on the
-  air). See [Encryption keys](docs/configuration/encryption.md). Phase 2 isn't
-  decrypted yet.
+  air). See [Encryption keys](docs/configuration/encryption.md).
 
 - **NXDN talker aliases:** Kenwood radios' programmed names are read from the
   traffic channel and shown as each radio's name (`tag_ota`, the Calls page,
