@@ -27,6 +27,21 @@ fn hex(s: &str, what: &str) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or_else(|_| bad())).collect()
 }
 
+/// A numeric identifier option (decimal or 0x…): present when `required`, a whole number, and at most `max`.
+/// (A number that doesn't fit is an error, not wrapped into another one: `--algid 0x184` is not AES.)
+fn ident(a: &Args, name: &str, max: u32, default: Option<u32>) -> u32 {
+    let Some(raw) = a.get(name) else {
+        return default.unwrap_or_else(|| die(&format!("--{name} is needed")));
+    };
+    let raw = raw.trim();
+    let v = if let Some(h) = raw.strip_prefix("0x") { u64::from_str_radix(h, 16) } else { raw.parse() };
+    match v {
+        Ok(v) if v <= max as u64 => v as u32,
+        Ok(_) => die(&format!("--{name} {raw}: at most {max:#x}")),
+        Err(_) => die(&format!("--{name} {raw}: not a whole number")),
+    }
+}
+
 pub fn run(a: &Args) {
     let path = a.positional.get(1).unwrap_or_else(|| die("tool p25synth <out.cu8> [--center Hz] [--freq Hz] …"));
     let center = a.num("center", 155_150_000.0);
@@ -40,8 +55,8 @@ pub fn run(a: &Args) {
         s => die(&format!("--join {s}: header, ldu1 or ldu2")),
     };
     let crypt = a.get("algid").map(|_| {
-        let algid = crate::tool::num_any(a, "algid") as u8;
-        let kid = crate::tool::num_any(a, "kid") as u16;
+        let algid = ident(a, "algid", 0xff, None) as u8;
+        let kid = ident(a, "kid", 0xffff, None) as u16;
         let key = match (a.get("key"), a.get("ekc")) {
             (Some(k), _) => zeroize::Zeroizing::new(hex(k, "key")),
             (None, Some(ekc)) => {
@@ -66,7 +81,7 @@ pub fn run(a: &Args) {
     if a.flag("phase2") {
         return run_phase2(a, path, center, freq, fs, start, crypt);
     }
-    let call = Call { nac: if a.get("nac").is_some() { crate::tool::num_any(a, "nac") as u16 } else { 0x293 }, tgid: a.num("tg", 1001.0) as u16, source: a.num("src", 4_567_890.0) as u32, crypt, superframes: a.num("superframes", 5.0) as usize, start };
+    let call = Call { nac: ident(a, "nac", 0xfff, Some(0x293)) as u16, tgid: ident(a, "tg", 0xffff, Some(1001)) as u16, source: ident(a, "src", 0xff_ffff, Some(4_567_890)), crypt, superframes: a.num("superframes", 5.0) as usize, start };
     let frames = call.frames(imbe).unwrap_or_else(|e| die(&format!("{e}")));
 
     // 120 ms of alternating outer symbols (a key-up), the call, then silence for the call to end.
@@ -131,13 +146,13 @@ fn write_cu8(path: &str, iq: &[Complex32]) {
 fn run_phase2(a: &Args, path: &str, center: f64, freq: f64, fs: f64, start: Start, crypt: Option<Crypt>) {
     use trunk_core::nxdn::synth::ambe;
     use trunk_core::p25::synth_p2::{modulate, Call};
-    let num = |k: &str, d: u32| if a.get(k).is_some() { crate::tool::num_any(a, k) } else { d };
+    let _ = ();
     let call = Call {
-        nac: num("nac", 0x293),
-        sys_id: num("sysid", 0x2a5),
-        wacn: num("wacn", 0xbee00),
-        tgid: a.num("tg", 1001.0) as u16,
-        source: a.num("src", 4_567_890.0) as u32,
+        nac: ident(a, "nac", 0xfff, Some(0x293)),
+        sys_id: ident(a, "sysid", 0xfff, Some(0x2a5)),
+        wacn: ident(a, "wacn", 0xf_ffff, Some(0xbee00)),
+        tgid: ident(a, "tg", 0xffff, Some(1001)) as u16,
+        source: ident(a, "src", 0xff_ffff, Some(4_567_890)),
         crypt,
         superframes: a.num("superframes", 5.0) as usize,
         channel: match a.num("channel", 0.0) {

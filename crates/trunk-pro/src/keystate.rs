@@ -119,6 +119,13 @@ impl KeyState {
         Ok(loaded.notes)
     }
 
+    /// A change to the keys section of the config is being applied: any unlock still opening a
+    /// container is dropped, not installed (call this before anything else is awaited; the refresh
+    /// that follows would otherwise be the first thing to invalidate it).
+    pub fn invalidate(&self) {
+        self.0.lock().unwrap().generation += 1;
+    }
+
     /// Forget what is held (a password file's keys come back at the next refresh). The recorder is
     /// told to take them from every call in progress too.
     pub fn lock(&self) {
@@ -283,6 +290,11 @@ mod tests {
         k.refresh(&settings("other.ekc", ""), &d);
         assert!(k.commit_unlock(started, &s, loaded).is_err());
         assert!(k.store().is_none());
+        // And a config change that is being applied (`invalidate`, before its refresh runs).
+        let started = k.0.lock().unwrap().generation;
+        let loaded = open();
+        k.invalidate();
+        assert!(k.commit_unlock(started, &s, loaded).is_err());
         // With nothing in between it takes.
         let started = k.0.lock().unwrap().generation;
         k.commit_unlock(started, &s, open()).unwrap();

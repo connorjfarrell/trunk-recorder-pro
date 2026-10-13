@@ -154,7 +154,7 @@ pub trait VoiceDecoder: Send {
     fn flush(&mut self, _out: &mut Vec<VoiceOut>) {}
     /// Which slots are being recorded (DMR vocodes only those).
     fn listen(&mut self, _slots: [bool; 2]) {}
-    /// The keys to decrypt calls with (P25 Phase 1 so far).
+    /// The keys to decrypt calls with (P25 Phase 1 and Phase 2); an empty store means none.
     fn set_keys(&mut self, _keys: std::sync::Arc<crate::crypto::KeyStore>) {}
     /// Whether it decrypts (keys were given and not empty).
     fn keyed(&self) -> bool {

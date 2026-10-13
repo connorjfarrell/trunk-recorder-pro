@@ -980,6 +980,11 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                 c.load_channel_files(&ctx.config_path);
                 let saved = c.save(&ctx.config_path);
                 let old = std::mem::replace(&mut *ctx.config.lock().unwrap(), c.clone());
+                // A change to the keys section wins over an unlock that is still opening its container,
+                // from this moment, not from when the refresh below gets its turn.
+                if old.keys != c.keys {
+                    ctx.keys.invalidate();
+                }
                 // A talkgroup file changed while recording (an Ignore flag set): the session takes it now.
                 if ctx.runner.lock().unwrap().is_some() {
                     let mut cmds = ctx.engine_cmds.lock().unwrap();

@@ -243,7 +243,7 @@ impl Session {
         &self.cfg
     }
 
-    /// Decrypt P25 Phase 1 calls with `keys` from now on (see [`Engine::set_keys`]).
+    /// Decrypt P25 Phase 1 and Phase 2 calls with `keys` from now on, those in progress too (see [`Engine::set_keys`]).
     pub fn set_keys(&mut self, keys: Option<std::sync::Arc<trunk_core::crypto::KeyStore>>) {
         self.engine.set_keys(keys);
     }
