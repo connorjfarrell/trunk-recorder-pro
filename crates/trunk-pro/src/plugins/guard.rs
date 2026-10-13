@@ -51,6 +51,20 @@ pub fn judge(id: &str, global: &Value, per_system: &BTreeMap<String, Value>, sha
     }
 }
 
+/// Whether a call's JSON says it was decrypted with our keys. A JSON that can't be read at all is
+/// taken as decrypted: it is withheld, never released on a classification that isn't certain.
+pub fn call_json_decrypted(json: &str) -> bool {
+    match serde_json::from_str::<Value>(json) {
+        Ok(v) => match &v["decrypted"] {
+            Value::Bool(b) => *b,
+            Value::Number(n) => n.as_i64() != Some(0),
+            Value::Null => false,
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
 /// The hosts a plugin's settings name: the host of every URL in them, and the value of keys that
 /// are plainly an address (`server`, `url`, `host`, `address`, `endpoint`, `ip`, `hostname`).
 pub fn destinations(v: &Value) -> Vec<String> {
@@ -159,6 +173,18 @@ mod tests {
         assert!(matches!(&v, Verdict::Withheld(w) if w.contains("api.openmhz.com (OUTSIDE your network)")), "{v:?}");
         let v = judge("p", &json!({ "server": "http://192.168.1.5:3000" }), &BTreeMap::new(), &none());
         assert!(matches!(&v, Verdict::Withheld(w) if w.contains("192.168.1.5 (on your network)")), "{v:?}");
+    }
+
+    #[test]
+    fn a_call_json_that_cannot_be_read_counts_as_decrypted() {
+        assert!(!call_json_decrypted(r#"{"talkgroup":1}"#));
+        assert!(!call_json_decrypted(r#"{"decrypted":0}"#));
+        assert!(call_json_decrypted(r#"{"decrypted":1}"#));
+        assert!(call_json_decrypted(r#"{"decrypted":true}"#));
+        // Truncated, not JSON, or a flag of a strange kind: withheld.
+        assert!(call_json_decrypted(r#"{"talkgroup":1,"decrypt"#));
+        assert!(call_json_decrypted(""));
+        assert!(call_json_decrypted(r#"{"decrypted":"yes"}"#));
     }
 
     #[test]

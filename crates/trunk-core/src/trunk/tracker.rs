@@ -94,6 +94,11 @@ impl VoiceTracker {
         self.crypto = (!keys.is_empty()).then(|| Crypto { dec: Decryptor::new(keys), held: Vec::new(), reported: None });
     }
 
+    /// Whether it decrypts.
+    pub fn keyed(&self) -> bool {
+        self.crypto.is_some()
+    }
+
     /// The talkgroup link control named for the current transmission.
     pub fn talkgroup(&self) -> Option<u32> {
         self.tgid

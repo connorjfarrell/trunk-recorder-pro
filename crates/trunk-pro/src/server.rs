@@ -489,23 +489,41 @@ async fn call_file(State(ctx): State<Arc<Ctx>>, UrlPath(path): UrlPath<String>, 
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn ws(State(ctx): State<Arc<Ctx>>, ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap, up: WebSocketUpgrade) -> Response {
-    let allow_lan = ctx.config.lock().unwrap().keys.allow_lan_unlock;
-    let local = is_local(&peer, &headers, allow_lan);
-    up.on_upgrade(move |socket| session(ctx, socket, local))
+async fn ws(State(ctx): State<Arc<Ctx>>, ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap, up: WebSocketUpgrade) -> Response {
+    let peer = Peer::new(addr, &headers);
+    up.on_upgrade(move |socket| session(ctx, socket, peer))
 }
 
-/// Whether a connection may unlock the decryption keys: it is from the computer the recorder
-/// runs on itself (the loopback address), not through a reverse proxy (which says so in a
-/// header, and whose visitors are not at this computer); or, when the config's
-/// `keys.allowLanUnlock` is on, from a private-network address (not through a proxy either).
-fn is_local(peer: &std::net::SocketAddr, headers: &HeaderMap, allow_lan: bool) -> bool {
-    const PROXIED: [&str; 5] = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip"];
-    if PROXIED.iter().any(|h| headers.contains_key(*h)) {
-        return false;
+/// Who a WebSocket is from, kept for as long as it lasts; what it may do is decided from this and
+/// the config as it is when it asks (`keys.allowLanUnlock` turned off takes effect at once).
+#[derive(Clone, Copy)]
+struct Peer {
+    addr: std::net::SocketAddr,
+    /// It came through a reverse proxy (which says so in a header), so its address isn't the visitor's.
+    proxied: bool,
+}
+
+impl Peer {
+    fn new(addr: std::net::SocketAddr, headers: &HeaderMap) -> Peer {
+        const PROXIED: [&str; 5] = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip"];
+        Peer { addr, proxied: PROXIED.iter().any(|h| headers.contains_key(*h)) }
     }
-    let ip = peer.ip().to_canonical();
-    ip.is_loopback() || (allow_lan && is_private(&ip))
+
+    /// From the computer the recorder runs on itself (the loopback address), not through a proxy.
+    fn loopback(&self) -> bool {
+        !self.proxied && self.addr.ip().to_canonical().is_loopback()
+    }
+
+    /// May query, unlock, lock and reload the decryption keys: [`Peer::loopback`], or, when the
+    /// config's `keys.allowLanUnlock` is on, from a private-network address (not through a proxy).
+    fn may_unlock(&self, allow_lan: bool) -> bool {
+        self.loopback() || (allow_lan && !self.proxied && is_private(&self.addr.ip().to_canonical()))
+    }
+}
+
+#[cfg(test)]
+fn is_local(peer: &std::net::SocketAddr, headers: &HeaderMap, allow_lan: bool) -> bool {
+    Peer::new(*peer, headers).may_unlock(allow_lan)
 }
 
 /// A private-network address: RFC 1918, link-local, or an IPv6 unique-local one.
@@ -722,7 +740,7 @@ pub(crate) fn radio_query(ctx: &Ctx, v: &Value) -> Value {
     out
 }
 
-async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, local: bool) {
+async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, peer: Peer) {
     let mut rx = ctx.hub.subscribe();
     let found = tokio::task::spawn_blocking(|| (json!(sdr::devices()), crate::radio::radios_json(false))).await;
     let (devices, radios) = found.unwrap_or((Value::Null, Value::Null));
@@ -761,8 +779,17 @@ async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, local: bool) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(t))) => {
+                    // An unlock's password goes from the message straight into storage that is
+                    // wiped, never into a `Value`.
+                    if let Some(unlock) = Unlock::parse(&t) {
+                        let reply = keys_unlock(&ctx, peer, unlock).await;
+                        if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
-                    if let Some(reply) = command(&ctx, &v, &mut listen, &mut subs, local).await {
+                    if let Some(reply) = command(&ctx, &v, &mut listen, &mut subs, peer).await {
                         if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
                             return;
                         }
@@ -773,6 +800,54 @@ async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, local: bool) {
             },
         }
     }
+}
+
+const NOT_HERE: &str = "Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, use a password file, or set keys.allowLanUnlock).";
+
+/// Whether `peer` may handle the keys now (the config as it is this moment).
+fn may_unlock(ctx: &Ctx, peer: Peer) -> bool {
+    peer.may_unlock(ctx.config.lock().unwrap().keys.allow_lan_unlock)
+}
+
+/// A `keysUnlock` message, its password in wiped storage.
+struct Unlock {
+    id: Option<f64>,
+    password: zeroize::Zeroizing<String>,
+}
+
+impl Unlock {
+    fn parse(text: &str) -> Option<Unlock> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            r#type: String,
+            id: Option<f64>,
+            #[serde(default)]
+            password: String,
+        }
+        if !text.contains("keysUnlock") {
+            return None;
+        }
+        let mut raw: Raw = serde_json::from_str(text).ok()?;
+        (raw.r#type == "keysUnlock").then(|| Unlock { id: raw.id, password: zeroize::Zeroizing::new(std::mem::take(&mut raw.password)) })
+    }
+}
+
+/// `keysUnlock`: open the container with the password.
+async fn keys_unlock(ctx: &Arc<Ctx>, peer: Peer, u: Unlock) -> Value {
+    let answer = |r: Result<(), String>, id: Option<f64>| {
+        let mut v = json!({ "type": "keysResult", "ok": r.is_ok(), "message": r.err() });
+        if let Some(id) = id {
+            v["id"] = json!(id);
+        }
+        v
+    };
+    if !may_unlock(ctx, peer) {
+        return answer(Err(NOT_HERE.into()), u.id);
+    }
+    let ctx2 = ctx.clone();
+    let (password, id) = (u.password, u.id);
+    let result = tokio::task::spawn_blocking(move || keys_command(&ctx2, "keysUnlock", &password)).await.unwrap_or_else(|_| Err("internal error".into()));
+    answer(result, id)
 }
 
 /// Unlock, lock or re-read the decryption keys, and tell the running session and the browsers.
@@ -864,7 +939,7 @@ impl Listen {
     }
 }
 
-async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &mut Subs, local: bool) -> Option<Value> {
+async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &mut Subs, peer: Peer) -> Option<Value> {
     match v["type"].as_str()? {
         // What this connection watches: costly messages (waterfalls, the
         // control channel log, detail views) only go to those that ask.
@@ -888,6 +963,17 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
         }
         "setConfig" => match serde_json::from_value::<Config>(v["config"].clone()) {
             Ok(mut c) => {
+                // Two controls are the config file's, and a computer other than the recorder's own
+                // can't change them from here: who may unlock the keys, and which plugins may be
+                // given decrypted calls.
+                if !peer.loopback() {
+                    let cur = ctx.config.lock().unwrap().keys.clone();
+                    if c.keys.allow_lan_unlock != cur.allow_lan_unlock || c.keys.share_decrypted != cur.share_decrypted {
+                        log::warn!("A settings change from another computer tried to change keys.allowLanUnlock or keys.shareDecrypted (set in the config file only): left as they were");
+                    }
+                    c.keys.allow_lan_unlock = cur.allow_lan_unlock;
+                    c.keys.share_decrypted = cur.share_decrypted;
+                }
                 // While linked, a conventional system's channels are its file's
                 // (re-read: a spreadsheet may have changed it). Files are linked
                 // with "channelFile".
@@ -994,17 +1080,15 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
         }
         // The decryption keys (docs/configuration/encryption.md). Which keys are held, and
         // unlocking and locking them, are for the computer the recorder runs on only.
-        "keysQuery" => Some(if local { ctx.keys.list_json() } else { json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }) }),
-        "keysUnlock" | "keysLock" | "keysReload" => {
-            let kind = v["type"].as_str().unwrap_or("");
-            if !local {
-                return Some(keys_result(v, Err("Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, use a password file, or set keys.allowLanUnlock).".into())));
+        "keysQuery" => Some(if may_unlock(ctx, peer) { ctx.keys.list_json() } else { json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }) }),
+        // (An unlock with its password is taken before this, in `session`.)
+        "keysUnlock" => Some(keys_result(v, Err("Enter the container's password.".into()))),
+        "keysLock" | "keysReload" => {
+            if !may_unlock(ctx, peer) {
+                return Some(keys_result(v, Err(NOT_HERE.into())));
             }
-            // (Held apart from the message, and wiped when done.)
-            let password = zeroize::Zeroizing::new(v["password"].as_str().unwrap_or("").to_string());
-            let ctx2 = ctx.clone();
-            let kind = kind.to_string();
-            let result = tokio::task::spawn_blocking(move || keys_command(&ctx2, &kind, &password)).await.unwrap_or_else(|_| Err("internal error".into()));
+            let (ctx2, kind) = (ctx.clone(), v["type"].as_str().unwrap_or("").to_string());
+            let result = tokio::task::spawn_blocking(move || keys_command(&ctx2, &kind, "")).await.unwrap_or_else(|_| Err("internal error".into()));
             Some(keys_result(v, result))
         }
         "quit" => {

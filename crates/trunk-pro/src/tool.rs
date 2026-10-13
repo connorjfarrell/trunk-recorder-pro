@@ -353,10 +353,11 @@ fn run_sdr(a: &Args) {
 /// `tool ekc`: what a key container holds.
 fn run_ekc(a: &Args) {
     let path = a.positional.get(1).unwrap_or_else(|| die("tool ekc <keys.ekc> [--password-file path]"));
-    let file = std::fs::read(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let file = crate::keyfiles::read_container(std::path::Path::new(path)).unwrap_or_else(|e| die(&e));
+    // (The same reading of a password file as when recording: mode 600, its first line, no byte-order mark.)
     let password = match a.get("password-file") {
-        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}"))).trim_end_matches(['\r', '\n']).to_string(),
-        None => std::env::var("TRUNK_EKC_PASSWORD").unwrap_or_else(|_| die("tool ekc: the password: --password-file <path>, or TRUNK_EKC_PASSWORD")),
+        Some(p) => crate::keyfiles::read_password(std::path::Path::new(p)).unwrap_or_else(|e| die(&e)),
+        None => zeroize::Zeroizing::new(std::env::var("TRUNK_EKC_PASSWORD").unwrap_or_else(|_| die("tool ekc: the password: --password-file <path>, or TRUNK_EKC_PASSWORD"))),
     };
     let c = trunk_core::crypto::ekc::parse(&file, &password).unwrap_or_else(|e| die(&format!("{path}: {e}")));
     for k in c.keys.list() {

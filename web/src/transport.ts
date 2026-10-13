@@ -9,6 +9,8 @@ export type CallExt = "wav" | "m4a" | "json";
 export interface Transport {
   readonly kind: "desktop" | "web";
   send(msg: ToRecorder): void;
+  /** Send now or not at all: false when the connection isn't open (nothing is kept to send later; for commands that carry a secret). */
+  sendNow?(msg: ToRecorder): boolean;
   onMessage: (msg: FromRecorder) => void;
   onAudio: (chunk: AudioChunk) => void;
   onConnection: (connected: boolean) => void;
@@ -65,6 +67,12 @@ export class WsTransport implements Transport {
   send(msg: ToRecorder): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
     else this.queue.push(msg);
+  }
+
+  sendNow(msg: ToRecorder): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(msg));
+    return true;
   }
 
   async callUrl(path: string, ext: CallExt): Promise<string> {

@@ -542,6 +542,14 @@ struct SysHost<'a> {
     bank: BankConfig,
 }
 
+/// Give each of `voices` `keys` (or, with none, an empty store: no decryption).
+pub(super) fn rekey<'a>(voices: impl Iterator<Item = &'a mut Box<dyn VoiceDecoder>>, keys: Option<&Arc<KeyStore>>) {
+    let store = keys.cloned().unwrap_or_else(|| Arc::new(KeyStore::new()));
+    for v in voices {
+        v.set_keys(store.clone());
+    }
+}
+
 impl SysHost<'_> {
     /// Open `call`'s voice channel on source `src` (a newer call on one
     /// already open takes its slot over, as in Trunk Recorder).
@@ -993,10 +1001,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Decrypt P25 Phase 1 calls with `keys` from now on (calls already in
-    /// progress go on as they were). None, or no keys: don't.
+    /// Decrypt P25 calls with `keys` from now on, those in progress too (a call is decrypted from
+    /// its next encryption sync; with no keys, from now it isn't). None, or no keys: don't.
     pub fn set_keys(&mut self, keys: Option<Arc<KeyStore>>) {
         self.radio.keys = keys.clone().filter(|k| !k.is_empty());
+        // Channels already open (one is reused by the next call on its frequency) change too:
+        // unlocking reaches them, and locking takes the old keys from them.
+        rekey(self.radio.channels.values_mut().map(|c| &mut c.voice), self.radio.keys.as_ref());
         self.conv.set_keys(keys);
     }
 
@@ -1727,6 +1738,24 @@ mod tests {
         assert!(e.radio.keys.is_some());
         e.set_keys(None);
         assert!(e.radio.keys.is_none());
+    }
+
+    /// Keys reach voice decoders that are open already, and locking takes them away.
+    #[test]
+    fn keys_reach_channels_already_open() {
+        use crate::crypto::{Key, KeyStore};
+        let spec = |kind| VoiceSpec { kind, rate: 24_000.0, t0: 0.0, seed: 1, vocoder: crate::mbe::Profile::Enhanced, bank: BankConfig::default(), squelch: 0.0, subaudible: false };
+        let mut voices: Vec<Box<dyn VoiceDecoder>> = vec![voice::build(&spec(VoiceKind::Fdma)), voice::build(&spec(VoiceKind::Tdma))];
+        assert!(voices.iter().all(|v| !v.keyed()));
+        let mut store = KeyStore::new();
+        store.insert(Key::new(0x81, 1, "k".into(), 0, true, vec![0; 8]));
+        let keys = Arc::new(store);
+        rekey(voices.iter_mut(), Some(&keys));
+        assert!(voices.iter().all(|v| v.keyed()), "unlocked: open channels decrypt");
+        rekey(voices.iter_mut(), None);
+        assert!(voices.iter().all(|v| !v.keyed()), "locked: they stop");
+        rekey(voices.iter_mut(), Some(&Arc::new(KeyStore::new())));
+        assert!(voices.iter().all(|v| !v.keyed()), "an empty store is no keys");
     }
 
     /// u8 IQ in buffers of odd length: the same as in even ones (no I/Q swap).

@@ -111,7 +111,8 @@ pub fn changed(a: &Config, b: &Config) -> bool {
         v.extend(c.conventional.iter().map(|x| (x.short_name.clone(), x.plugins.clone())));
         v
     };
-    a.plugins != b.plugins || a.recording.m4a != b.recording.m4a || per_system(a) != per_system(b)
+    // (`keys.shareDecrypted` is what lets a plugin be given decrypted calls: changing or removing it takes effect now.)
+    a.plugins != b.plugins || a.recording.m4a != b.recording.m4a || per_system(a) != per_system(b) || a.keys.share_decrypted != b.keys.share_decrypted
 }
 
 pub fn plugins_dir() -> PathBuf {

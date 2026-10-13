@@ -88,6 +88,8 @@ const DRAIN_MAX: Duration = Duration::from_secs(30);
 struct EncodeJob {
     call: ConcludedCall,
     audio: CallAudio,
+    /// The call was decrypted with our keys (see [`super::guard`]).
+    decrypted: bool,
 }
 
 /// A concluded call's audio, for the plugins.
@@ -376,14 +378,15 @@ impl PluginHost {
     /// wants it.
     pub fn concluded(&self, system: u16, rel: &str, json: &str, mut audio: CallAudio) {
         let record: CallRecord = serde_json::from_str(json).unwrap_or_default();
-        if self.call_takers(is_decrypted(&record)) == 0 {
+        // (A call JSON that can't be read is withheld like a decrypted call, not released.)
+        let decrypted = super::guard::call_json_decrypted(json);
+        if self.call_takers(decrypted) == 0 {
             return;
         }
-        let decrypted = is_decrypted(&record);
         let call = |files: &CallFiles| ConcludedCall { path: rel.to_string(), system, call: record.clone(), files: files.clone() };
         match &self.encode_tx {
             Some(tx) if audio.files.m4a.is_none() => {
-                if let Err(TrySendError::Full(mut job) | TrySendError::Disconnected(mut job)) = tx.try_send(EncodeJob { call: call(&audio.files), audio }) {
+                if let Err(TrySendError::Full(mut job) | TrySendError::Disconnected(mut job)) = tx.try_send(EncodeJob { call: call(&audio.files), audio, decrypted }) {
                     self.shared.note_log("", Level::Warn, "M4A encoding is behind: a call goes out as WAV only");
                     job.audio.write_wav();
                     self.shared.dispatch(topic::CALL_CONCLUDED, &line(&HostMessage::CallConcluded(job.call)), decrypted);
@@ -488,15 +491,6 @@ fn with_ext(base: &Path, ext: &str) -> PathBuf {
     PathBuf::from(format!("{}.{ext}", base.display()))
 }
 
-/// Whether a concluded call was decrypted with our keys.
-fn is_decrypted(r: &CallRecord) -> bool {
-    match r.extra.get("decrypted") {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_i64().is_some_and(|n| n != 0),
-        _ => false,
-    }
-}
-
 fn line(m: &HostMessage) -> Arc<str> {
     let mut s = serde_json::to_string(m).unwrap_or_default();
     s.push('\n');
@@ -541,7 +535,7 @@ fn encode_worker(rx: &Mutex<Receiver<EncodeJob>>, sh: &Shared, e: &Encoder, kbps
     let mut last_error: Option<Instant> = None;
     loop {
         let job = rx.lock().unwrap().recv();
-        let Ok(EncodeJob { mut call, mut audio }) = job else {
+        let Ok(EncodeJob { mut call, mut audio, decrypted }) = job else {
             return;
         };
         match e.m4a(&audio.wav, &audio.m4a_to, kbps) {
@@ -554,7 +548,6 @@ fn encode_worker(rx: &Mutex<Receiver<EncodeJob>>, sh: &Shared, e: &Encoder, kbps
                 }
             }
         }
-        let decrypted = is_decrypted(&call.call);
         sh.dispatch(topic::CALL_CONCLUDED, &line(&HostMessage::CallConcluded(call)), decrypted);
     }
 }
@@ -789,6 +782,6 @@ mod tests {
         // It is told once, with how to allow it, never the key.
         let said = said.lock().unwrap();
         assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0].starts_with("openmhz: is not given decrypted calls") && said[0].contains("keys.shareDecrypted.openmhz"), "{said:?}");
+        assert!(said[0].starts_with("openmhz: is NOT given decrypted calls") && said[0].contains("keys.shareDecrypted.openmhz"), "{said:?}");
     }
 }

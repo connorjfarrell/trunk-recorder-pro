@@ -297,6 +297,8 @@ function take(m: FromRecorder): void {
       });
       if (m.host) feedSeries(m.host.t, m.host.values);
       if (m.pluginRuntime) pendingRuntime = m.pluginRuntime;
+      // (A new connection may be to a restarted recorder whose key list version is the same number: ask again.)
+      set({ keys: null, heldKeys: [], heldKeysRestricted: false });
       if (m.keys) take(m.keys);
       if (state.listen) transport.send({ type: "listen", on: true, system: state.listenSystem, talkgroup: state.listenTalkgroup });
       // (A new connection: it watches nothing until told.)
@@ -502,8 +504,12 @@ function keysCommand(msg: { type: "keysUnlock"; password: string } | { type: "ke
   return new Promise((resolve) => {
     // (Answers are matched by id: one that comes after its timeout is not taken for the next command's.)
     const id = nextKeysId++;
+    // (Not queued for a reconnect: a password mustn't be sent later than the person pressed Unlock.)
+    if (!transport.sendNow?.({ ...msg, id })) {
+      resolve({ ok: false, message: "Not connected to the recorder." });
+      return;
+    }
     keysWaiting.set(id, resolve);
-    transport.send({ ...msg, id });
     setTimeout(() => {
       if (keysWaiting.delete(id)) resolve({ ok: false, message: "No answer from the recorder." });
     }, 20_000);

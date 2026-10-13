@@ -564,6 +564,8 @@ impl Conventional {
     /// Decrypt P25 channels' calls with `keys` (None, or empty: don't).
     pub fn set_keys(&mut self, keys: Option<std::sync::Arc<crate::crypto::KeyStore>>) {
         self.keys = keys.filter(|k| !k.is_empty());
+        // Channels open now change too (see `Engine::set_keys`).
+        super::engine::rekey(self.chans.iter_mut().filter_map(|c| c.open.as_mut()).map(|o| &mut o.voice), self.keys.as_ref());
     }
 
     pub fn open_count(&self) -> usize {

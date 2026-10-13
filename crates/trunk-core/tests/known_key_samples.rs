@@ -24,7 +24,7 @@ fn unhex(s: &str) -> Vec<u8> {
 
 struct Sample {
     algid: u8,
-    key: Vec<u8>,
+    key: zeroize::Zeroizing<Vec<u8>>,
     /// Per frame: the 144 coded bits, and the MI marker it carries, if any.
     frames: Vec<([u8; 144], Option<p25::Mi>)>,
     expected: Vec<i16>,
@@ -34,7 +34,7 @@ fn load(dir: &Path) -> Sample {
     let kv = std::fs::read_to_string(dir.join("key.txt")).unwrap();
     let get = |k: &str| kv.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).unwrap().trim().to_string();
     let algid = u8::from_str_radix(get("algid").trim_start_matches("0x"), 16).unwrap();
-    let key = unhex(&get("key_hex"));
+    let key = zeroize::Zeroizing::new(unhex(&get("key_hex")));
     let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("encrypted.mbe")).unwrap()).unwrap();
     let frames = j["frames"]
         .as_array()
@@ -126,7 +126,7 @@ fn p25_phase1_samples_decrypt_with_their_keys() {
             chain.push(marked.or(from_chain).expect("a first MI"));
         }
         let (voice, n, errs, good) = vocode(&s, Some(&s.key), &chain);
-        let mut wrong = s.key.clone();
+        let mut wrong = zeroize::Zeroizing::new(s.key.to_vec());
         wrong[0] ^= 0x55;
         let (wvoice, _, _, wenv) = vocode(&s, Some(&wrong), &chain);
         let (cvoice, _, _, _) = vocode(&s, None, &chain);

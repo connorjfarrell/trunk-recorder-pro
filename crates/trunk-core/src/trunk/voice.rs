@@ -156,6 +156,10 @@ pub trait VoiceDecoder: Send {
     fn listen(&mut self, _slots: [bool; 2]) {}
     /// The keys to decrypt calls with (P25 Phase 1 so far).
     fn set_keys(&mut self, _keys: std::sync::Arc<crate::crypto::KeyStore>) {}
+    /// Whether it decrypts (keys were given and not empty).
+    fn keyed(&self) -> bool {
+        false
+    }
     /// What the control channel says voice needs (Phase 2: the scrambler key).
     fn set_params(&mut self, _p: &VoiceParams) {}
     /// Analog: the carrier power that opens the squelch.
@@ -248,6 +252,9 @@ impl VoiceDecoder for P25Fdma {
     fn set_keys(&mut self, keys: std::sync::Arc<crate::crypto::KeyStore>) {
         self.tracker.set_keys(keys);
     }
+    fn keyed(&self) -> bool {
+        self.tracker.keyed()
+    }
     fn push(&mut self, iq: &[Complex32], out: &mut Vec<VoiceOut>) {
         (self.nac, self.air) = (None, None);
         self.groups.clear();
@@ -306,6 +313,9 @@ impl VoiceDecoder for P25Tdma {
     }
     fn set_keys(&mut self, keys: std::sync::Arc<crate::crypto::KeyStore>) {
         self.tracker.set_keys(keys);
+    }
+    fn keyed(&self) -> bool {
+        self.tracker.keyed()
     }
     fn set_params(&mut self, p: &VoiceParams) {
         if let Some((nac, sys, wacn)) = p.tdma_key {

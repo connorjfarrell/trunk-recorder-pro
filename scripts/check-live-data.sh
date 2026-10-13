@@ -19,7 +19,12 @@
 #            line and the number of the entry, never the text, so a public CI log doesn't repeat it.
 #
 # Known harmless values (the standards' published test vectors, documentation addresses) are in
-# .live-data-allow: one extended regex per line, matched against the added line.
+# .live-data-allow: one extended regex per line. What it matches is taken OUT of an added line
+# before the checks, so a harmless value never hides anything else on the same line.
+#
+# A finding is reported by file and rule, with the number of lines, and NOT the line itself: a CI
+# log is public, and printing a caught secret there would disclose it a second time. --show prints
+# the lines too, for a run on your own computer.
 # Exit status 1 when anything is found.
 
 set -u
@@ -27,11 +32,13 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 
 range=""
 deny_file=""
+show=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --range) range="$2"; shift 2 ;;
     --denylist) deny_file="$2"; shift 2 ;;
-    *) echo "usage: $0 [--range <rev range>] [--denylist <file>]" >&2; exit 2 ;;
+    --show) show=1; shift ;;
+    *) echo "usage: $0 [--range <rev range>] [--denylist <file>] [--show]" >&2; exit 2 ;;
   esac
 done
 if [ -z "$range" ]; then
@@ -52,19 +59,30 @@ git log -p --no-color --format= -U0 "$range" -- . ':!Cargo.lock' ':!web/package-
   /^\+/         { print f "\t" substr($0, 2) }' > "$tmp/added.tsv"
 git log --no-color --format='(commit message)%x09%B' "$range" > "$tmp/messages.tsv"
 
-# Lines the allowlist says are harmless.
-allow="$tmp/allow.txt"
-grep -v -E '^\s*(#|$)' .live-data-allow 2>/dev/null > "$allow" || : > "$allow"
-dropped_allowed() { if [ -s "$allow" ]; then grep -v -E -f "$allow"; else cat; fi; }
+# What the allowlist says is harmless is taken out of each line, for the checks below (the
+# denylist is checked on the lines as they are).
+cp "$tmp/added.tsv" "$tmp/masked.tsv"
+sep=$(printf '\001')
+while IFS= read -r re; do
+  [ -z "$re" ] && continue
+  sed -E "s${sep}${re}${sep}${sep}g" "$tmp/masked.tsv" > "$tmp/masked.next" && mv "$tmp/masked.next" "$tmp/masked.tsv"
+done < <(grep -v -E '^\s*(#|$)' .live-data-allow 2>/dev/null || true)
+
+# A report of what matched: where, never the text (unless --show).
+report() {
+  cut -d: -f1 "$tmp/hits.txt" | sort | uniq -c | sort -rn | head -10 | awk '{ n = $1; $1 = ""; print "    " substr($0, 2) ": " n " line(s)" }'
+  [ "$show" -eq 1 ] && cut -c1-200 "$tmp/hits.txt" | head -5 | sed 's/^/      /'
+  return 0
+}
 
 # rule <name> <only paths ERE> <except paths ERE> <line ERE>
 rule() {
   local name="$1" only="$2" except="$3" re="$4"
   awk -F'\t' -v only="$only" -v except="$except" '
-    $1 ~ only && !(except != "" && $1 ~ except) { print $1 ": " substr($0, length($1) + 2) }' "$tmp/added.tsv" | { grep -E -e "$re" || true; } | dropped_allowed > "$tmp/hits.txt"
+    $1 ~ only && !(except != "" && $1 ~ except) { print $1 ": " substr($0, length($1) + 2) }' "$tmp/masked.tsv" | { grep -E -e "$re" || true; } > "$tmp/hits.txt"
   if [ -s "$tmp/hits.txt" ]; then
     problem "$name"
-    cut -c1-200 "$tmp/hits.txt" | head -5 | sed 's/^/    /'
+    report
   fi
 }
 
@@ -81,7 +99,7 @@ fi
 
 # ── Heuristics over the added lines ─────────────────────────────────────────────────────────────
 rule "a recorder log line (talkgroup and frequency)" '.*' "$DOCS|^crates/.*/(tests?|testdata)/" 'TG:[[:space:]]+[0-9]+[[:space:]]+Freq:[[:space:]]+[0-9]+\.[0-9]+[[:space:]]+MHz'
-rule "a talkgroup export (RadioReference, Trunk Recorder CSV)" '.*' "$DOCS" '(Decimal,Hex,Mode,Alpha Tag|DEC[[:space:]]+HEX[[:space:]]+MODE[[:space:]]+ALPHA TAG)'
+rule "a talkgroup export (RadioReference, Trunk Recorder CSV)" '.*' "$DOCS|^scripts/check-live-data\\.sh$" '(Decimal,Hex,Mode,Alpha Tag|DEC[[:space:]]+HEX[[:space:]]+MODE[[:space:]]+ALPHA TAG)'
 rule "a call record (talkgroup, radio ids)" "$DATA" '^docs/' '"(srcList|src|unit|radio_id|unitId|talkgroup)"[[:space:]]*:[[:space:]]*(\[|[0-9]{3,})'
 rule "a config naming real channels, keys or files" "$DATA" "$NOTCONFIGS" '"(controlChannelsHz|voiceChannelsHz|talkgroupsCsv|ekcFile|passwordFile|apiKey|systemName|shortName)"[[:space:]]*:[[:space:]]*(\[[[:space:]]*[0-9]|"[^"]+")'
 rule "a unit alias or radio name list" "$DATA" '^docs/' ': [0-9]{5,9},[^,]*[A-Za-z]'
@@ -103,7 +121,8 @@ while IFS= read -r entry; do
   if git ls-files | grep "${opt[@]}" -q -e "$re"; then problem "denylist entry #$n appears in the name of a tracked file"; fi
   if cut -f2- "$tmp/added.tsv" | grep "${opt[@]}" -q -e "$re"; then
     problem "denylist entry #$n appears in added lines:"
-    awk -F'\t' '{print NR "\t" $0}' "$tmp/added.tsv" | grep "${opt[@]}" -e "$re" | head -5 | awk -F'\t' '{print "    " $2 ": (line " $1 " of the added lines)"}'
+    awk -F'\t' '{print $1 ": " $2}' "$tmp/added.tsv" | { grep "${opt[@]}" -e "$re" || true; } > "$tmp/hits.txt"
+    report
   fi
   if grep "${opt[@]}" -q -e "$re" "$tmp/messages.tsv"; then problem "denylist entry #$n appears in a commit message"; fi
 done < "$tmp/deny.txt"

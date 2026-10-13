@@ -80,7 +80,7 @@ export function KeysPanel() {
         <p className={state === "error" ? "bad-text" : "muted"} role="status">
           {STATE_TEXT[state]}
           {keys?.source === "file" && " (from the password file)"}
-          {keys?.source === "password" && " (with the password you typed; kept in memory until you lock it or quit; locking applies to calls that start afterwards)"}
+          {keys?.source === "password" && " (with the password you typed; kept in memory until you lock it or quit)"}
           {keys?.message && <> {keys.message}</>}
         </p>
 

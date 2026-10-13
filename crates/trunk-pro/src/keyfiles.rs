@@ -57,7 +57,7 @@ fn check_password_perms(path: &Path) -> Result<(), String> {
 }
 
 /// The password on the file's first line (its line ending taken off, nothing else).
-fn read_password(path: &Path) -> Result<zeroize::Zeroizing<String>, String> {
+pub(crate) fn read_password(path: &Path) -> Result<zeroize::Zeroizing<String>, String> {
     check_password_perms(path)?;
     let len = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
     if len > MAX_PASSWORD_FILE {
@@ -107,10 +107,35 @@ pub fn load(s: &KeysSettings, config_dir: &Path) -> Loaded {
     loaded
 }
 
+/// The most a key container may be (a real one is a few KB; this is for a mistaken path).
+const MAX_CONTAINER: u64 = 8 << 20;
+
+/// A key container's bytes: a regular file no bigger than [`MAX_CONTAINER`] (a device like
+/// `/dev/zero`, a pipe or a huge file is an error, not memory used or startup blocked).
+pub(crate) fn read_container(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let bad = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    // (Checked before opening: opening a pipe would wait for its other end.)
+    let meta = std::fs::metadata(path).map_err(|e| bad(&e))?;
+    if !meta.is_file() {
+        return Err(bad(&"not a regular file"));
+    }
+    let f = std::fs::File::open(path).map_err(|e| bad(&e))?;
+    if f.metadata().map_err(|e| bad(&e))?.len() > MAX_CONTAINER {
+        return Err(bad(&"too large for a key container"));
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_CONTAINER + 1).read_to_end(&mut buf).map_err(|e| bad(&e))?;
+    if buf.len() as u64 > MAX_CONTAINER {
+        return Err(bad(&"too large for a key container"));
+    }
+    Ok(buf)
+}
+
 /// Open the container at `ekc_path` with `password`: its usable keys, and lines for the log.
 /// Err says what is wrong with the file or the password (never a key).
 pub fn open_ekc(ekc_path: &Path, password: &str) -> Result<Loaded, String> {
-    let file = std::fs::read(ekc_path).map_err(|e| format!("{}: {e}", ekc_path.display()))?;
+    let file = read_container(ekc_path)?;
     let container = ekc::parse(&file, password).map_err(|e| format!("{}: {e}", ekc_path.display()))?;
     let mut notes = Vec::new();
     let mut keys = container.keys;
@@ -147,6 +172,24 @@ mod tests {
     // trunk-core's test container: throwaway keys.
     fn ekc_bytes() -> Vec<u8> {
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../trunk-core/src/crypto/testdata/dummy-test-keys.ekc")).unwrap()
+    }
+
+    /// A mistaken path is an error, not memory used or a startup that waits.
+    #[test]
+    fn a_container_that_is_not_a_small_regular_file_is_refused() {
+        let d = dir("container");
+        assert!(read_container(&d).unwrap_err().contains("not a regular file"), "a folder");
+        assert!(read_container(&d.join("missing.ekc")).is_err());
+        #[cfg(unix)]
+        {
+            assert!(read_container(Path::new("/dev/zero")).unwrap_err().contains("not a regular file"), "a device that never ends");
+        }
+        let big = d.join("big.ekc");
+        std::fs::write(&big, vec![0u8; (MAX_CONTAINER + 1) as usize]).unwrap();
+        assert!(read_container(&big).unwrap_err().contains("too large"));
+        let ok = d.join("ok.ekc");
+        std::fs::write(&ok, ekc_bytes()).unwrap();
+        assert_eq!(read_container(&ok).unwrap(), ekc_bytes());
     }
 
     fn dir(name: &str) -> PathBuf {

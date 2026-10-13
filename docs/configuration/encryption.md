@@ -69,9 +69,13 @@ stopping and starting recording keeps it. After a restart you unlock again.
 - Tries are a second apart, and a wrong password changes nothing.
 - Any browser is told whether keys are held and how many; only a browser on the recorder's own
   computer is told which (cipher, key id and name, never the keys).
-- Keys unlocked while recording is on are used for calls that start afterwards. **Lock** likewise
-  takes effect for calls that start afterwards: a call already being decrypted finishes with the
-  keys it began with (they are wiped from memory when it ends).
+- Unlocking while recording is on reaches calls already in progress: one is decrypted from its next
+  encryption sync (up to a couple of seconds on). **Lock** takes the keys away at once, from every
+  call in progress, whose voice then isn't decoded.
+- Whether a browser on another computer may unlock (`keys.allowLanUnlock`) and which plugins are given
+  decrypted calls (`keys.shareDecrypted`) are the config file's to say: a settings change sent from
+  another computer can't alter them, and turning `allowLanUnlock` off cuts off the connections already
+  open. A change to `shareDecrypted` takes effect at once, restarting the plugins.
 
 - **The password file must be readable by you alone** on Linux and macOS: no access for group or
   others (`600` is usual). A file others can read is refused, and the log tells you to `chmod 600`

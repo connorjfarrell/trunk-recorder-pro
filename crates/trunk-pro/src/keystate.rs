@@ -47,7 +47,9 @@ impl KeyState {
     /// container is the same one, else it is locked; with neither, nothing is held.
     pub fn refresh(&self, s: &KeysSettings, config_dir: &Path) -> Notes {
         let mut g = self.0.lock().unwrap();
-        let before = (g.store.as_ref().map(|k| k.len()), g.from_prompt, g.problem.clone());
+        // (What the browsers show: which keys, not only how many; a replaced container with as many keys changes it.)
+        let shown = |g: &Inner| (g.store.as_ref().map(|k| k.list()), g.from_prompt, g.problem.clone());
+        let before = shown(&g);
         let mut notes = Notes::new();
         if s.ekc_file.trim().is_empty() || s.password_file.trim().is_empty() {
             if !(g.from_prompt && !s.ekc_file.trim().is_empty() && g.ekc == s.ekc_file) {
@@ -66,7 +68,7 @@ impl KeyState {
             notes = loaded.notes;
         }
         g.ekc = s.ekc_file.clone();
-        if before != (g.store.as_ref().map(|k| k.len()), g.from_prompt, g.problem.clone()) {
+        if before != shown(&g) {
             g.version += 1;
         }
         notes
@@ -99,8 +101,8 @@ impl KeyState {
         Ok(loaded.notes)
     }
 
-    /// Forget what is held (a password file's keys come back at the next refresh). Calls already
-    /// being decrypted keep the keys they began with; they are wiped when those calls end.
+    /// Forget what is held (a password file's keys come back at the next refresh). The recorder is
+    /// told to take them from every call in progress too.
     pub fn lock(&self) {
         let mut g = self.0.lock().unwrap();
         if g.store.take().is_some() {

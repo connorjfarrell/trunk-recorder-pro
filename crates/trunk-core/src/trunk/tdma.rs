@@ -164,6 +164,11 @@ impl TdmaTracker {
         }
     }
 
+    /// Whether it decrypts.
+    pub fn keyed(&self) -> bool {
+        self.slots.iter().any(|s| s.crypto.is_some())
+    }
+
     /// The scrambler seed: NAC, System ID, WACN (from the control channel).
     pub fn set_key(&mut self, nac: u32, sys_id: u32, wacn: u32) {
         if self.key != Some((nac, sys_id, wacn)) {
