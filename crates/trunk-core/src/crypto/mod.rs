@@ -4,5 +4,6 @@
 
 pub mod ekc;
 mod keystore;
+pub mod p25;
 
 pub use keystore::{Key, KeyInfo, KeyStore};
