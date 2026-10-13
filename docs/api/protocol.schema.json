@@ -1541,6 +1541,9 @@
             },
             "restricted": {
               "type": "boolean"
+            },
+            "canUnlock": {
+              "type": "boolean"
             }
           },
           "required": [

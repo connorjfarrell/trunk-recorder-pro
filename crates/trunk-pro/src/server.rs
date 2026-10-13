@@ -1088,7 +1088,17 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
         // The decryption keys (docs/configuration/encryption.md). Which keys are held, and
         // unlocking and locking them, are for the computer the recorder runs on only.
         // (Which keys are held is for the recorder's own computer only, not for a LAN address that may unlock.)
-        "keysQuery" => Some(if peer.loopback() { ctx.keys.list_json() } else { json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }) }),
+        "keysQuery" => {
+            // `canUnlock`: whether this connection may unlock, lock and reload (the page offers the password box only then).
+            let can = may_unlock(ctx, peer);
+            Some(if peer.loopback() {
+                let mut l = ctx.keys.list_json();
+                l["canUnlock"] = json!(can);
+                l
+            } else {
+                json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true, "canUnlock": can })
+            })
+        }
         // (An unlock with its password is taken before this, in `session`.)
         "keysUnlock" => Some(keys_result(v, Err("Enter the container's password.".into()))),
         "keysLock" | "keysReload" => {

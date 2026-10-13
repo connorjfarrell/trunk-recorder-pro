@@ -491,6 +491,7 @@ fn the_keys_messages() {
         k.status_json(&s),
         k.list_json(),
         json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }),
+        json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true, "canUnlock": true }),
         json!({ "type": "keysResult", "ok": false, "message": "Wait a moment before trying again." }),
         json!({ "type": "keysResult", "ok": true, "message": null }),
         crate::server::keys_result(&json!({ "type": "keysLock", "id": 4 }), Ok(())),

@@ -19,8 +19,10 @@
 #            line and the number of the entry, never the text, so a public CI log doesn't repeat it.
 #
 # Known harmless values (the standards' published test vectors, documentation addresses) are in
-# .live-data-allow: one extended regex per line. What it matches is taken OUT of an added line
-# before the checks, so a harmless value never hides anything else on the same line.
+# .live-data-allow: one entry per line, `<path regex> ::: <value regex>`. In the files the path
+# matches, what the value matches is taken OUT of an added line before the checks, so a harmless
+# value never hides anything else on the line, and an example in a test can't excuse the same value in
+# a config or a log.
 #
 # A finding is reported by file and rule, with the number of lines, and NOT the line itself: a CI
 # log is public, and printing a caught secret there would disclose it a second time. --show prints
@@ -62,10 +64,11 @@ git log --no-color --format='(commit message)%x09%B' "$range" > "$tmp/messages.t
 # What the allowlist says is harmless is taken out of each line, for the checks below (the
 # denylist is checked on the lines as they are).
 cp "$tmp/added.tsv" "$tmp/masked.tsv"
-sep=$(printf '\001')
-while IFS= read -r re; do
-  [ -z "$re" ] && continue
-  sed -E "s${sep}${re}${sep}${sep}g" "$tmp/masked.tsv" > "$tmp/masked.next" && mv "$tmp/masked.next" "$tmp/masked.tsv"
+while IFS= read -r entry; do
+  case "$entry" in *" ::: "*) ;; *) echo "check-live-data: .live-data-allow: '$entry' needs '<path regex> ::: <value regex>'" >&2; exit 2 ;; esac
+  # (Only in the files the entry names: a value that is an example in a test is not one in a config or a log.)
+  PATH_RE="${entry%% ::: *}" VALUE_RE="${entry#* ::: }" awk 'BEGIN { FS = OFS = "\t"; p = ENVIRON["PATH_RE"]; v = ENVIRON["VALUE_RE"] }
+    $1 ~ p { gsub(v, "", $2) } { print }' "$tmp/masked.tsv" > "$tmp/masked.next" && mv "$tmp/masked.next" "$tmp/masked.tsv"
 done < <(grep -v -E '^\s*(#|$)' .live-data-allow 2>/dev/null || true)
 
 # A report of what matched: where, never the text (unless --show).
@@ -121,6 +124,11 @@ while IFS= read -r entry; do
   [ -z "$entry" ] && continue
   n=$((n + 1)); terms=$n
   if [ "${entry#re:}" != "$entry" ]; then re="${entry#re:}"; opt=(-E -i); else re="$entry"; opt=(-F -i); fi
+  # (A regular expression that doesn't parse would make every search fail quietly: say so and stop.)
+  grep "${opt[@]}" -q -e "$re" /dev/null 2>/dev/null; if [ $? -ge 2 ]; then
+    echo "check-live-data: denylist entry #$n is not a valid pattern; not running with fewer checks than asked for." >&2
+    exit 2
+  fi
   # (names of tracked files, added lines, commit messages)
   if git ls-files | grep "${opt[@]}" -q -e "$re"; then problem "denylist entry #$n appears in the name of a tracked file"; fi
   if cut -f2- "$tmp/added.tsv" | grep "${opt[@]}" -q -e "$re"; then

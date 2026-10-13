@@ -800,7 +800,8 @@ impl Conventional {
     /// dropped, and its code returned). Several P25 rows file under the
     /// row's talkgroup.
     fn route_digital(rows: &[ConvChannel], slot: usize, h: &mut Heard) -> Option<String> {
-        if h.audio.is_empty() && h.infos.is_empty() {
+        // (What a transmission says of its key, with no voice or link control in the same run, is news too.)
+        if h.audio.is_empty() && h.infos.is_empty() && h.crypto.is_none() {
             return None;
         }
         let best = rows
@@ -847,7 +848,10 @@ impl Conventional {
     /// Start, relabel, split or feed the call on one slot with what it heard.
     #[allow(clippy::too_many_arguments)]
     fn slot_call(ch: &mut Chan, slot: usize, h: Heard, now_s: f64, num: u32, ids: &CallIds, rules: &CallRules, max_call_s: f64, out: &mut Vec<ConvOut>) {
-        if h.audio.is_empty() && h.infos.is_empty() {
+        // A run with only what the call says of its key (its link control said "encrypted" in an earlier
+        // one, and this one's sync names a key we don't hold) is for the call already live; it starts none.
+        let key_only_for_a_live_call = h.audio.is_empty() && h.infos.is_empty() && h.crypto.is_some() && ch.open.as_ref().is_some_and(|o| o.live[slot].is_some());
+        if h.audio.is_empty() && h.infos.is_empty() && !key_only_for_a_live_call {
             return;
         }
         let o = ch.open.as_mut().unwrap();

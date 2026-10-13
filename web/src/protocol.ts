@@ -1206,8 +1206,8 @@ export type FromRecorder =
   | { type: "radios"; radios: Radios }
   /** The decryption keys' state changed. Never the keys: see docs/configuration/encryption.md. */
   | ({ type: "keys" } & KeysStatus)
-  /** Answers keysQuery: the keys held by algorithm, key id and name (never the keys), to a connection from the recorder's own computer only; `restricted` otherwise. */
-  | { type: "keysList"; version: number; keys: HeldKey[]; restricted?: boolean }
+  /** Answers keysQuery: the keys held by algorithm, key id and name (never the keys), to a connection from the recorder's own computer only; `restricted` otherwise. `canUnlock`: whether this connection may unlock, lock and reload the keys (the recorder decides from where the connection is from and the config). */
+  | { type: "keysList"; version: number; keys: HeldKey[]; restricted?: boolean; canUnlock?: boolean }
   /** Answers keysUnlock / keysLock / keysReload, with the `id` the command carried. */
   | { type: "keysResult"; id?: number; ok: boolean; message: string | null }
   | ({ type: "state" } & PhaseState)

@@ -8,9 +8,6 @@ import { useState } from "react";
 import { askKeys, lockKeys, reloadKeys, unlockKeys, updateConfig, useApp } from "./controller.ts";
 import { cipherName } from "./dash/Calls.tsx";
 
-/** Whether this page was opened on the computer the recorder runs on (the only place keys can be unlocked). */
-const onThisComputer = () => ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) || location.hostname.endsWith(".localhost");
-
 const STATE_TEXT = {
   off: "No key container set.",
   locked: "Locked: enter the container's password.",
@@ -19,7 +16,7 @@ const STATE_TEXT = {
 } as const;
 
 export function KeysPanel() {
-  const { config: c, keys, heldKeys, heldKeysRestricted } = useApp();
+  const { config: c, keys, heldKeys, heldKeysRestricted, canUnlockKeys } = useApp();
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
@@ -27,7 +24,8 @@ export function KeysPanel() {
   const k = c.keys ?? { ekcFile: "", passwordFile: "" };
   const edit = (patch: Partial<typeof k>) => updateConfig((x) => void (x.keys = { ...(x.keys ?? { ekcFile: "", passwordFile: "" }), ...patch }));
   const state = keys?.state ?? "off";
-  const local = onThisComputer() || !!k.allowLanUnlock;
+  // (Only what the recorder says of this connection: the password isn't offered for sending where it would be refused.)
+  const local = canUnlockKeys;
   const canType = state === "locked" || state === "unlocked";
 
   const act = async (f: () => Promise<{ ok: boolean; message: string | null }>, done: string) => {

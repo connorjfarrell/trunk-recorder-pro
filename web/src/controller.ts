@@ -95,6 +95,8 @@ export interface AppState {
   heldKeys: HeldKey[];
   /** The keys held aren't listed to this browser (it is on another computer). */
   heldKeysRestricted: boolean;
+  /** The recorder says this connection may unlock, lock and reload the keys. */
+  canUnlockKeys: boolean;
   /** The plugins (desktop app); null until the recorder says. */
   plugins: PluginsList | null;
   /** The plugin registry's list; null until asked for. */
@@ -180,6 +182,7 @@ let state: AppState = {
   keys: null,
   heldKeys: [],
   heldKeysRestricted: false,
+  canUnlockKeys: false,
   plugins: null,
   pluginStore: null,
   pluginInstalls: {},
@@ -298,7 +301,7 @@ function take(m: FromRecorder): void {
       if (m.host) feedSeries(m.host.t, m.host.values);
       if (m.pluginRuntime) pendingRuntime = m.pluginRuntime;
       // (A new connection may be to a restarted recorder whose key list version is the same number: ask again.)
-      set({ keys: null, heldKeys: [], heldKeysRestricted: false });
+      set({ keys: null, heldKeys: [], heldKeysRestricted: false, canUnlockKeys: false });
       if (m.keys) take(m.keys);
       if (state.listen) transport.send({ type: "listen", on: true, system: state.listenSystem, talkgroup: state.listenTalkgroup });
       // (A new connection: it watches nothing until told.)
@@ -374,7 +377,7 @@ function take(m: FromRecorder): void {
       break;
     }
     case "keysList":
-      set({ heldKeys: m.keys, heldKeysRestricted: !!m.restricted });
+      set({ heldKeys: m.keys, heldKeysRestricted: !!m.restricted, canUnlockKeys: !!m.canUnlock });
       break;
     case "keysResult": {
       const done = m.id === undefined ? undefined : keysWaiting.get(m.id);
