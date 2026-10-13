@@ -1385,6 +1385,60 @@
                 "$ref": "#/definitions/PluginRuntime"
               },
               "description": "Every plugin's runtime, by id (desktop app)."
+            },
+            "keys": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "locked",
+                    "unlocked",
+                    "error"
+                  ],
+                  "description": "off: no container set. locked: one is, and needs its password. unlocked: keys held. error: the files named didn't open (`message`)."
+                },
+                "source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "file",
+                    "password",
+                    null
+                  ],
+                  "description": "Where the held keys came from: the files the config names, or a password typed in."
+                },
+                "message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "count": {
+                  "type": "number"
+                },
+                "version": {
+                  "type": "number",
+                  "description": "Counts every change of what is held, to know when to ask keysQuery again."
+                },
+                "type": {
+                  "type": "string",
+                  "const": "keys"
+                }
+              },
+              "required": [
+                "count",
+                "message",
+                "source",
+                "state",
+                "type",
+                "version"
+              ],
+              "description": "The decryption keys' state (desktop app)."
             }
           },
           "required": [
@@ -1413,6 +1467,110 @@
           "required": [
             "type",
             "radios"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "off",
+                "locked",
+                "unlocked",
+                "error"
+              ],
+              "description": "off: no container set. locked: one is, and needs its password. unlocked: keys held. error: the files named didn't open (`message`)."
+            },
+            "source": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "file",
+                "password",
+                null
+              ],
+              "description": "Where the held keys came from: the files the config names, or a password typed in."
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "count": {
+              "type": "number"
+            },
+            "version": {
+              "type": "number",
+              "description": "Counts every change of what is held, to know when to ask keysQuery again."
+            },
+            "type": {
+              "type": "string",
+              "const": "keys"
+            }
+          },
+          "required": [
+            "count",
+            "message",
+            "source",
+            "state",
+            "type",
+            "version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysList"
+            },
+            "version": {
+              "type": "number"
+            },
+            "keys": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/HeldKey"
+              }
+            },
+            "restricted": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "version",
+            "keys"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysResult"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "ok",
+            "message"
           ],
           "additionalProperties": false
         },
@@ -2769,6 +2927,38 @@
       ],
       "additionalProperties": false,
       "description": "A code a conventional frequency carried (crates/trunk-app/src/heard.rs), in a row's Tone form (\"\" = none)."
+    },
+    "HeldKey": {
+      "type": "object",
+      "properties": {
+        "algId": {
+          "type": "number",
+          "description": "The P25 algorithm id (0x81 DES-OFB, 0x84 AES-256, 0xAA ADP)."
+        },
+        "keyId": {
+          "type": "number"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sln": {
+          "type": "number",
+          "description": "Its storage location number in KFDtool."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Its keyset is the one in use."
+        }
+      },
+      "required": [
+        "algId",
+        "keyId",
+        "name",
+        "sln",
+        "active"
+      ],
+      "additionalProperties": false,
+      "description": "A key held: which, not what."
     },
     "Identity": {
       "type": "object",
@@ -6171,6 +6361,62 @@
             "type",
             "source",
             "centerHz"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysQuery"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysUnlock"
+            },
+            "password": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "password"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysLock"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysReload"
+            }
+          },
+          "required": [
+            "type"
           ],
           "additionalProperties": false
         },

@@ -66,7 +66,12 @@ export class WorkerTransport implements Transport {
       msg.type === "addPlugin" ||
       msg.type === "removePlugin" ||
       msg.type === "pluginStore" ||
-      msg.type === "installPlugin"
+      msg.type === "installPlugin" ||
+      // (Decryption keys are the desktop app's.)
+      msg.type === "keysQuery" ||
+      msg.type === "keysUnlock" ||
+      msg.type === "keysLock" ||
+      msg.type === "keysReload"
     )
       return;
     if (msg.type === "start" || msg.type === "surveyStart" || msg.type === "profileSource") this.post({ type: "files", files: this.files });

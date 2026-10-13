@@ -60,8 +60,22 @@ export function PatchedWith({ tgs }: { tgs: TalkgroupName[] }) {
   );
 }
 
+/** A P25 algorithm id by name. */
+export function cipherName(algId: number): string {
+  switch (algId) {
+    case 0x81:
+      return "DES-OFB";
+    case 0x84:
+      return "AES-256";
+    case 0xaa:
+      return "ADP";
+    default:
+      return `0x${algId.toString(16)}`;
+  }
+}
+
 export function reasonText(c: CallView): string {
-  if (c.state === "recording") return c.encrypted ? "recording (encrypted)" : "recording";
+  if (c.state === "recording") return c.decrypted ? "recording (decrypted)" : c.encrypted ? "recording (encrypted)" : "recording";
   switch (c.reason) {
     case "encrypted":
       return "encrypted — not recorded";
@@ -198,7 +212,8 @@ export function ActiveCalls({ s }: { s: AppState }) {
                   <td className="unit-cell">{c.sources.length ? <Unit id={c.sources.at(-1)!} alias={aliasOf(s, c.systemName, c.sources.at(-1)!)} /> : "—"}</td>
                   <td className="mono">{clock(Math.max(0, now - c.startS))}</td>
                   <td>
-                    <span className={`dot dot-${c.state}${c.encrypted ? " dot-enc" : ""}`} /> {reasonText(c)}
+                    <span className={`dot dot-${c.state}${c.decrypted ? " dot-dec" : c.encrypted ? " dot-enc" : ""}`} /> {reasonText(c)}
+                    {c.decrypted && c.algId != null && <span className="muted" title="The cipher and key id the call named"> · {cipherName(c.algId)} key {c.keyId}</span>}
                   </td>
                   <td>
                     {c.state === "recording" && (

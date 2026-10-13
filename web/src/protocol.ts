@@ -322,6 +322,30 @@ export interface KeysSettings {
   passwordFile: string;
 }
 
+/** The decryption keys: whether any are held and how they came, for any browser. */
+export interface KeysStatus {
+  /** off: no container set. locked: one is, and needs its password. unlocked: keys held. error: the files named didn't open (`message`). */
+  state: "off" | "locked" | "unlocked" | "error";
+  /** Where the held keys came from: the files the config names, or a password typed in. */
+  source: "file" | "password" | null;
+  message: string | null;
+  count: number;
+  /** Counts every change of what is held, to know when to ask keysQuery again. */
+  version: number;
+}
+
+/** A key held: which, not what. */
+export interface HeldKey {
+  /** The P25 algorithm id (0x81 DES-OFB, 0x84 AES-256, 0xAA ADP). */
+  algId: number;
+  keyId: number;
+  name: string;
+  /** Its storage location number in KFDtool. */
+  sln: number;
+  /** Its keyset is the one in use. */
+  active: boolean;
+}
+
 export interface MonitorSettings {
   /** Where to check the internet answers (host:port, a TCP connect every 15 s). Empty: no checks. */
   probeHosts: string[];
@@ -1172,8 +1196,16 @@ export type FromRecorder =
       host?: { type: "host"; t: number; values: Record<string, number>; platform: PlatformInfo } | null;
       /** Every plugin's runtime, by id (desktop app). */
       pluginRuntime?: Record<string, PluginRuntime>;
+      /** The decryption keys' state (desktop app). */
+      keys?: { type: "keys" } & KeysStatus;
     }
   | { type: "radios"; radios: Radios }
+  /** The decryption keys' state changed. Never the keys: see docs/configuration/encryption.md. */
+  | ({ type: "keys" } & KeysStatus)
+  /** Answers keysQuery: the keys held by algorithm, key id and name (never the keys), to a connection from the recorder's own computer only; `restricted` otherwise. */
+  | { type: "keysList"; version: number; keys: HeldKey[]; restricted?: boolean }
+  /** Answers keysUnlock / keysLock / keysReload. */
+  | { type: "keysResult"; ok: boolean; message: string | null }
   | ({ type: "state" } & PhaseState)
   | { type: "config"; config: Config }
   | { type: "status"; status: EngineStatus; sources: SourceStatus[]; load: number; calls: CallView[] }
@@ -1239,6 +1271,14 @@ export type ToRecorder =
   | { type: "surveyStop" }
   /** Look at source `source`'s band (tuned to `centerHz`; a capture keeps its own) for its roll-off; answered with sourceProfile. Not while recording. */
   | { type: "profileSource"; source: number; centerHz: number }
+  /** The keys held, as a keysList (answered in full only to the recorder's own computer). */
+  | { type: "keysQuery" }
+  /** Open the config's key container with its password. Only from the recorder's own computer (not over a network or a proxy); the password is neither stored nor sent back. */
+  | { type: "keysUnlock"; password: string }
+  /** Forget the keys held (a password file's come back when recording starts or on keysReload). Own computer only. */
+  | { type: "keysLock" }
+  /** Read the files the config names again. Own computer only. */
+  | { type: "keysReload" }
   | { type: "plugins" }
   /** A plugin executable on the recorder's computer (a build of the user's own); it's added to the config. */
   | { type: "addPlugin"; path: string }

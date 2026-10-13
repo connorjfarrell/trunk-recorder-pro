@@ -26,8 +26,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as UrlPath, Request, State};
-use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::extract::{ConnectInfo, Path as UrlPath, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -103,7 +103,7 @@ pub async fn serve(ctx: Arc<Ctx>, listener: std::net::TcpListener) -> std::io::R
         // Let the sessions deliver it before the connections close.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };
-    axum::serve(listener, app).with_graceful_shutdown(shutdown).await
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown).await
 }
 
 /// SIGHUP: reopen the log file (logrotate moved it).
@@ -475,8 +475,17 @@ async fn call_file(State(ctx): State<Arc<Ctx>>, UrlPath(path): UrlPath<String>, 
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn ws(State(ctx): State<Arc<Ctx>>, up: WebSocketUpgrade) -> Response {
-    up.on_upgrade(move |socket| session(ctx, socket))
+async fn ws(State(ctx): State<Arc<Ctx>>, ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap, up: WebSocketUpgrade) -> Response {
+    let local = is_local(&peer, &headers);
+    up.on_upgrade(move |socket| session(ctx, socket, local))
+}
+
+/// Whether a connection is from the computer the recorder runs on, itself: on the loopback
+/// address, and not through a reverse proxy (which says so in a header, and whose visitors
+/// are not at this computer). Unlocking the decryption keys is only for such a connection.
+fn is_local(peer: &std::net::SocketAddr, headers: &HeaderMap) -> bool {
+    const PROXIED: [&str; 5] = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip"];
+    peer.ip().to_canonical().is_loopback() && !PROXIED.iter().any(|h| headers.contains_key(*h))
 }
 
 /// End a running survey (frees its radio) and tell the browsers.
@@ -611,6 +620,7 @@ pub(crate) fn hello_json(ctx: &Ctx, devices: Value, radios: Value) -> Value {
         "events": ctx.shared.recent_events(),
         "host": ctx.host_last.lock().unwrap().clone(),
         "pluginRuntime": ctx.plugins.runtime_json(),
+        "keys": ctx.keys.status_json(&config.keys),
     })
 }
 
@@ -684,7 +694,7 @@ pub(crate) fn radio_query(ctx: &Ctx, v: &Value) -> Value {
     out
 }
 
-async fn session(ctx: Arc<Ctx>, mut socket: WebSocket) {
+async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, local: bool) {
     let mut rx = ctx.hub.subscribe();
     let found = tokio::task::spawn_blocking(|| (json!(sdr::devices()), crate::radio::radios_json(false))).await;
     let (devices, radios) = found.unwrap_or((Value::Null, Value::Null));
@@ -724,7 +734,7 @@ async fn session(ctx: Arc<Ctx>, mut socket: WebSocket) {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
-                    if let Some(reply) = command(&ctx, &v, &mut listen, &mut subs).await {
+                    if let Some(reply) = command(&ctx, &v, &mut listen, &mut subs, local).await {
                         if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
                             return;
                         }
@@ -735,6 +745,37 @@ async fn session(ctx: Arc<Ctx>, mut socket: WebSocket) {
             },
         }
     }
+}
+
+/// Unlock, lock or re-read the decryption keys, and tell the running session and the browsers.
+fn keys_command(ctx: &Arc<Ctx>, kind: &str, password: &str) -> Result<(), String> {
+    let settings = ctx.config.lock().unwrap().keys.clone();
+    let dir = ctx.config_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    let notes = match kind {
+        "keysUnlock" => ctx.keys.unlock(&settings, &dir, password)?,
+        "keysLock" => {
+            ctx.keys.lock();
+            Vec::new()
+        }
+        _ => ctx.keys.refresh(&settings, &dir),
+    };
+    keys_changed(ctx, &settings);
+    for (problem, text) in notes {
+        if problem {
+            log::warn!("{text}");
+        } else {
+            log::info!("{text}");
+        }
+    }
+    Ok(())
+}
+
+/// What is held changed: the running session uses it from the next call, and browsers are told.
+pub(crate) fn keys_changed(ctx: &Ctx, settings: &trunk_app::config::KeysSettings) {
+    if ctx.runner.lock().unwrap().is_some() {
+        ctx.engine_cmds.lock().unwrap().push(crate::runtime::EngineCmd::Keys(ctx.keys.store()));
+    }
+    publish(&ctx.hub, ctx.keys.status_json(settings));
 }
 
 /// Change the config on the recorder's side (a plugin added or removed):
@@ -785,7 +826,7 @@ impl Listen {
     }
 }
 
-async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &mut Subs) -> Option<Value> {
+async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &mut Subs, local: bool) -> Option<Value> {
     match v["type"].as_str()? {
         // What this connection watches: costly messages (waterfalls, the
         // control channel log, detail views) only go to those that ask.
@@ -823,6 +864,20 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                             cmds.push(crate::runtime::EngineCmd::Talkgroups { short_name: s.short_name.clone(), csv: s.talkgroups_csv.clone() });
                         }
                     }
+                }
+                if old.keys != c.keys {
+                    let (ctx2, keys) = (ctx.clone(), c.keys.clone());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for (problem, text) in ctx2.keys.refresh(&keys, ctx2.config_path.parent().unwrap_or(std::path::Path::new("."))) {
+                            if problem {
+                                log::warn!("{text}");
+                            } else {
+                                log::info!("{text}");
+                            }
+                        }
+                        keys_changed(&ctx2, &keys);
+                    })
+                    .await;
                 }
                 if old.log != c.log {
                     crate::logging::configure(&c.log, ctx.config_path.parent().unwrap_or(std::path::Path::new(".")));
@@ -898,6 +953,21 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
         "findRadios" => {
             let radios = tokio::task::spawn_blocking(|| crate::radio::radios_json(true)).await.unwrap_or(Value::Null);
             Some(json!({ "type": "radios", "radios": radios }))
+        }
+        // The decryption keys (docs/configuration/encryption.md). Which keys are held, and
+        // unlocking and locking them, are for the computer the recorder runs on only.
+        "keysQuery" => Some(if local { ctx.keys.list_json() } else { json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }) }),
+        "keysUnlock" | "keysLock" | "keysReload" => {
+            let kind = v["type"].as_str().unwrap_or("");
+            if !local {
+                return Some(json!({ "type": "keysResult", "ok": false, "message": "Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, or use a password file)." }));
+            }
+            // (Held apart from the message, and wiped when done.)
+            let password = zeroize::Zeroizing::new(v["password"].as_str().unwrap_or("").to_string());
+            let ctx2 = ctx.clone();
+            let kind = kind.to_string();
+            let result = tokio::task::spawn_blocking(move || keys_command(&ctx2, &kind, &password)).await.unwrap_or_else(|_| Err("internal error".into()));
+            Some(json!({ "type": "keysResult", "ok": result.is_ok(), "message": result.err() }))
         }
         "quit" => {
             let ctx2 = ctx.clone();
@@ -1050,6 +1120,27 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    /// Unlocking keys is for a connection from this computer itself: not a LAN address,
+    /// not a proxy's (which names its visitors in a header).
+    #[test]
+    fn only_a_direct_loopback_connection_is_local() {
+        use std::net::SocketAddr;
+        let peer = |a: &str| a.parse::<SocketAddr>().unwrap();
+        let none = HeaderMap::new();
+        assert!(is_local(&peer("127.0.0.1:5000"), &none));
+        assert!(is_local(&peer("[::1]:5000"), &none));
+        assert!(is_local(&peer("[::ffff:127.0.0.1]:5000"), &none), "a loopback address as IPv6 writes it");
+        assert!(!is_local(&peer("192.168.1.20:5000"), &none));
+        assert!(!is_local(&peer("172.17.0.1:5000"), &none), "a container's gateway");
+        assert!(!is_local(&peer("[2001:db8::1]:5000"), &none));
+        for h in ["x-forwarded-for", "X-Real-IP", "forwarded", "x-forwarded-host"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::HeaderName::from_bytes(h.as_bytes()).unwrap(), HeaderValue::from_static("203.0.113.9"));
+            assert!(!is_local(&peer("127.0.0.1:5000"), &headers), "{h}");
+        }
+    }
+
     use super::{admit, folder_file, interface_path, percent_decode, Listen};
     use serde_json::json;
     use axum::http::{header, StatusCode, Uri};

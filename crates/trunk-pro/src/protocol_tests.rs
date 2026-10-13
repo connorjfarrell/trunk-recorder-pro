@@ -265,6 +265,7 @@ fn ctx(cfg: Config, dir: &Path) -> Arc<crate::runtime::Ctx> {
         engine_cmds: Mutex::new(Vec::new()),
         host_last: Mutex::new(None),
         spool: Mutex::new(None),
+        keys: Default::default(),
     })
 }
 
@@ -480,6 +481,22 @@ fn every_message_type_is_declared() {
     assert!(ignored.is_empty(), "in protocol.ts's ToRecorder but not handled: {ignored:?}");
 }
 
+/// The keys' messages are as protocol.ts says, and carry nothing but state.
+#[test]
+fn the_keys_messages() {
+    let k = crate::keystate::KeyState::default();
+    let s = trunk_app::config::KeysSettings { ekc_file: "k.ekc".into(), ..Default::default() };
+    let msgs = vec![
+        k.status_json(&Default::default()),
+        k.status_json(&s),
+        k.list_json(),
+        json!({ "type": "keysList", "version": 0, "keys": [], "restricted": true }),
+        json!({ "type": "keysResult", "ok": false, "message": "Wait a moment before trying again." }),
+        json!({ "type": "keysResult", "ok": true, "message": null }),
+    ];
+    check_all("FromRecorder", &msgs);
+}
+
 /// What the interface sends is what the server reads (the shapes, as the docs give them).
 #[test]
 fn messages_to_the_recorder() {
@@ -489,6 +506,10 @@ fn messages_to_the_recorder() {
         json!({ "type": "stop" }),
         json!({ "type": "listen", "on": true, "system": null, "talkgroup": 101 }),
         json!({ "type": "listDir", "path": "" }),
+        json!({ "type": "keysQuery" }),
+        json!({ "type": "keysUnlock", "password": "p" }),
+        json!({ "type": "keysLock" }),
+        json!({ "type": "keysReload" }),
         json!({ "type": "surveyStart", "source": 0, "bands": ["800"], "findGain": true }),
         json!({ "type": "profileSource", "source": 0, "centerHz": 460_000_000 }),
         json!({ "type": "installPlugin", "id": "openmhz" }),

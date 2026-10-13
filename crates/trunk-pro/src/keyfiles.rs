@@ -13,7 +13,7 @@ use trunk_core::crypto::{ekc, p25, KeyStore};
 const MAX_PASSWORD_FILE: u64 = 4096;
 
 /// Where `file` is: as given when absolute, else beside the config file.
-fn resolve(file: &str, config_dir: &Path) -> PathBuf {
+pub(crate) fn resolve(file: &str, config_dir: &Path) -> PathBuf {
     let p = Path::new(file.trim());
     if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) }
 }
@@ -93,18 +93,25 @@ pub fn load(s: &KeysSettings, config_dir: &Path) -> Loaded {
         return off("keys.passwordFile (the file with the key container's password) is not set".into());
     }
     let (ekc_path, pw_path) = (resolve(&s.ekc_file, config_dir), resolve(&s.password_file, config_dir));
-    let file = match std::fs::read(&ekc_path) {
-        Ok(f) => f,
-        Err(e) => return off(format!("{}: {e}", ekc_path.display())),
-    };
     let password = match read_password(&pw_path) {
         Ok(p) => p,
         Err(e) => return off(e),
     };
-    let container = match ekc::parse(&file, &password) {
-        Ok(c) => c,
-        Err(e) => return off(format!("{}: {e}", ekc_path.display())),
+    #[allow(unused_mut)]
+    let mut loaded = match open_ekc(&ekc_path, &password) {
+        Ok(l) => l,
+        Err(e) => off(e),
     };
+    #[cfg(not(unix))]
+    loaded.notes.push((false, "The password file's permissions are not checked on this system: keep it readable by you alone".to_string()));
+    loaded
+}
+
+/// Open the container at `ekc_path` with `password`: its usable keys, and lines for the log.
+/// Err says what is wrong with the file or the password (never a key).
+pub fn open_ekc(ekc_path: &Path, password: &str) -> Result<Loaded, String> {
+    let file = std::fs::read(ekc_path).map_err(|e| format!("{}: {e}", ekc_path.display()))?;
+    let container = ekc::parse(&file, password).map_err(|e| format!("{}: {e}", ekc_path.display()))?;
     let mut notes = Vec::new();
     let mut keys = container.keys;
     notes.extend(vet(&mut keys));
@@ -112,9 +119,7 @@ pub fn load(s: &KeysSettings, config_dir: &Path) -> Loaded {
         notes.push((false, format!("Key {:?} not loaded: {}", sk.name, sk.reason)));
     }
     notes.push((false, format!("Decryption keys: {} loaded from {}", keys.len(), ekc_path.display())));
-    #[cfg(not(unix))]
-    notes.push((false, "The password file's permissions are not checked on this system: keep it readable by you alone".to_string()));
-    Loaded { keys: (!keys.is_empty()).then(|| Arc::new(keys)), notes }
+    Ok(Loaded { keys: (!keys.is_empty()).then(|| Arc::new(keys)), notes })
 }
 
 /// Take out the keys that can never decrypt (an algorithm that isn't supported, a

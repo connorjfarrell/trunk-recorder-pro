@@ -86,6 +86,7 @@
 
 mod dmrtool;
 mod keyfiles;
+mod keystate;
 mod logging;
 mod monitor;
 mod nxdntool;
@@ -752,7 +753,16 @@ fn serve(a: &Args) {
         engine_cmds: Mutex::new(Vec::new()),
         host_last: Mutex::new(None),
         spool: Mutex::new(None),
+        keys: Default::default(),
     });
+    // The decryption keys the config names (a container alone waits for its password in Setup).
+    for (problem, text) in ctx.keys.refresh(&ctx.config.lock().unwrap().keys, config_path.parent().unwrap_or(Path::new("."))) {
+        if problem {
+            log::warn!("{text}");
+        } else {
+            log::info!("{text}");
+        }
+    }
     monitor::start(ctx.clone());
     // What each call kept once its plugins are done, for the history list.
     let weak = Arc::downgrade(&ctx);

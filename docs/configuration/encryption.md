@@ -43,10 +43,28 @@ Then add a `keys` section to the config:
 | Key | Required | Description |
 |---|:---:|---|
 | `ekcFile` | to decrypt | The container: absolute, or relative to the config file's folder |
-| `passwordFile` | to decrypt | A file with the container's password on its first line (its line ending is not part of it): absolute, or relative to the config file's folder |
+| `passwordFile` | optional | A file with the container's password on its first line (its line ending is not part of it): absolute, or relative to the config file's folder. Leave it out to type the password into Setup instead (below) |
 
 With no `keys` section, or an empty `ekcFile`, **nothing is decrypted** and nothing else changes.
-Both files are read when recording starts, so changes apply the next time you start it.
+With a `passwordFile` the keys load without anyone present, when the app starts and again when
+recording starts, which is what an unattended recorder needs (and Docker or Kubernetes secrets).
+
+### Typing the password instead
+
+Set only `ekcFile` (in Setup: **Recording → Decryption keys**) and the keys stay **locked** until you
+type the container's password there and press **Unlock**. Nothing about the password is written
+anywhere: it is held in memory (as the keys are) until you press **Lock** or the app quits, so
+stopping and starting recording keeps it. After a restart you unlock again.
+
+- **Only from the computer the recorder runs on.** The unlock is accepted from a browser on that
+  computer, at `http://localhost:<port>`, and refused from any other address or through a reverse
+  proxy: with `--bind 0.0.0.0` and no login, anyone on your network could otherwise try passwords.
+  Over SSH, forward the port (`ssh -L 8080:localhost:8080 host`) and open `localhost`. Docker maps
+  its connections from a gateway address, so a container uses a password file.
+- Tries are a second apart, and a wrong password changes nothing.
+- Any browser is told whether keys are held and how many; only a browser on the recorder's own
+  computer is told which (cipher, key id and name, never the keys).
+- Keys unlocked while recording is on are used for calls that start afterwards.
 
 - **The password file must be readable by you alone** on Linux and macOS: no access for group or
   others (`600` is usual). A file others can read is refused, and the log tells you to `chmod 600`
@@ -70,7 +88,8 @@ holds (algorithm, key id, name), to check it.
 
 ## What you get
 
-- A decrypted call is recorded like any other. Its call JSON has `"encrypted": 1` (it was encrypted on
+- A decrypted call is recorded like any other, and played like one: the dashboard marks it
+  **recording (decrypted)** with its cipher and key id. Its call JSON has `"encrypted": 1` (it was encrypted on
   the air), `"decrypted": 1`, and the `alg_id` and `key_id` it named. A call stays `decrypted` once
   any of it was, with the key that decrypted it, even if a later talker uses a key you don't hold. The interface's live calls carry
   `decrypted`, `algId` and `keyId`.

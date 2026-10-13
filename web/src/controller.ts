@@ -21,6 +21,8 @@ import type {
   DirListing,
   EngineStatus,
   FromRecorder,
+  HeldKey,
+  KeysStatus,
   LogLine,
   Phase,
   PluginInstall,
@@ -87,6 +89,12 @@ export interface AppState {
   profiling: number | null;
   /** Bumped when the config is replaced from outside the form (fields re-read it). */
   configEpoch: number;
+  /** The decryption keys' state (desktop app); null until the recorder says. */
+  keys: KeysStatus | null;
+  /** The keys held, by algorithm, key id and name, as of `keys.version`; only the recorder's own computer is told. */
+  heldKeys: HeldKey[];
+  /** The keys held aren't listed to this browser (it is on another computer). */
+  heldKeysRestricted: boolean;
   /** The plugins (desktop app); null until the recorder says. */
   plugins: PluginsList | null;
   /** The plugin registry's list; null until asked for. */
@@ -169,6 +177,9 @@ let state: AppState = {
   profile: null,
   profiling: null,
   configEpoch: 0,
+  keys: null,
+  heldKeys: [],
+  heldKeysRestricted: false,
   plugins: null,
   pluginStore: null,
   pluginInstalls: {},
@@ -286,6 +297,7 @@ function take(m: FromRecorder): void {
       });
       if (m.host) feedSeries(m.host.t, m.host.values);
       if (m.pluginRuntime) pendingRuntime = m.pluginRuntime;
+      if (m.keys) take(m.keys);
       if (state.listen) transport.send({ type: "listen", on: true, system: state.listenSystem, talkgroup: state.listenTalkgroup });
       // (A new connection: it watches nothing until told.)
       sendTopics(true);
@@ -352,6 +364,22 @@ function take(m: FromRecorder): void {
     case "notice":
       set({ notice: m.message });
       break;
+    case "keys": {
+      const { type: _, ...keys } = m;
+      // What is held changed (or it is the first we hear): the list is asked for again.
+      if (state.keys?.version !== keys.version && keys.state !== "off") transport.send({ type: "keysQuery" });
+      set({ keys, ...(keys.count === 0 ? { heldKeys: [] } : {}) });
+      break;
+    }
+    case "keysList":
+      set({ heldKeys: m.keys, heldKeysRestricted: !!m.restricted });
+      break;
+    case "keysResult": {
+      const done = keysWaiting.shift();
+      if (done) done(m);
+      else if (!m.ok && m.message) set({ error: m.message });
+      break;
+    }
     case "plugins": {
       const { type: _, ...list } = m;
       // The runtimes hello carried (the list only names plugins), merged in once.
@@ -462,6 +490,30 @@ export function useTopic(topic: string | null): void {
     };
   }, [topic]);
 }
+
+// ── decryption keys ──────────────────────────────────────────────────────────
+
+const keysWaiting: ((r: { ok: boolean; message: string | null }) => void)[] = [];
+
+function keysCommand(msg: ToRecorder): Promise<{ ok: boolean; message: string | null }> {
+  return new Promise((resolve) => {
+    keysWaiting.push(resolve);
+    transport.send(msg);
+    setTimeout(() => {
+      const k = keysWaiting.indexOf(resolve);
+      if (k >= 0) {
+        keysWaiting.splice(k, 1);
+        resolve({ ok: false, message: "No answer from the recorder." });
+      }
+    }, 20_000);
+  });
+}
+
+/** Open the config's key container with its password (only from the recorder's own computer). The password is not kept here. */
+export const unlockKeys = (password: string) => keysCommand({ type: "keysUnlock", password });
+export const lockKeys = () => keysCommand({ type: "keysLock" });
+export const reloadKeys = () => keysCommand({ type: "keysReload" });
+export const askKeys = () => transport.send({ type: "keysQuery" });
 
 // ── queries ──────────────────────────────────────────────────────────────────
 

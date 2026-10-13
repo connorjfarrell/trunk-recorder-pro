@@ -89,12 +89,16 @@ pub struct Ctx {
     pub host_last: Mutex<Option<Value>>,
     /// The RAM spool (`recording.ramSpool`), as last opened.
     pub spool: Mutex<Option<Arc<crate::spool::Spool>>>,
+    /// The decryption keys held ([`crate::keystate`]).
+    pub keys: crate::keystate::KeyState,
 }
 
 /// Something for the running session to do.
 pub enum EngineCmd {
     /// A system's talkgroup file changed (an Ignore flag set from the dashboard).
     Talkgroups { short_name: String, csv: String },
+    /// The decryption keys changed (unlocked or locked): new calls use them.
+    Keys(Option<Arc<trunk_core::crypto::KeyStore>>),
 }
 
 impl Ctx {
@@ -181,16 +185,16 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
     let epoch_at = Instant::now();
     let mut session = Session::new(cfg.clone(), epoch_ms, &|name| fs::read_to_string(bandplan_path(name)).ok(), local_offset)?;
     session.attach(ctx.shared.clone());
-    // Decryption keys, when the config names them: from files, read now.
-    let keys = crate::keyfiles::load(&cfg.keys, ctx.config_path.parent().unwrap_or(std::path::Path::new(".")));
-    for (problem, text) in &keys.notes {
-        if *problem {
+    // Decryption keys: from the files the config names (read now), or those unlocked with a password.
+    for (problem, text) in ctx.keys.refresh(&cfg.keys, ctx.config_path.parent().unwrap_or(std::path::Path::new("."))) {
+        if problem {
             log::warn!("{text}");
         } else {
             log::info!("{text}");
         }
     }
-    session.set_keys(keys.keys);
+    session.set_keys(ctx.keys.store());
+    publish(&ctx.hub, ctx.keys.status_json(&cfg.keys));
     session.load_units(&|name| fs::read_to_string(units_path(name)).ok());
     session.load_heard(&fs::read_to_string(heard_path(&cfg)).unwrap_or_default());
     ctx.plugins.start(&cfg);
@@ -477,6 +481,7 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, rx: mpsc::Rec
         }
         for c in std::mem::take(&mut *ctx.engine_cmds.lock().unwrap()) {
             match c {
+                EngineCmd::Keys(keys) => session.set_keys(keys),
                 EngineCmd::Talkgroups { short_name, csv } => {
                     if session.set_talkgroups(&short_name, &csv) {
                         log::info!("[{short_name}] Talkgroups updated");
