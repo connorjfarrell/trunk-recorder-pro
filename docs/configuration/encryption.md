@@ -69,7 +69,8 @@ stopping and starting recording keeps it. After a restart you unlock again.
   is only on a network you trust, `keys.allowLanUnlock` (above) lets a private address unlock it too.
 - Tries are a second apart, and a wrong password changes nothing.
 - Any browser is told whether keys are held and how many; only a browser on the recorder's own
-  computer is told which (cipher, key id and name, never the keys).
+  computer is told which (cipher, key id and name, never the keys); a private address that
+  `keys.allowLanUnlock` lets unlock isn't told which either.
 - Unlocking while recording is on reaches calls already in progress: one is decrypted from its next
   encryption sync (up to a couple of seconds on). **Lock** takes the keys away at once, from every
   call in progress, whose voice then isn't decoded.
