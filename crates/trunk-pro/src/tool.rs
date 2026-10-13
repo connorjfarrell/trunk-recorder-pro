@@ -22,6 +22,10 @@
 //! `--s16` writes raw 16-bit samples at the vocoder's own scale instead of a
 //! WAV.
 //!
+//! `tool ekc <keys.ekc> [--password-file path]` — read a KFDtool encrypted key
+//! container and list what it holds (algorithm, key id, name; never the key).
+//! The password comes from the file, else `TRUNK_EKC_PASSWORD`, never an argument.
+//!
 //! `tool sdr <call.sdr> [--frames]` — an `.sdr` frame capture's call as
 //! MimoSDR projects it (its sidecar JSON), or its frames as `.frames.jsonl`
 //! lines (what the vocoder shootout's decoders read).
@@ -43,7 +47,7 @@ use trunk_core::p25::voice::{decode_hdu, decode_ldu1_lc, decode_ldu2_es, decode_
 use crate::{die, Args};
 
 pub fn run(a: &Args) {
-    let mode = a.positional.first().map(String::as_str).unwrap_or_else(|| die("tool cc|voice|frames|p2|smartnet|dmr|dmrscan|nxdn|nxdnscan|nxdnsynth|snr|revoice|sdr … (trunk-pro --help)"));
+    let mode = a.positional.first().map(String::as_str).unwrap_or_else(|| die("tool cc|voice|frames|p2|smartnet|dmr|dmrscan|nxdn|nxdnscan|nxdnsynth|snr|revoice|ekc|sdr … (trunk-pro --help)"));
     if mode == "p2" {
         return run_p2(a);
     }
@@ -67,6 +71,9 @@ pub fn run(a: &Args) {
     }
     if mode == "sdr" {
         return run_sdr(a);
+    }
+    if mode == "ekc" {
+        return run_ekc(a);
     }
     if mode == "revoice" {
         return run_revoice(a);
@@ -338,6 +345,24 @@ fn run_sdr(a: &Args) {
     }
     let bytes = std::fs::read(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
     println!("{}", trunk_core::trunk::sdr::sdr_sidecar_json(&bytes).unwrap_or_else(|| die(&format!("{path}: no call header"))));
+}
+
+/// `tool ekc`: what a key container holds.
+fn run_ekc(a: &Args) {
+    let path = a.positional.get(1).unwrap_or_else(|| die("tool ekc <keys.ekc> [--password-file path]"));
+    let file = std::fs::read(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let password = match a.get("password-file") {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}"))).trim_end_matches(['\r', '\n']).to_string(),
+        None => std::env::var("TRUNK_EKC_PASSWORD").unwrap_or_else(|_| die("tool ekc: the password: --password-file <path>, or TRUNK_EKC_PASSWORD")),
+    };
+    let c = trunk_core::crypto::ekc::parse(&file, &password).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    for k in c.keys.list() {
+        println!("algid {:#04x}  kid {:5}  sln {:5}  {}{}", k.algid, k.kid, k.sln, k.name, if k.active { "" } else { "  (inactive keyset)" });
+    }
+    for s in &c.skipped {
+        println!("skipped {:?}: {}", s.name, s.reason);
+    }
+    eprintln!("{} keys{}", c.keys.len(), if c.skipped.is_empty() { String::new() } else { format!(", {} skipped", c.skipped.len()) });
 }
 
 /// `tool revoice`: a frame capture back through the vocoder.

@@ -11,6 +11,7 @@
 pub mod alias;
 pub mod ambe;
 pub mod bits;
+pub mod crypto;
 pub mod dmr;
 pub mod dsp;
 pub mod loudness;
