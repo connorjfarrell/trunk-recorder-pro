@@ -54,11 +54,25 @@ const PROTOCOL: &str = include_str!("../../../web/src/protocol.ts");
 /// What `GET /api/version` answers — how a second launch recognises us.
 pub const APP_ID: &str = "trunk-pro";
 
+/// Whether the interface listens beyond this computer (set by [`serve`]).
+static EXPOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Say so, when decryption keys are held and the interface (which has no login) is reachable
+/// from other computers: its Listen page and the recordings folder then give decrypted calls
+/// to anyone who can reach it.
+pub(crate) fn warn_if_exposed(ctx: &Ctx) {
+    if EXPOSED.load(std::sync::atomic::Ordering::Relaxed) && ctx.keys.store().is_some() {
+        log::warn!("Decryption keys are loaded and the interface is reachable from other computers (it has no login): anyone who can reach it can listen to decrypted calls and download them. Bind it to 127.0.0.1, or keep it on a network you trust.");
+    }
+}
+
 /// Serve until `quit` from a browser, Ctrl-C or SIGTERM. Recording is stopped
 /// first either way, so calls in progress are written out.
 pub async fn serve(ctx: Arc<Ctx>, listener: std::net::TcpListener) -> std::io::Result<()> {
     listener.set_nonblocking(true)?;
     let loopback = listener.local_addr()?.ip().is_loopback();
+    EXPOSED.store(!loopback, std::sync::atomic::Ordering::Relaxed);
+    warn_if_exposed(&ctx);
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let app = Router::new()
         .route("/api/ws", get(ws))
@@ -799,6 +813,7 @@ pub(crate) fn keys_changed(ctx: &Ctx, settings: &trunk_app::config::KeysSettings
         ctx.engine_cmds.lock().unwrap().push(crate::runtime::EngineCmd::Keys(ctx.keys.store()));
     }
     publish(&ctx.hub, ctx.keys.status_json(settings));
+    warn_if_exposed(ctx);
 }
 
 /// Change the config on the recorder's side (a plugin added or removed):

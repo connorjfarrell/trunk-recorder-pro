@@ -568,7 +568,8 @@ fn finish_calls(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, rx: 
 /// from memory.
 fn finish_one(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, f: Finish, encoder: Option<&(plugins::Encoder, u32)>, host: Option<&PluginHost>) {
     let r = f.rules;
-    let takers = host.map_or(0, |h| h.call_takers());
+    let decrypted = f.entry["record"]["decrypted"].as_i64().is_some_and(|n| n != 0) || f.entry["record"]["decrypted"].as_bool() == Some(true);
+    let takers = host.map_or(0, |h| h.call_takers(decrypted));
     // (A call no plugin takes is kept whole.)
     let (keep_audio, keep_json) = (r.audio_archive || takers == 0, r.call_log || takers == 0);
     let keep_m4a = keep_audio && r.compress_wav;
@@ -632,9 +633,9 @@ fn deliver(ctx: &Ctx, out: &mut Vec<Output>, plugins: Option<&PluginHost>, rules
             Output::Text(t) => {
                 let _ = ctx.hub.send(Arc::new(Out::Text(t)));
             }
-            Output::Audio { short_name, tg, frame, .. } => {
+            Output::Audio { short_name, tg, frame, decrypted, .. } => {
                 if let Some(p) = plugins {
-                    p.audio_frame(&frame);
+                    p.audio_frame(&frame, decrypted);
                 }
                 let _ = ctx.hub.send(Arc::new(Out::Audio { short_name, tg, frame }));
             }

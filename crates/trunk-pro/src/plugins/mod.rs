@@ -27,6 +27,7 @@
 mod archive;
 pub mod cli;
 mod encode;
+pub mod guard;
 mod host;
 pub mod manage;
 pub mod store;

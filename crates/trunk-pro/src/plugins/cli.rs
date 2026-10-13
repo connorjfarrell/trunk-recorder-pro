@@ -283,12 +283,14 @@ fn run_calls(a: &Args) {
         None => std::env::temp_dir().join(format!("trunk-pro-plugin-run-{id}")),
     };
     eprintln!("Data folder: {}", data_dir.display());
-    let mut spec = Spec { id, copy: 0, exe, config, systems, data_dir: Some(data_dir) };
+    let mut spec = Spec { id, copy: 0, exe, config, systems, data_dir: Some(data_dir), decrypted: super::guard::Verdict::Local };
     if let Some(s) = a.get("settings") {
         let v: Value = std::fs::read_to_string(s).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| die(&format!("{s}: not JSON")));
         spec.config = v.get("config").cloned().unwrap_or(Value::Null);
         spec.systems = v.get("systems").and_then(|s| serde_json::from_value(s.clone()).ok()).unwrap_or_default();
     }
+    // (Calls decrypted with our keys go only where the config allows, here as when recording.)
+    spec.decrypted = super::guard::judge(&spec.id, &spec.config, &spec.systems, &cfg.keys.share_decrypted);
     let capture_dir = PathBuf::from(a.get("capture-dir").map(String::from).unwrap_or(cfg.recording.capture_dir.clone()));
     let limit: usize = a.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     let mut calls: Vec<PathBuf> = Vec::new();
