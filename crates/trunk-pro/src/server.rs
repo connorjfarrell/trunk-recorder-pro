@@ -476,16 +476,30 @@ async fn call_file(State(ctx): State<Arc<Ctx>>, UrlPath(path): UrlPath<String>, 
 }
 
 async fn ws(State(ctx): State<Arc<Ctx>>, ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap, up: WebSocketUpgrade) -> Response {
-    let local = is_local(&peer, &headers);
+    let allow_lan = ctx.config.lock().unwrap().keys.allow_lan_unlock;
+    let local = is_local(&peer, &headers, allow_lan);
     up.on_upgrade(move |socket| session(ctx, socket, local))
 }
 
-/// Whether a connection is from the computer the recorder runs on, itself: on the loopback
-/// address, and not through a reverse proxy (which says so in a header, and whose visitors
-/// are not at this computer). Unlocking the decryption keys is only for such a connection.
-fn is_local(peer: &std::net::SocketAddr, headers: &HeaderMap) -> bool {
+/// Whether a connection may unlock the decryption keys: it is from the computer the recorder
+/// runs on itself (the loopback address), not through a reverse proxy (which says so in a
+/// header, and whose visitors are not at this computer); or, when the config's
+/// `keys.allowLanUnlock` is on, from a private-network address (not through a proxy either).
+fn is_local(peer: &std::net::SocketAddr, headers: &HeaderMap, allow_lan: bool) -> bool {
     const PROXIED: [&str; 5] = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip"];
-    peer.ip().to_canonical().is_loopback() && !PROXIED.iter().any(|h| headers.contains_key(*h))
+    if PROXIED.iter().any(|h| headers.contains_key(*h)) {
+        return false;
+    }
+    let ip = peer.ip().to_canonical();
+    ip.is_loopback() || (allow_lan && is_private(&ip))
+}
+
+/// A private-network address: RFC 1918, link-local, or an IPv6 unique-local one.
+fn is_private(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => a.is_private() || a.is_link_local(),
+        std::net::IpAddr::V6(a) => a.is_unique_local() || a.is_unicast_link_local(),
+    }
 }
 
 /// End a running survey (frees its radio) and tell the browsers.
@@ -969,7 +983,7 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
         "keysUnlock" | "keysLock" | "keysReload" => {
             let kind = v["type"].as_str().unwrap_or("");
             if !local {
-                return Some(keys_result(v, Err("Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, or use a password file).".into())));
+                return Some(keys_result(v, Err("Keys can only be unlocked from the computer the recorder runs on (open the interface at http://localhost, use a password file, or set keys.allowLanUnlock).".into())));
             }
             // (Held apart from the message, and wiped when done.)
             let password = zeroize::Zeroizing::new(v["password"].as_str().unwrap_or("").to_string());
@@ -1137,17 +1151,34 @@ mod tests {
         use std::net::SocketAddr;
         let peer = |a: &str| a.parse::<SocketAddr>().unwrap();
         let none = HeaderMap::new();
-        assert!(is_local(&peer("127.0.0.1:5000"), &none));
-        assert!(is_local(&peer("[::1]:5000"), &none));
-        assert!(is_local(&peer("[::ffff:127.0.0.1]:5000"), &none), "a loopback address as IPv6 writes it");
-        assert!(!is_local(&peer("192.168.1.20:5000"), &none));
-        assert!(!is_local(&peer("172.17.0.1:5000"), &none), "a container's gateway");
-        assert!(!is_local(&peer("[2001:db8::1]:5000"), &none));
+        assert!(is_local(&peer("127.0.0.1:5000"), &none, false));
+        assert!(is_local(&peer("[::1]:5000"), &none, false));
+        assert!(is_local(&peer("[::ffff:127.0.0.1]:5000"), &none, false), "a loopback address as IPv6 writes it");
+        assert!(!is_local(&peer("192.168.1.20:5000"), &none, false));
+        assert!(!is_local(&peer("172.17.0.1:5000"), &none, false), "a container's gateway");
+        assert!(!is_local(&peer("[2001:db8::1]:5000"), &none, false));
         for h in ["x-forwarded-for", "X-Real-IP", "forwarded", "x-forwarded-host"] {
             let mut headers = HeaderMap::new();
             headers.insert(axum::http::HeaderName::from_bytes(h.as_bytes()).unwrap(), HeaderValue::from_static("203.0.113.9"));
-            assert!(!is_local(&peer("127.0.0.1:5000"), &headers), "{h}");
+            assert!(!is_local(&peer("127.0.0.1:5000"), &headers, true), "{h}");
         }
+    }
+
+    #[test]
+    fn a_private_address_may_unlock_only_when_the_config_allows_it() {
+        use std::net::SocketAddr;
+        let peer = |a: &str| a.parse::<SocketAddr>().unwrap();
+        let none = HeaderMap::new();
+        for a in ["192.168.1.20:5000", "10.1.2.3:5000", "172.29.0.7:5000", "169.254.1.1:5000", "[fd00::5]:5000", "[fe80::1]:5000"] {
+            assert!(is_local(&peer(a), &none, true), "{a}");
+            assert!(!is_local(&peer(a), &none, false), "{a}");
+        }
+        for a in ["8.8.8.8:5000", "203.0.113.9:5000", "[2001:db8::1]:5000", "172.32.0.1:5000"] {
+            assert!(!is_local(&peer(a), &none, true), "{a}: a public address never");
+        }
+        let mut proxied = HeaderMap::new();
+        proxied.insert(axum::http::HeaderName::from_static("x-forwarded-for"), HeaderValue::from_static("192.168.1.9"));
+        assert!(!is_local(&peer("192.168.1.20:5000"), &proxied, true), "not through a proxy");
     }
 
     use super::{admit, folder_file, interface_path, percent_decode, Listen};

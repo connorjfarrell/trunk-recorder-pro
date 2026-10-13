@@ -43,6 +43,7 @@ Then add a `keys` section to the config:
 | Key | Required | Description |
 |---|:---:|---|
 | `ekcFile` | to decrypt | The container: absolute, or relative to the config file's folder |
+| `allowLanUnlock` | optional | `true` lets a browser on a private-network address (not only this computer) unlock the container in Setup. Off by default, and set in the config file only: the interface is plain HTTP with no login, so the password crosses the network unencrypted and anyone on that network can try to unlock. Never through a reverse proxy, and never from a public address |
 | `passwordFile` | optional | A file with the container's password on its first line (its line ending is not part of it): absolute, or relative to the config file's folder. Leave it out to type the password into Setup instead (below) |
 
 With no `keys` section, or an empty `ekcFile`, **nothing is decrypted** and nothing else changes.
@@ -60,7 +61,8 @@ stopping and starting recording keeps it. After a restart you unlock again.
   computer, at `http://localhost:<port>`, and refused from any other address or through a reverse
   proxy: with `--bind 0.0.0.0` and no login, anyone on your network could otherwise try passwords.
   Over SSH, forward the port (`ssh -L 8080:localhost:8080 host`) and open `localhost`. Docker maps
-  its connections from a gateway address, so a container uses a password file.
+  its connections from a gateway address, so a container uses a password file. If the interface
+  is only on a network you trust, `keys.allowLanUnlock` (above) lets a private address unlock it too.
 - Tries are a second apart, and a wrong password changes nothing.
 - Any browser is told whether keys are held and how many; only a browser on the recorder's own
   computer is told which (cipher, key id and name, never the keys).
