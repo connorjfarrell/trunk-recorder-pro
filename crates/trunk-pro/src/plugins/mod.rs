@@ -237,6 +237,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Changing or removing what allows a plugin decrypted calls restarts the plugins.
+    #[test]
+    fn a_change_to_share_decrypted_reloads_the_plugins() {
+        let a: Config = serde_json::from_value(json!({ "plugins": { "openmhz": { "enabled": true } } })).unwrap();
+        assert!(!changed(&a, &a.clone()));
+        let mut b = a.clone();
+        b.keys.share_decrypted.insert("openmhz".into(), super::guard::PHRASE.into());
+        assert!(changed(&a, &b), "authorized");
+        assert!(changed(&b, &a), "revoked");
+    }
+
     #[test]
     fn what_plugins_get_from_the_config() {
         let c: Config = serde_json::from_value(json!({

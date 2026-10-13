@@ -84,17 +84,19 @@ impl KeyState {
         if s.ekc_file.trim().is_empty() {
             return Err("No key container is set (keys.ekcFile).".into());
         }
+        let started;
         {
             let mut g = self.0.lock().unwrap();
             if g.last_try.is_some_and(|t| t.elapsed() < TRY_EVERY) {
                 return Err("Wait a moment before trying again.".into());
             }
             g.last_try = Some(Instant::now());
+            // (Taken in the same hold of the mutex: any change from here on is newer than this unlock.)
+            started = g.generation;
         }
         if password.is_empty() {
             return Err("Enter the container's password.".into());
         }
-        let started = self.0.lock().unwrap().generation;
         let loaded = keyfiles::open_ekc(&keyfiles::resolve(&s.ekc_file, config_dir), password)?;
         self.commit_unlock(started, s, loaded)
     }

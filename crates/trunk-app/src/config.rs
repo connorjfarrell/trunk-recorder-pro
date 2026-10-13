@@ -1000,7 +1000,7 @@ pub struct Config {
     pub log: LogSettings,
     /// The dashboard's watch on the computer (desktop app).
     pub monitor: MonitorSettings,
-    /// Decryption keys for P25 Phase 1 calls. Not there (or empty): no decryption.
+    /// Decryption keys for P25 Phase 1 and Phase 2 calls. Not there (or empty): no decryption.
     #[serde(skip_serializing_if = "KeysSettings::is_unset")]
     pub keys: KeysSettings,
     /// Keys this version doesn't know (a newer version's, a hand edit's):

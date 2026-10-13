@@ -310,7 +310,7 @@ export interface Config {
   log?: LogSettings;
   /** What the dashboard watches on the computer (desktop app). */
   monitor?: MonitorSettings;
-  /** Decryption keys for P25 Phase 1 calls (desktop app). Absent or empty: none. */
+  /** Decryption keys for P25 Phase 1 and Phase 2 calls (desktop app). Absent or empty: none. */
   keys?: KeysSettings;
 }
 
