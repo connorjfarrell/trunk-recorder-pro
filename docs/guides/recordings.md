@@ -349,9 +349,12 @@ A call that isn't kept logs `Call not saved - no audio, or shorter than the mini
   usually sounds most natural. **Enhanced** is Trunk Recorder's floating-point synthesis. **mbelib**
   behaves exactly like mbelib. **blip25-mbe** and **blip25-vocoder** are openBLIP25's MIT-licensed
   Rust decoders ([blip25-mbe](https://github.com/openBLIP25/blip25-mbe),
-  [blip25-vocoder](https://github.com/openBLIP25/blip25-vocoder)): the spec's synthesis with no
-  post-filter and their own error concealment. They decode P25 Phase 1 only; Phase 2, DMR and NXDN
-  voice stay on the enhanced decoder.
+  [blip25-vocoder](https://github.com/openBLIP25/blip25-vocoder)), run with their post-filter off
+  and their own error concealment. Their wire framing and FEC follow the standard, but their
+  synthesis core is reverse-engineered from a reference vocoder, and both projects' patent notices
+  say that makes them patent-encumbered, IMBE included, and offered for research and
+  interoperability study. Read their `PATENT_NOTICE.md` before using or distributing a build with
+  them. They decode P25 Phase 1 only; Phase 2, DMR and NXDN voice stay on the enhanced decoder.
 - **Save vocoder frames** (`captureFrames`, off): also saves each digital call's raw vocoder frames
   as `<name>.sdr`, MimoSDR's call file ([sdr-stream](https://github.com/MimoCAD/sdr-stream)):
   the call's identity and the voice still coded, about a tenth the size of the WAV. MimoSDR's

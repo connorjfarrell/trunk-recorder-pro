@@ -1,7 +1,12 @@
 //! The two openBLIP25 IMBE decoders, for P25 Phase 1: `blip25-mbe` and
-//! `blip25-vocoder`. Both are MIT, pure Rust, and follow the spec's synthesis
-//! with no post-filter (their optional enhancement stays off), so they sound
-//! like the standard rather than like Trunk Recorder's tuned synthesis.
+//! `blip25-vocoder`. Both are MIT-licensed pure Rust, with their optional
+//! post-filter left off.
+//!
+//! Provenance matters: the wire framing and FEC are spec-derived, but each
+//! project's PATENT_NOTICE.md says its analysis/synthesis core (IMBE as much as
+//! AMBE+2) was reverse-engineered from a compiled reference vocoder, is
+//! patent-encumbered, and is for research and interoperability study. Anyone
+//! building or distributing with these profiles takes that on themselves.
 //!
 //! Neither gets the soft-decision repeat thresholds or the enhanced concealment
 //! of [`super::Profile::Enhanced`]: each does its own, from the same FEC counts.

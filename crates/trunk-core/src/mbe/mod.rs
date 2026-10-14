@@ -761,12 +761,13 @@ pub enum Profile {
     /// thresholds as `Enhanced`; AMBE as `Enhanced`. Listeners on WMATA found
     /// it the most natural-sounding (tools/vocoder-shootout).
     Fixed,
-    /// IMBE through the openBLIP25 `blip25-mbe` crate: the spec's synthesis with
-    /// no post-filter and its own concealment. AMBE as `Enhanced`.
+    /// IMBE through the openBLIP25 `blip25-mbe` crate (post-filter off, its own
+    /// concealment). Its synthesis core is reverse-engineered from a reference
+    /// vocoder, not the spec; see its PATENT_NOTICE. AMBE as `Enhanced`.
     Blip25Mbe,
-    /// IMBE through the openBLIP25 `blip25-vocoder` crate (same family, bit-exact
-    /// with the reference vocoder, takes the FEC error severity directly).
-    /// AMBE as `Enhanced`.
+    /// IMBE through the openBLIP25 `blip25-vocoder` crate (same family and same
+    /// provenance as `Blip25Mbe`; bit-exact with the reference vocoder, takes
+    /// the FEC error severity directly). AMBE as `Enhanced`.
     Blip25Vocoder,
 }
 
