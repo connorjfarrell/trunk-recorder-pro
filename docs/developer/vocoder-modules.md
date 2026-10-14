@@ -75,6 +75,11 @@ A module should answer within a few milliseconds. The recorder waits 500 ms; if 
 the module exits, closes stdout, or answers with a kind other than 0–4, it stops using the module for that stream and
 decodes the rest of it with a built-in vocoder.
 
+The request and reply happen on the thread that decodes the call, so a module that is slow but not
+failed holds that thread for as long as it takes (up to 500 ms a frame), and starting a module holds it
+up to 3 seconds, once per stream. A module that can't keep up in real time should say so by failing
+(exit) rather than answering late.
+
 ## Testing a module
 
 `trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> --profile module:<id>

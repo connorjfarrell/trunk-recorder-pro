@@ -61,7 +61,9 @@ works, so keep a module's per-frame time well under 20 ms, and a hardware one to
 [tools/vocoder-modules](https://github.com/connorjfarrell/trunk-recorder-pro/tree/main/tools/vocoder-modules)
 has the module SDK and two example modules, built from openBLIP25's
 [blip25-vocoder](https://github.com/openBLIP25/blip25-vocoder) (IMBE and AMBE+2) and
-[blip25-mbe](https://github.com/openBLIP25/blip25-mbe) (IMBE). You need a Rust toolchain:
+[blip25-mbe](https://github.com/openBLIP25/blip25-mbe) (IMBE). You need a Rust toolchain. These commands are for Linux; on macOS or Windows put the same two files in a
+`vocoders/blip25-vocoder/` folder beside your config file (on Windows the program is
+`blip25-vocoder.exe`):
 
 ```
 cd tools/vocoder-modules
