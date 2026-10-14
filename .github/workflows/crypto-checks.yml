@@ -6,6 +6,12 @@ name: crypto-checks
 
 on:
   workflow_dispatch:
+    inputs:
+      which:
+        description: "Which checks to run"
+        type: choice
+        options: [all, secrets, tests]
+        default: all
   pull_request:
     types: [labeled]
 
@@ -17,7 +23,7 @@ env:
 
 jobs:
   tests:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-ci'
+    if: (github.event_name == 'workflow_dispatch' && inputs.which != 'secrets') || github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +42,7 @@ jobs:
         working-directory: web
 
   secrets:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-ci'
+    if: (github.event_name == 'workflow_dispatch' && inputs.which != 'tests') || github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
