@@ -81,7 +81,9 @@ report() {
 # rule <name> <only paths ERE> <except paths ERE> <line ERE>
 rule() {
   local name="$1" only="$2" except="$3" re="$4"
-  awk -F'\t' -v only="$only" -v except="$except" '
+  # (The patterns go in through the environment: `awk -v` would read their backslashes as escapes.)
+  ONLY_RE="$only" EXCEPT_RE="$except" awk -F'\t' '
+    BEGIN { only = ENVIRON["ONLY_RE"]; except = ENVIRON["EXCEPT_RE"] }
     $1 ~ only && !(except != "" && $1 ~ except) { print $1 ": " substr($0, length($1) + 2) }' "$tmp/masked.tsv" | { grep -E -e "$re" || true; } > "$tmp/hits.txt"
   if [ -s "$tmp/hits.txt" ]; then
     problem "$name"
