@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, type ReactNode } from "react";
 import { startProblem } from "./config.ts";
-import { closeGuide, dismissError, openGuide, quitApp, setNotice, setView, start, stop, useApp, useSelect, web, type View } from "./controller.ts";
+import { closeGuide, dismissError, openGuide, quitApp, restart, setNotice, setView, start, stop, useApp, useSelect, web, type View } from "./controller.ts";
 import { guideWanted, SetupGuide } from "./Onboarding.tsx";
 import { InterfacesPage } from "./Interfaces.tsx";
 import { PluginsPage } from "./Plugins.tsx";
@@ -96,6 +96,7 @@ export function App() {
   const s = useSelect((x) => ({
     connected: x.connected,
     quit: x.quit,
+    restartNeeded: x.restartNeeded,
     phase: x.phase,
     config: x.config,
     version: x.version,
@@ -160,9 +161,14 @@ export function App() {
               {!s.connected ? "Disconnected" : s.phase === "running" ? (liveDongle ? "Recording" : "Replaying") : s.phase === "idle" ? "Stopped" : s.phase === "starting" ? "Starting…" : "Stopping…"}
             </span>
             {running ? (
-              <button className="btn primary" onClick={stop}>
-                Stop
-              </button>
+              <>
+                <button className="btn ghost" onClick={restart} title="Stop and start again, with the settings as they are now">
+                  Restart
+                </button>
+                <button className="btn primary" onClick={stop}>
+                  Stop
+                </button>
+              </>
             ) : (
               <button className="btn primary" disabled={!s.connected || s.phase === "stopping" || !!problem} title={problem ?? ""} onClick={start}>
                 Start
@@ -190,6 +196,14 @@ export function App() {
               <span>{s.notice}</span>
               <button className="btn ghost small" onClick={() => setNotice(null)}>
                 OK
+              </button>
+            </div>
+          )}
+          {running && s.restartNeeded && (
+            <div className="banner" role="status">
+              <span>Change requires restart — some settings you changed only apply when recording starts again.</span>
+              <button className="btn primary small" onClick={restart}>
+                Restart now
               </button>
             </div>
           )}

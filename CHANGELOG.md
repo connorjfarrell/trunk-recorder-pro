@@ -125,6 +125,12 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   2.5 + 6 MS/s worked. A source at 2 MS/s or
   below runs its radio at 6 MS/s; use separate USB controllers if a
   pair doesn't fit.
+- **Restart.** A Restart button beside Stop (while recording) stops and
+  starts again, so a run takes the settings changed since it began. When
+  you change a setting that only applies at start (radios, systems,
+  recording options like saving vocoder frames), a "Change requires
+  restart" banner offers Restart now. Settings the recorder takes live
+  (talkgroup files, plugins, the log) don't raise it.
 
 ## [0.1.11] — 2026-10-14
 
