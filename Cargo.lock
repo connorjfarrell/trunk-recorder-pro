@@ -159,33 +159,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "blip25-codebooks"
-version = "0.3.1"
-source = "git+https://github.com/openBLIP25/blip25-mbe.git?rev=fc693babfd5edb5c535f3bc295981fa9d2918cad#fc693babfd5edb5c535f3bc295981fa9d2918cad"
-
-[[package]]
-name = "blip25-codec"
-version = "0.3.1"
-source = "git+https://github.com/openBLIP25/blip25-mbe.git?rev=fc693babfd5edb5c535f3bc295981fa9d2918cad#fc693babfd5edb5c535f3bc295981fa9d2918cad"
-dependencies = [
- "blip25-codebooks",
-]
-
-[[package]]
-name = "blip25-mbe"
-version = "0.3.1"
-source = "git+https://github.com/openBLIP25/blip25-mbe.git?rev=fc693babfd5edb5c535f3bc295981fa9d2918cad#fc693babfd5edb5c535f3bc295981fa9d2918cad"
-dependencies = [
- "blip25-codec",
-]
-
-[[package]]
-name = "blip25-vocoder"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f9aee7245798876b2d5abe6e641acbc2fc9fee3facab0972b29894e973f2382"
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1908,8 +1881,6 @@ name = "trunk-core"
 version = "0.1.10"
 dependencies = [
  "aes",
- "blip25-mbe",
- "blip25-vocoder",
  "des",
  "num-complex",
  "regex-lite",

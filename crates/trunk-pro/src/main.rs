@@ -73,7 +73,7 @@
 //!     Phase 2 slots, a SmartNet control channel, one DMR / NXDN channel,
 //!     every DMR / NXDN carrier in a capture, a synthetic NXDN or P25 capture,
 //!     weak-signal curves (each tool's module documents its options).
-//! trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile fixed|enhanced|mbelib|blip25-mbe|blip25-vocoder]
+//! trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile fixed|enhanced|mbelib|module:<id>] [--modules-dir DIR]
 //!     Vocode a call's saved frames again.
 //! trunk-pro tool sdr <call.sdr> [--frames]
 //!     A saved .sdr call's metadata as MimoSDR reads it, or its frames as JSON lines.
@@ -108,6 +108,7 @@ mod statstore;
 mod protocol_tests;
 mod survey;
 mod tool;
+mod vocoder_modules;
 
 pub use trunk_app::config;
 
@@ -244,7 +245,7 @@ usage:
       --keys (or clear), for checking decryption (replay --p25 Hz --keys).
   trunk-pro tool snr <capture.cu8> --center Hz --rate Hz --freq Hz --kind dmr|p25|smartnet|p2 [--snr 40,20,…]
       Weak-signal curves: one channel decoded again with noise added.
-  trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile fixed|enhanced|mbelib|blip25-mbe|blip25-vocoder]
+  trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile fixed|enhanced|mbelib|module:<id>] [--modules-dir DIR]
       Vocode a call's saved frames (recording setting \"Save vocoder frames\") again.
   trunk-pro tool sdr <call.sdr> [--frames]
       A saved .sdr call's metadata as MimoSDR reads it, or (--frames) its frames as JSON lines.

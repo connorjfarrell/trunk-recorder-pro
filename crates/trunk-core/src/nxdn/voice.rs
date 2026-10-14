@@ -58,7 +58,7 @@ impl NxdnVoice {
             framer: Framer::new(),
             frames: Vec::new(),
             sf: SacchAssembler::default(),
-            dec: mbe::Decoder::new(mbe::lcg(seed), mbe::Profile::Enhanced),
+            dec: mbe::Decoder::new_ambe(mbe::lcg(seed)),
             talkgroup: None,
             source: None,
             group: true,

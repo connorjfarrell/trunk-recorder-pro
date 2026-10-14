@@ -5,13 +5,16 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
-- **Two more P25 voice decoders:** `recording.vocoder` (and **P25 voice
-  decoder** in Setup) accepts `blip25-mbe` and `blip25-vocoder`, openBLIP25's
-  MIT-licensed Rust IMBE decoders (post-filter off). Their synthesis core is
-  reverse-engineered from a reference vocoder and, per their patent notices,
-  patent-encumbered, IMBE included: research and interoperability study.
-  `trunk-pro tool revoice --profile` takes them too. Phase 1 only: Phase 2,
-  DMR and NXDN voice stay on the enhanced decoder.
+- **Vocoder modules:** use another vocoder, a library you are licensed for, or
+  a DVSI USB dongle, by installing a module in `vocoders/<id>/` and choosing
+  `module:<id>` as `recording.vocoder` (Setup → Recording → **External
+  module…**). A module is a program that turns vocoder frames into audio; the
+  app starts one per call, and a module that fails hands the rest of the call to
+  the built-in decoder. `tools/vocoder-modules` has the SDK and two examples a
+  user builds themselves, from openBLIP25's blip25-vocoder and blip25-mbe,
+  which are patent-encumbered and so aren't built into the app. `trunk-pro tool
+  revoice --profile module:<id>` tries one on a saved call. Desktop and server
+  only.
 
 - **Playback**, a new page beside Listen: search everything the recorder has
   saved, not just the last 24 hours, by system, talkgroup, radio ID, a name or

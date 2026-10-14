@@ -18,12 +18,3 @@ aes = { version = "0.9", features = ["zeroize"] }
 zeroize = "1"
 # MimoSDR's .sdr call container (frame capture). Zero dependencies; not on crates.io.
 sdr_stream = { package = "sdr-stream", git = "https://github.com/MimoCAD/sdr-stream.git", rev = "8c4d293bc5b27732252faea5112dd5a37a2ed0bd" }
-# Two more IMBE decoders for P25 Phase 1 (mbe::Profile::Blip25Mbe / Blip25Vocoder).
-# MIT, pure Rust. PATENT-ENCUMBERED: both projects' PATENT_NOTICE.md say the
-# analysis/synthesis core, IMBE included, is reverse-engineered from a reference
-# vocoder and offered for research and interoperability study only. blip25-mbe's 0.3 line isn't on
-# crates.io yet (the name is held by a 0.0.0 placeholder), so it comes from git.
-# We only decode: blip25-vocoder is built decode-only; blip25-mbe can't be (at this rev its
-# IMBE decoder calls into the encoder module, so `encode` stays on).
-blip25-vocoder = { version = "1.0", default-features = false, features = ["decode"] }
-blip25-mbe = { git = "https://github.com/openBLIP25/blip25-mbe.git", rev = "fc693babfd5edb5c535f3bc295981fa9d2918cad" }

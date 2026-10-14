@@ -111,7 +111,7 @@ impl Slot {
 
     fn new(rng: mbe::Rng) -> Self {
         Slot {
-            dec: mbe::Decoder::new(rng, mbe::Profile::Enhanced),
+            dec: mbe::Decoder::new_ambe(rng),
             active: false,
             encrypted: false,
             algid: ALGID_CLEAR,

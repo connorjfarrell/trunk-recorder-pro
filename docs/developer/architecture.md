@@ -310,8 +310,9 @@ frame:
   mbelib in double precision, with TIA-102.BABA-A concealment. 160 samples (20 ms) at 8 kHz per
   frame.
 - Profiles: `fixed` (Pavel Yazev's fixed-point IMBE, the app default for Phase 1), `enhanced`,
-  `mbelib`, `blip25-mbe` and `blip25-vocoder` (the openBLIP25 crates, `mbe/blip25.rs`; IMBE only,
-  concealment from their own rules). AMBE always uses `enhanced`.
+  `mbelib`. AMBE uses `enhanced`. `module:<id>` hands IMBE and/or AMBE+2 frames to an external
+  vocoder module (`mbe/external.rs`; the process host is `trunk-pro/src/vocoder_modules.rs`), and a
+  failed module falls back to `fixed` (IMBE) / `enhanced` (AMBE).
 - Scaling: ×7/32768, then a tanh soft limiter above −3 dBFS.
 - `record::save_call`: drops transmissions shorter than `minTransmissionS` and encrypted ones
   that weren't decrypted,
@@ -1025,7 +1026,7 @@ same frequency).
 | `archiveFilesOnFailure` | true | yes | |
 | `filenameFormat` | "" | yes | "" = `<short>/<Y>/<M>/<D>/<tg>-<epoch>_<freq>` |
 | `dropDuplicateCalls` | true | | multi-site dedupe |
-| `vocoder` | `fixed` | | `fixed`, `enhanced`, `mbelib`, `blip25-mbe`, `blip25-vocoder` (IMBE) |
+| `vocoder` | `fixed` | | `fixed`, `enhanced`, `mbelib` (IMBE), `module:<id>` (a vocoder module) |
 | `m4a` | `{encoder: auto, bitrateKbps: 32}` | | auto / ffmpeg / afconvert / fdkaac / none |
 | `ramSpool` | `{enabled: false, sizeMb: 256, dir}` | | see 8.6 |
 

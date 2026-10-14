@@ -24,7 +24,7 @@ struct Slot {
 
 impl Slot {
     fn new(seed: u32) -> Self {
-        Slot { dec: mbe::Decoder::new(mbe::lcg(seed), mbe::Profile::Enhanced), talkgroup: None, source: None, group: true, encrypted: false, emergency: false }
+        Slot { dec: mbe::Decoder::new_ambe(mbe::lcg(seed)), talkgroup: None, source: None, group: true, encrypted: false, emergency: false }
     }
 }
 
