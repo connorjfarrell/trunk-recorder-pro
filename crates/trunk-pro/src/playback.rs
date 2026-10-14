@@ -57,7 +57,8 @@ impl Query {
 
 /// A call's system: its record's short name, else the folder it is in.
 fn system_of(record: &Value, rel: &Path) -> String {
-    record["short_name"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| rel.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default())
+    let folder = || if rel.components().count() > 1 { rel.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()) } else { None };
+    record["short_name"].as_str().filter(|s| !s.is_empty()).map(String::from).or_else(folder).unwrap_or_default()
 }
 
 /// A call file's start (Unix s) as its name has it (`<talkgroup>-<start>_<freq>`),
@@ -73,38 +74,41 @@ fn mtime_s(m: &fs::Metadata) -> i64 {
 }
 
 /// The call JSONs under `dir` that may be in [from_s, to_s]: (start, path).
-/// A folder not touched since a day before `from_s` holds no later call.
-fn list_calls(dir: &Path, system: Option<&str>, from_s: i64, to_s: i64) -> Vec<(i64, PathBuf)> {
+/// Every folder is searched (a filename format can put calls anywhere), the
+/// recordings folder itself included. A folder with no subfolders is skipped
+/// when it hasn't changed since a day before `from_s`: adding a call changes
+/// it. (A folder that has subfolders can't be told that way: a call added
+/// deeper doesn't change it.)
+fn list_calls(dir: &Path, from_s: i64, to_s: i64) -> Vec<(i64, PathBuf)> {
     let mut out = Vec::new();
-    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
-    if let Ok(rd) = fs::read_dir(dir) {
-        let tops: Vec<PathBuf> = rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect();
-        // The system's own folder, when there is one (a custom layout may put its calls anywhere).
-        let own: Vec<&PathBuf> = tops.iter().filter(|p| system.is_some_and(|s| p.file_name().is_some_and(|n| n == s))).collect();
-        let chosen: Vec<PathBuf> = if own.is_empty() { tops.clone() } else { own.into_iter().cloned().collect() };
-        stack.extend(chosen.into_iter().map(|p| (p, 1)));
-    }
+    let mut stack: Vec<(PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
     while let Some((d, depth)) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
+        let (mut has_dirs, mut files) = (false, Vec::new());
         for e in rd.flatten() {
             let p = e.path();
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
-                let old = e.metadata().is_ok_and(|m| mtime_s(&m) < from_s - 86_400);
-                if depth < MAX_DEPTH && !old {
+                has_dirs = true;
+                if depth < MAX_DEPTH {
                     stack.push((p, depth + 1));
                 }
-            } else if p.extension().is_some_and(|x| x == "json") {
+            } else if ft.is_file() && p.extension().is_some_and(|x| x == "json") {
+                // (`is_file` is false for a link: one could lead out of the recordings folder.)
                 let s = match start_from_name(&p) {
                     Some(s) => s,
                     None => e.metadata().map_or(0, |m| mtime_s(&m)),
                 };
                 // (An hour of slack: the name is the start, a record's time may differ.)
                 if s >= from_s - 3600 && s <= to_s + 3600 {
-                    out.push((s, p));
+                    files.push((s, p));
                 }
             }
         }
+        if !has_dirs && fs::metadata(&d).is_ok_and(|m| mtime_s(&m) < from_s - 86_400) {
+            continue;
+        }
+        out.extend(files);
     }
     out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     out
@@ -131,29 +135,33 @@ struct UnitStat {
 
 /// The radios that spoke on a call, with an alias if the record has one.
 fn units_of(record: &Value) -> Vec<(u32, String)> {
-    record["srcList"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|s| {
-            let src = s["src"].as_u64().filter(|&u| u > 0)? as u32;
-            let tag = ["tag", "tag_ota"].iter().filter_map(|k| s[*k].as_str()).find(|t| !t.is_empty()).unwrap_or("");
-            Some((src, tag.to_string()))
-        })
-        .collect()
+    // (srcList is a timeline: a radio that spoke twice is in it twice, but is one radio on the call.)
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for s in record["srcList"].as_array().into_iter().flatten() {
+        let Some(src) = s["src"].as_u64().filter(|&u| u > 0).map(|u| u as u32) else { continue };
+        let tag = ["tag", "tag_ota"].iter().filter_map(|k| s[*k].as_str()).find(|t| !t.is_empty()).unwrap_or("");
+        match out.iter_mut().find(|(u, _)| *u == src) {
+            Some((_, alias)) if alias.is_empty() => *alias = tag.to_string(),
+            Some(_) => {}
+            None => out.push((src, tag.to_string())),
+        }
+    }
+    out
 }
 
 /// The `playbackResult` for `req` over the recordings in `dir`. `known(system,
 /// talkgroup)`: whether the system's talkgroup file lists it.
 pub fn query(dir: &Path, known: &dyn Fn(&str, u32) -> bool, req: &Value, now_ms: i64) -> Value {
     let q = Query::from_json(req, now_ms);
-    let found = list_calls(dir, q.system.as_deref(), q.from_ms.div_euclid(1000), q.to_ms.div_euclid(1000));
+    let found = list_calls(dir, q.from_ms.div_euclid(1000), q.to_ms.div_euclid(1000));
     let first_page = q.before_ms.is_none();
     let mut tgs: HashMap<(String, u32), TgStat> = HashMap::new();
     let mut units: HashMap<(String, u32), UnitStat> = HashMap::new();
     let mut systems: std::collections::BTreeSet<String> = Default::default();
-    let mut page: Vec<Value> = Vec::new();
-    let (mut total, mut more, mut read, mut matched_ms) = (0usize, false, 0usize, (i64::MAX, 0i64));
+    // The calls found: (their own start, ms; their file). Ordered, and paged, by that start, not by
+    // the file's name or time (a custom filename format has neither right).
+    let mut matches: Vec<(i64, PathBuf)> = Vec::new();
+    let mut read = 0usize;
     for (_, p) in &found {
         if read >= MAX_READ {
             break;
@@ -199,36 +207,40 @@ pub fn query(dir: &Path, known: &dyn Fn(&str, u32) -> bool, req: &Value, now_ms:
             t.first_ms = if t.first_ms == 0 { start } else { t.first_ms.min(start) };
         }
         if first_page && by_tg {
+            // (Every radio is counted, then the busiest are kept: one first heard in older calls may be among them.)
             for (r, alias) in &radios {
-                if units.len() < 4 * MAX_UNITS || units.contains_key(&(system.clone(), *r)) {
-                    let u = units.entry((system.clone(), *r)).or_default();
-                    if u.calls == 0 {
-                        u.last_ms = start;
-                    }
-                    if u.alias.is_empty() {
-                        u.alias = alias.clone();
-                    }
-                    u.calls += 1;
+                let u = units.entry((system.clone(), *r)).or_default();
+                u.last_ms = u.last_ms.max(start);
+                if u.alias.is_empty() {
+                    u.alias = alias.clone();
                 }
+                u.calls += 1;
             }
         }
         if !(by_tg && by_unit) {
             continue;
         }
-        total += 1;
-        matched_ms = (matched_ms.0.min(start), matched_ms.1.max(start));
-        if q.before_ms.is_some_and(|b| start >= b) {
-            continue;
-        }
-        if page.len() < q.limit {
-            let audio = ["wav", "m4a"].iter().any(|x| p.with_extension(x).exists());
-            page.push(json!({ "path": rel.with_extension("").to_string_lossy().replace('\\', "/"), "record": record, "audio": audio, "json": true }));
-        } else {
-            more = true;
-        }
+        matches.push((start, p.clone()));
     }
-    // (Files are read newest first by their names, records sorted by their own start: they agree but for a second.)
-    page.sort_by_key(|e| std::cmp::Reverse(e["record"]["start_time_ms"].as_i64().unwrap_or(0)));
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let total = matches.len();
+    let after: Vec<&(i64, PathBuf)> = matches.iter().filter(|m| q.before_ms.is_none_or(|b| m.0 < b)).collect();
+    // A page ends between starts, never inside calls of one millisecond: the next page is those
+    // before the oldest here, so the ones left off would never be shown.
+    let mut end = after.len().min(q.limit);
+    while end < after.len() && end > 0 && after[end].0 == after[end - 1].0 {
+        end += 1;
+    }
+    let more = end < after.len();
+    let page: Vec<Value> = after[..end]
+        .iter()
+        .filter_map(|(_, p)| {
+            let record = fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())?;
+            let rel = p.strip_prefix(dir).ok()?;
+            let audio = ["wav", "m4a"].iter().any(|x| p.with_extension(x).exists());
+            Some(json!({ "path": rel.with_extension("").to_string_lossy().replace('\\', "/"), "record": record, "audio": audio, "json": true }))
+        })
+        .collect();
     let mut talkgroups: Vec<Value> = tgs
         .into_iter()
         .map(|((system, tg), t)| {
@@ -284,6 +296,8 @@ mod tests {
         write(&dir, "metro", &format!("101-{}_851", t0 + 60), 101, t0 + 60, &[8], "Dispatch");
         write(&dir, "metro", &format!("999-{}_852", t0 + 120), 999, t0 + 120, &[8, 9], "");
         write(&dir, "county", &format!("5-{}_853", t0 + 30), 5, t0 + 30, &[7], "Fire");
+        // A filename format with no folder: the call is in the recordings folder itself.
+        fs::write(dir.join(format!("7-{}_854.json", t0 + 90)), json!({ "short_name": "county", "talkgroup": 7, "start_time_ms": (t0 + 90) * 1000, "call_length_ms": 1000, "srcList": [] }).to_string()).unwrap();
         let known = |s: &str, t: u32| !(s == "metro" && t == 999);
         let ask = |v: Value| query(&dir, &known, &v, (t0 + 600) * 1000);
         let base = json!({ "id": 1, "from": (t0 - 100) * 1000 });
@@ -296,19 +310,22 @@ mod tests {
         };
 
         let all = ask(base.clone());
-        assert_eq!(all["total"], 4);
-        assert_eq!(all["entries"].as_array().unwrap().len(), 4);
+        assert_eq!(all["total"], 5);
+        assert_eq!(all["entries"].as_array().unwrap().len(), 5);
         // Newest first; the path is the call without its extension.
         assert_eq!(all["entries"][0]["record"]["talkgroup"], 999);
         assert!(all["entries"][0]["path"].as_str().unwrap().starts_with("metro/2026/10/14/999-"));
         assert_eq!(all["entries"][0]["audio"], true);
         assert_eq!(all["systems"], json!(["county", "metro"]));
-        assert_eq!(all["talkgroups"].as_array().unwrap().len(), 3);
+        assert_eq!(all["talkgroups"].as_array().unwrap().len(), 4);
+        assert_eq!(all["entries"][1]["path"], format!("7-{}_854", t0 + 90));
 
-        assert_eq!(ask(with(json!({ "system": "county" })))["total"], 1);
+        assert_eq!(ask(with(json!({ "system": "county" })))["total"], 2);
         assert_eq!(ask(with(json!({ "system": "metro", "talkgroup": 101 })))["total"], 2);
         assert_eq!(ask(with(json!({ "unit": 8 })))["total"], 2);
         assert_eq!(ask(with(json!({ "unit": 7 })))["total"], 2);
+        // The time span from the epoch: everything.
+        assert_eq!(ask(with(json!({ "from": 0 })))["total"], 5);
         assert_eq!(ask(with(json!({ "text": "fire" })))["total"], 1);
         assert_eq!(ask(with(json!({ "text": "unit 9" })))["total"], 1);
 
@@ -324,12 +341,94 @@ mod tests {
         assert_eq!(ask(with(json!({ "system": "metro", "talkgroup": 101 })))["talkgroups"].as_array().unwrap().len(), 2);
 
         // Time span, and pages.
-        assert_eq!(ask(with(json!({ "from": (t0 + 50) * 1000 })))["total"], 2);
+        assert_eq!(ask(with(json!({ "from": (t0 + 50) * 1000 })))["total"], 3);
         let p1 = ask(with(json!({ "limit": 3 })));
         assert_eq!((p1["entries"].as_array().unwrap().len(), p1["more"].clone()), (3, json!(true)));
         let oldest = p1["entries"][2]["record"]["start_time_ms"].as_i64().unwrap();
         let p2 = ask(with(json!({ "limit": 3, "before": oldest })));
-        assert_eq!((p2["entries"].as_array().unwrap().len(), p2["more"].clone(), p2["talkgroups"].clone()), (1, json!(false), Value::Null));
+        assert_eq!((p2["entries"].as_array().unwrap().len(), p2["more"].clone(), p2["talkgroups"].clone()), (2, json!(false), Value::Null));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trunk-pro-playback-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn call(dir: &Path, rel: &str, tg: u32, start_ms: i64, src: &[u32]) {
+        let path = dir.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let list: Vec<Value> = src.iter().map(|u| json!({ "src": u })).collect();
+        fs::write(path, json!({ "short_name": "metro", "talkgroup": tg, "start_time_ms": start_ms, "call_length_ms": 1000, "srcList": list }).to_string()).unwrap();
+    }
+
+    /// Folders that look old (a year folder's time doesn't change when a call is added to a day below it)
+    /// and folders of a layout of the user's own are searched all the same.
+    #[test]
+    fn every_folder_is_searched() {
+        let dir = fresh("folders");
+        let t0 = 1_791_000_000;
+        call(&dir, &format!("metro/2026/10/14/1-{t0}_1.json"), 1, t0 * 1000, &[]);
+        call(&dir, &format!("by-hand/9-{t0}_1.json"), 9, t0 * 1000, &[]);
+        let old = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for d in ["metro/2026", "metro/2026/10", "metro"] {
+            fs::File::open(dir.join(d)).unwrap().set_modified(old).unwrap();
+        }
+        let r = query(&dir, &|_, _| true, &json!({ "from": (t0 - 100) * 1000, "system": "metro" }), (t0 + 100) * 1000);
+        // (Both are metro's by their records; the second is in a folder that isn't named for it.)
+        assert_eq!(r["total"], 2, "{r}");
+    }
+
+    /// A page ends between seconds, and a radio that spoke twice is one radio on the call.
+    #[test]
+    fn pages_lose_no_call_and_radios_count_once() {
+        let dir = fresh("pages");
+        let t0 = 1_791_000_000;
+        // Three calls starting the same millisecond (two fit the page), one before.
+        for (i, ms) in [t0 * 1000 + 500; 3].into_iter().enumerate() {
+            call(&dir, &format!("metro/{i}-{t0}_1.json"), 1, ms, &[5, 6, 5]);
+        }
+        call(&dir, &format!("metro/9-{}_1.json", t0 - 60), 1, (t0 - 60) * 1000, &[5]);
+        let ask = |extra: Value| {
+            let mut v = json!({ "from": (t0 - 100) * 1000, "limit": 2 });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            query(&dir, &|_, _| true, &v, (t0 + 100) * 1000)
+        };
+        let p1 = ask(json!({}));
+        assert_eq!(p1["entries"].as_array().unwrap().len(), 3, "calls of one instant come whole");
+        assert_eq!(p1["more"], true);
+        let oldest = p1["entries"][2]["record"]["start_time_ms"].as_i64().unwrap();
+        let p2 = ask(json!({ "before": oldest }));
+        assert_eq!(p2["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(p2["more"], false);
+        // Pages follow the calls' own start, whatever their files are named: the newest comes first.
+        let dir2 = fresh("order");
+        call(&dir2, &format!("metro/1-{}_1.json", t0 + 100), 1, t0 * 1000, &[]);
+        call(&dir2, &format!("metro/2-{}_1.json", t0), 2, (t0 + 100) * 1000, &[]);
+        let r = query(&dir2, &|_, _| true, &json!({ "from": (t0 - 100) * 1000, "limit": 1 }), (t0 + 200) * 1000);
+        assert_eq!(r["entries"][0]["record"]["talkgroup"], 2, "{r}");
+        assert_eq!(r["more"], true);
+        // Radio 5 was on all four calls, 6 on three, however often they spoke.
+        let calls = |unit: u64| p1["units"].as_array().unwrap().iter().find(|u| u["unit"] == unit).unwrap()["calls"].clone();
+        assert_eq!((calls(5), calls(6)), (json!(4), json!(3)));
+    }
+
+    /// A link in the recordings folder isn't followed: it could lead anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn links_are_not_followed() {
+        let dir = fresh("links");
+        let outside = fresh("links-outside");
+        let t0 = 1_791_000_000;
+        call(&outside, "secret.json", 1, t0 * 1000, &[]);
+        call(&dir, &format!("metro/1-{t0}_1.json"), 1, t0 * 1000, &[]);
+        std::os::unix::fs::symlink(outside.join("secret.json"), dir.join(format!("metro/2-{t0}_1.json"))).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("metro/elsewhere")).unwrap();
+        let r = query(&dir, &|_, _| true, &json!({ "from": (t0 - 100) * 1000 }), (t0 + 100) * 1000);
+        assert_eq!(r["total"], 1, "{r}");
     }
 }

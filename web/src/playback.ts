@@ -97,6 +97,8 @@ export function usePlayback<T>(pick: (s: PlaybackState) => T): T {
 
 const PAGE = 100;
 let queryId = 0;
+/** When the search was made: its pages all look at the same span, however long it's open. */
+let searchedAt = 0;
 
 /** The request for `f`, from `before` (the next page) or the newest. */
 export function requestFor(f: Filters, now: number, id: number, before?: number) {
@@ -109,7 +111,8 @@ export function requestFor(f: Filters, now: number, id: number, before?: number)
     ...(f.unit !== null ? { unit: f.unit } : {}),
     ...(f.text.trim() ? { text: f.text.trim() } : {}),
     ...(f.newOnly ? { newOnly: true } : {}),
-    from: now - span.ms,
+    // ("Everything" is from the epoch: no bound on how old.)
+    from: f.span === "all" ? 0 : now - span.ms,
     to: now + 60_000,
     limit: PAGE,
     ...(before !== undefined ? { before } : {}),
@@ -131,7 +134,8 @@ export function clearFilters(): void {
 export function search(): void {
   const id = ++queryId;
   set({ loading: true });
-  transport.send(requestFor(state.filters, Date.now(), id));
+  searchedAt = Date.now();
+  transport.send(requestFor(state.filters, searchedAt, id));
 }
 
 /** The next page of the search, older calls. */
@@ -139,7 +143,7 @@ export function loadMore(): void {
   const oldest = state.calls.at(-1)?.record.start_time_ms;
   if (state.loading || oldest === undefined) return;
   set({ loading: true });
-  transport.send(requestFor(state.filters, Date.now(), ++queryId, oldest));
+  transport.send(requestFor(state.filters, searchedAt, ++queryId, oldest));
 }
 
 onRecorderMessage((m) => {
@@ -153,7 +157,8 @@ onRecorderMessage((m) => {
     truncated: first ? m.truncated : state.truncated || m.truncated,
     searched: true,
     loading: false,
-    systems: m.systems.length || first ? m.systems : state.systems,
+    // (Later pages carry no systems of their own: keep the first page's.)
+    systems: first || m.systems.length > 0 ? m.systems : state.systems,
     talkgroups: m.talkgroups ?? state.talkgroups,
     units: m.units ?? state.units,
   });
@@ -170,6 +175,8 @@ let token = 0;
 export async function play(c: CallEntry): Promise<void> {
   if (!audio) return;
   const mine = ++token;
+  // (The call playing stops now, not when the next one's file is found.)
+  audio.pause();
   // One sound at a time: not the scanner, not live audio.
   stopOthers?.();
   if (snapshot().listen) setListen(false);
@@ -203,10 +210,10 @@ function neighbour(c: CallEntry, step: 1 | -1): CallEntry | null {
   return null;
 }
 
-/** The current call is over: the next one if autoplay, else stop. */
-function next(): void {
+/** The current call is over: the next one if autoplay (or `manual`: it was skipped), else stop. */
+function next(manual = false): void {
   const was = state.playing;
-  const n = was && state.autoplay ? neighbour(was, 1) : null;
+  const n = was && (manual || state.autoplay) ? neighbour(was, 1) : null;
   if (n) void play(n);
   else {
     token++;
@@ -216,7 +223,7 @@ function next(): void {
 
 export const skipNext = () => {
   audio?.pause();
-  next();
+  next(true);
 };
 
 export function skipBack(): void {
@@ -254,7 +261,7 @@ export const setAutoplay = (autoplay: boolean) => set({ autoplay });
 export const setChrono = (chrono: boolean) => set({ chrono });
 
 if (audio) {
-  audio.onended = next;
+  audio.onended = () => next();
   audio.onerror = () => {
     if (state.playing) next();
   };

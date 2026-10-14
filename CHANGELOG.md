@@ -59,6 +59,43 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 - **Delete old calls:** Setup → Recording → Recorder has **Keep calls for, days**, **Keep at most,
   GB** and **Keep at most, % of the disk** (`recording.retention`). Past any that are set, the
   oldest calls are deleted from the recordings folder, checked every ten minutes. Off by default.
+- **Phase 2, DMR and NXDN tone frames now play as tones:** a dispatch tone-out sent
+  as AMBE+2 tone frames (a pure tone or a pair, with a tone ID and a level)
+  came out as silence with a click at each frame edge, because the decoder
+  took the tone ID for part of a pitch and faded to nothing. It now reads the
+  frame by TIA-102.BABA-A §2.10 and plays the Annex T tone at the level it
+  names, continuous from frame to frame (checked against the reference
+  vocoder's amplitude to within 4 %). A tone frame the FEC damaged keeps the
+  tone going, and tone frames no longer count as bad frames. The mbelib
+  profile still plays none, as mbelib doesn't.
+
+## [0.1.11] — 2026-10-14
+
+- **Setup, reorganized.** Each Setup tab is now sections of cards, and
+  each card's settings are in named groups with a line on what they are
+  for: a system's Basics, On the air, Talkgroups and units, Sites and
+  Overrides; a radio's Device, Tuning, Gain and Frequency correction; the
+  Recording tab's Recorder, Call rules and Advanced (M4A audio, Log,
+  Interfaces). Headings step down in size from section to card to group,
+  so it's clearer what belongs together. System, conventional and radio
+  cards fold to a one-line header (name, type, whether its control
+  channel is covered, Record), with Expand all / Collapse all; with
+  several, they start folded, and each is remembered in the browser.
+  Show, from an import's to-do list or a plugin's system chips, opens the
+  card it points into. Nothing about the settings themselves changed.
+- **A system can override a plugin's settings.** Each plugin on a system's
+  card in Setup now has a section for that system's own values of the
+  plugin's settings, such as the server it uploads to; anything left empty
+  stays as set for every system. It works for a single copy of a plugin or
+  for each of several, so one system can upload to two Rdio Scanner servers.
+  In the config this is `override` in the system's settings for the plugin.
+  A required setting, such as Rdio Scanner's server, can be left empty for
+  the whole recorder when every system that uses the plugin sets it.
+- **Plugin SDK 0.3.0.** Each system in `Setup` carries `settings`: the
+  plugin's settings with that system's overrides. `CallQueue::start_by`
+  gives each server a queue of its own (workers, retries, capacity and
+  endpoint status), so a server that's down doesn't hold up the others.
+  Breaking: `System` takes the config type too, `System<C, S>`.
 
 ## [0.1.10] — 2026-10-13
 
