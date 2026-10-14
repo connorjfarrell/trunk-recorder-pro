@@ -41,16 +41,20 @@ Binary, on stdin. Every request is a 4-byte header and an optional payload:
 
 | Byte | |
 |---|---|
-| 0 | `op`: 1 IMBE frame, 2 AMBE+2 frame, 3 reset |
-| 1 | flags: bit 0 set means the frame was **lost** (the payload is meaningless) |
-| 2 | `e0`: FEC errors corrected in the first codeword (IMBE; 0 for AMBE+2), saturated at 255 |
+| 0 | `op`: 1 IMBE frame, 2 AMBE+2 frame |
+| 1 | flags: bit 0 set means the frame was **lost** (the payload is meaningless). IMBE requests only; AMBE+2 requests always send 0, and a damaged AMBE+2 frame shows as a high `et` |
+| 2 | `e0`: FEC errors corrected in the first codeword (IMBE only; 0 for AMBE+2), saturated at 255 |
 | 3 | `et`: FEC errors corrected in the whole frame, saturated at 255 |
 
 - **IMBE (op 1)**: 88 payload bytes, the frame's 88 information bits, one per byte (0 or 1), in
   mbelib's `imbe_d` order: u0 u1 u2 u3 (12 bits each), u4 u5 u6 (11 each), u7 (7), most
   significant bit first.
 - **AMBE+2 (op 2)**: 49 payload bytes, mbelib's `ambe_d`: u0 (12) u1 (12) u2 (11) u3 (14).
-- **Reset (op 3)**: no payload. A new call begins on this stream.
+
+There is no reset request: every call (or timeslot of one) gets a new process, so a module starts
+each stream with fresh state. The recorder starts the process when the stream's first frame
+arrives, not when the channel is set up, and stops it when the call ends, so an idle channel never
+holds one of `maxStreams`.
 
 These are the bits after the recorder's own FEC. Frames of an encrypted call arrive decrypted if
 the recorder has the key.
@@ -64,11 +68,11 @@ For every request, exactly one reply of 321 bytes on stdout, in order:
 | 0 | kind: 0 voice, 1 repeat (the previous audio held because this frame was unusable), 2 muted, 3 erasure, 4 tone |
 | 1–320 | 160 samples of 16-bit little-endian PCM: 20 ms at 8 kHz, full scale 32767 |
 
-A reset gets a reply too (any content). The recorder counts repeat, muted and erasure frames as a
+The recorder counts repeat, muted and erasure frames as a
 call's bad frames, and applies its own loudness and limiting to the samples.
 
 A module should answer within a few milliseconds. The recorder waits 500 ms; if it gets no reply, or
-the module exits, writes garbage, or closes stdout, it stops using the module for that stream and
+the module exits, closes stdout, or answers with a kind other than 0–4, it stops using the module for that stream and
 decodes the rest of it with a built-in vocoder.
 
 ## Testing a module

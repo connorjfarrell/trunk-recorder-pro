@@ -21,10 +21,6 @@ impl Module {
 }
 
 impl Vocoder for Module {
-    fn reset(&mut self) {
-        self.0.reset();
-    }
-
     fn imbe(&mut self, bits: &[u8; 88], e0: u8, et: u8, erased: bool) -> (Kind, [i16; FRAME_SAMPLES]) {
         let mut bytes = [0u8; 11];
         if erased || e0 >= REPEAT_E0 || et >= REPEAT_ET {

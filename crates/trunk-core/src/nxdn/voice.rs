@@ -228,6 +228,7 @@ impl NxdnVoice {
             }
             Message::TxRel { .. } | Message::TxRelEx { .. } | Message::Disc { .. } => {
                 // End of the transmission: what it was doesn't carry over to the next.
+                self.dec.release();
                 self.source = None;
                 self.encrypted = false;
                 self.emergency = false;

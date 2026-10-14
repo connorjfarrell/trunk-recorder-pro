@@ -365,6 +365,8 @@ fn run_revoice(a: &Args) {
     if a.flag("hard-fec") {
         dec.hard_fec();
     }
+    // A vocoder module has a stream per codec: IMBE on `dec`, AMBE+2 on this one.
+    let mut dec_ambe = (profile == mbe::Profile::External).then(|| mbe::Decoder::new_ambe(mbe::lcg(a.num("seed", 1.0) as u32)));
     // --s16: raw 16-bit samples at the vocoder's own scale (mbelib's ×7), no limiter.
     let s16 = a.flag("s16");
     let mut pcm: Vec<i16> = Vec::new();
@@ -378,7 +380,7 @@ fn run_revoice(a: &Args) {
             }
             Codec::Ambe => {
                 let bits: [u8; 49] = f.bits[..].try_into().unwrap();
-                dec.ambe(&bits, f.errs, &mut buf)
+                dec_ambe.as_mut().unwrap_or(&mut dec).ambe(&bits, f.errs, &mut buf)
             }
         };
         differ += (kind != f.kind) as u32;

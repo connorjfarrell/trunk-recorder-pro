@@ -207,6 +207,7 @@ impl VoiceTracker {
                     }
                 }
                 self.active = false;
+                self.dec.release();
                 self.algid = ALGID_CLEAR as i32;
                 self.set_es(None);
                 // Voice still waiting for a sync that won't come.
@@ -286,6 +287,7 @@ impl VoiceTracker {
         if self.active && t - self.end_s > 1.0 {
             // Quiet with no terminator: the next transmission re-learns its cipher.
             self.active = false;
+            self.dec.release();
             self.algid = ALGID_CLEAR as i32;
         }
         if !self.active {

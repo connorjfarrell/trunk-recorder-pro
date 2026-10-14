@@ -31,11 +31,6 @@ fn frame(v: &mut Blip, info: &[u16], status: FrameStatus) -> (Kind, [i16; FRAME_
 }
 
 impl Vocoder for Module {
-    fn reset(&mut self) {
-        self.imbe.reset();
-        self.ambe.reset();
-    }
-
     fn imbe(&mut self, bits: &[u8; 88], _e0: u8, et: u8, erased: bool) -> (Kind, [i16; FRAME_SAMPLES]) {
         let status = if erased { FrameStatus::LOST } else { FrameStatus::new(et as u32, false) };
         frame(&mut self.imbe, &imbe_info(bits), status)

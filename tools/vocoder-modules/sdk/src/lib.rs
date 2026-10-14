@@ -35,11 +35,9 @@ pub enum Kind {
 }
 
 /// One decoding stream. The recorder starts one process per stream (a call, or
-/// one timeslot of one), so state lives in `self` and frames arrive in order.
+/// one timeslot of one), so state lives in `self`, starts fresh with each call,
+/// and frames arrive in order.
 pub trait Vocoder {
-    /// A new call begins.
-    fn reset(&mut self) {}
-
     /// One IMBE 7200x4400 (P25 Phase 1) frame: its 88 information bits, one per
     /// byte (0 or 1, mbelib's imbe_d order), the FEC errors found in the first
     /// codeword and in all of them, and whether the frame was lost outright.
@@ -56,7 +54,6 @@ pub trait Vocoder {
 
 const OP_IMBE: u8 = 1;
 const OP_AMBE: u8 = 2;
-const OP_RESET: u8 = 3;
 
 /// Say the module couldn't start (no dongle, bad setting) and exit. Call it
 /// instead of [`serve`].
@@ -113,10 +110,6 @@ pub fn serve_io<R: Read, W: Write, V: Vocoder>(mut input: R, mut output: W, mut 
                 input.read_exact(&mut bits)?;
                 vocoder.ambe(&bits, et)
             }
-            OP_RESET => {
-                vocoder.reset();
-                (Kind::Voice, [0; FRAME_SAMPLES])
-            }
             other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown request {other}"))),
         };
         let mut reply = [0u8; 1 + FRAME_SAMPLES * 2];
@@ -160,10 +153,6 @@ mod tests {
     struct Ramp(u32);
 
     impl Vocoder for Ramp {
-        fn reset(&mut self) {
-            self.0 = 0;
-        }
-
         fn imbe(&mut self, bits: &[u8; 88], e0: u8, et: u8, erased: bool) -> (Kind, [i16; FRAME_SAMPLES]) {
             self.0 += 1;
             let mut pcm = [0i16; FRAME_SAMPLES];
@@ -174,13 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn serves_frames_resets_and_exits_on_eof() {
+    fn serves_frames_and_exits_on_eof() {
         let mut input = Vec::new();
         input.extend_from_slice(&[OP_IMBE, 0, 2, 3]);
         input.extend_from_slice(&[1; 88]);
         input.extend_from_slice(&[OP_IMBE, 1, 0, 0]);
         input.extend_from_slice(&[0; 88]);
-        input.extend_from_slice(&[OP_RESET, 0, 0, 0]);
         input.extend_from_slice(&[OP_IMBE, 0, 0, 0]);
         input.extend_from_slice(&[0; 88]);
         let mut out = Vec::new();
@@ -188,12 +176,11 @@ mod tests {
         let ready = b"{\"type\":\"ready\"}\n";
         assert!(out.starts_with(ready));
         let replies: Vec<&[u8]> = out[ready.len()..].chunks(1 + FRAME_SAMPLES * 2).collect();
-        assert_eq!(replies.len(), 4);
+        assert_eq!(replies.len(), 3);
         let sample = |r: &[u8], i: usize| i16::from_le_bytes([r[1 + 2 * i], r[2 + 2 * i]]);
         assert_eq!((replies[0][0], sample(replies[0], 0), sample(replies[0], 1)), (0, 1, 1 + 20 + 300));
         assert_eq!((replies[1][0], sample(replies[1], 0)), (1, 2));
-        assert_eq!(replies[2][0], 0);
-        assert_eq!(sample(replies[3], 0), 1, "the reset started the count over");
+        assert_eq!((replies[2][0], sample(replies[2], 0)), (0, 3));
     }
 
     #[test]

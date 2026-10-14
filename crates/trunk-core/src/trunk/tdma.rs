@@ -356,6 +356,7 @@ impl TdmaTracker {
                 }
                 MAC_END_PTT => {
                     s.active = false;
+                    s.dec.release();
                     s.algid = ALGID_CLEAR;
                     s.set_es(None, keys);
                     s.last_vb = None;

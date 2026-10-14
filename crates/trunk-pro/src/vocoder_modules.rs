@@ -29,7 +29,6 @@ const SCALE: f32 = 1.0 / 7.0;
 
 const OP_IMBE: u8 = 1;
 const OP_AMBE: u8 = 2;
-const OP_RESET: u8 = 3;
 const FLAG_ERASED: u8 = 1;
 
 /// The folder modules are installed in.
@@ -103,7 +102,9 @@ impl Module {
         if id.is_empty() || id.len() > 64 || id.starts_with('.') || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
             return Err("the module's name must be letters, digits, - _ . only".into());
         }
-        let dir = root.join(id);
+        // Absolute: the module runs with its own folder as the working directory,
+        // where a relative path to its program would point elsewhere.
+        let dir = std::path::absolute(root.join(id)).map_err(|e| format!("{}: {e}", root.display()))?;
         let manifest_path = dir.join("module.json");
         let text = std::fs::read_to_string(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
         let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
@@ -119,6 +120,10 @@ impl Module {
 }
 
 impl Provider for Module {
+    fn supports(&self, codec: Codec) -> bool {
+        self.manifest.does(codec)
+    }
+
     fn open(&self, codec: Codec) -> Option<Box<dyn External>> {
         if !self.manifest.does(codec) {
             return None;
@@ -288,16 +293,22 @@ impl Stream {
 
     fn frame(&mut self, op: u8, flags: u8, e0: u32, et: u32, payload: &[u8], out: &mut [f32; FRAME_SAMPLES]) -> Option<Kind> {
         let (kind, pcm) = self.call(op, flags, e0.min(255) as u8, et.min(255) as u8, payload)?;
-        for (o, &v) in out.iter_mut().zip(pcm.iter()) {
-            *o = v as f32 * SCALE;
-        }
-        Some(match kind {
+        let kind = match kind {
+            0 => Kind::Voice,
             1 => Kind::Repeat,
             2 => Kind::Muted,
             3 => Kind::Erasure,
             4 => Kind::Tone,
-            _ => Kind::Voice,
-        })
+            // Out of step or garbled: not a stream to trust any longer.
+            other => {
+                self.fail(&format!("it answered with an unknown frame kind ({other})"));
+                return None;
+            }
+        };
+        for (o, &v) in out.iter_mut().zip(pcm.iter()) {
+            *o = v as f32 * SCALE;
+        }
+        Some(kind)
     }
 }
 
@@ -307,11 +318,7 @@ impl External for Stream {
     }
 
     fn ambe(&mut self, d: &[u8; 49], errs: u32, out: &mut [f32; FRAME_SAMPLES]) -> Option<Kind> {
-        self.frame(OP_AMBE, 0, errs, errs, d, out)
-    }
-
-    fn reset(&mut self) {
-        let _ = self.call(OP_RESET, 0, 0, 0, &[]);
+        self.frame(OP_AMBE, 0, 0, errs, d, out)
     }
 }
 
@@ -377,6 +384,40 @@ done
         assert_eq!(s.imbe(&[0; 88], 0, 0, false, &mut out), None);
         assert_eq!(s.imbe(&[0; 88], 0, 0, false, &mut out), None, "stays failed");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn an_unknown_frame_kind_fails_the_stream() {
+        let script = ECHO.replace("printf '\\001'", "printf '\\007'");
+        assert_ne!(script, ECHO);
+        let (root, m) = install("kind", None, &script);
+        let mut s = m.open(Codec::Imbe).expect("spawns");
+        let mut out = [0f32; FRAME_SAMPLES];
+        assert_eq!(s.imbe(&[0; 88], 0, 0, false, &mut out), None);
+        assert_eq!(s.imbe(&[0; 88], 0, 0, false, &mut out), None, "stays failed");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_relative_modules_folder_works() {
+        let (root, _) = install("rel", None, ECHO);
+        // The same folder, named relative to the current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = root.strip_prefix(&cwd).map(Path::to_path_buf).unwrap_or_else(|_| pathdiff(&root, &cwd));
+        let m = Module::find(&rel, "t").unwrap();
+        let mut s = m.open(Codec::Imbe).expect("spawns");
+        let mut out = [0f32; FRAME_SAMPLES];
+        assert_eq!(s.imbe(&[0; 88], 0, 0, false, &mut out), Some(Kind::Repeat));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `to` relative to `from`, both absolute.
+    fn pathdiff(to: &Path, from: &Path) -> PathBuf {
+        let (to, from): (Vec<_>, Vec<_>) = (to.components().collect(), from.components().collect());
+        let common = to.iter().zip(&from).take_while(|(a, b)| a == b).count();
+        let mut p: PathBuf = std::iter::repeat_n("..", from.len() - common).collect();
+        p.extend(&to[common..]);
+        p
     }
 
     #[test]

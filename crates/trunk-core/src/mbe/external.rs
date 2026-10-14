@@ -5,9 +5,14 @@
 //! a stream when it is made. Nothing here spawns anything, so trunk-core stays
 //! platform-independent (the browser build never registers a provider).
 //!
+//! A decoder opens its stream when its first frame arrives, not when it is
+//! made (a recorder keeps decoders for idle channels and timeslots, which must
+//! not hold a dongle's channels), and gives it back at the end of a call
+//! ([`super::Decoder::release`]) or when the next call resets it.
+//!
 //! A module that fails (won't start, crashes, stops answering) returns `None`
-//! from a call; the decoder drops it and carries on with a built-in vocoder, so
-//! a bad module costs some audio, never a call.
+//! from a call; the decoder drops it and carries on with a built-in vocoder for
+//! the rest of that call, so a bad module costs some audio, never a call.
 
 use std::sync::{Arc, RwLock};
 
@@ -30,12 +35,14 @@ pub trait External: Send {
     fn imbe(&mut self, d: &[u8; 88], e0: u32, et: u32, erased: bool, out: &mut [f32; FRAME_SAMPLES]) -> Option<Kind>;
     /// 49 AMBE+2 information bits (mbelib's ambe_d) and the FEC error count.
     fn ambe(&mut self, d: &[u8; 49], errs: u32, out: &mut [f32; FRAME_SAMPLES]) -> Option<Kind>;
-    /// A new call: forget the previous one's state.
-    fn reset(&mut self);
 }
 
 /// Opens streams on the module the config chose.
 pub trait Provider: Send + Sync {
+    /// Whether the module does `codec` at all (its `module.json`). Free to
+    /// call; it opens nothing.
+    fn supports(&self, codec: Codec) -> bool;
+
     /// A new stream for `codec`, or `None` when the module doesn't do that
     /// codec, is busy (a dongle has few channels), or won't start. The
     /// decoder then uses a built-in vocoder.
@@ -48,6 +55,11 @@ static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 /// before the session starts; streams already open keep their module.
 pub fn set_provider(provider: Option<Arc<dyn Provider>>) {
     *PROVIDER.write().unwrap_or_else(|e| e.into_inner()) = provider;
+}
+
+/// Whether the registered module does `codec`.
+pub(super) fn supports(codec: Codec) -> bool {
+    PROVIDER.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|p| p.supports(codec))
 }
 
 pub(super) fn open(codec: Codec) -> Option<Box<dyn External>> {

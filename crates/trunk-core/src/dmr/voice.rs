@@ -98,6 +98,7 @@ impl DmrVoice {
                 let Some(group) = lc.voice_user() else { return };
                 if from == LcFrom::Terminator {
                     // End of the transmission (repeated through the hang time): not a call of its own.
+                    s.dec.release();
                     s.source = None;
                     s.encrypted = false;
                     s.emergency = false;
