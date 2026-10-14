@@ -7,9 +7,11 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 - **Two more P25 voice decoders:** `recording.vocoder` (and **P25 voice
   decoder** in Setup) accepts `blip25-mbe` and `blip25-vocoder`, openBLIP25's
-  MIT-licensed Rust IMBE decoders, which follow the spec's synthesis with no
-  post-filter. `trunk-pro tool revoice --profile` takes them too. Phase 1
-  only: Phase 2, DMR and NXDN voice stay on the enhanced decoder.
+  MIT-licensed Rust IMBE decoders (post-filter off). Their synthesis core is
+  reverse-engineered from a reference vocoder and, per their patent notices,
+  patent-encumbered, IMBE included: research and interoperability study.
+  `trunk-pro tool revoice --profile` takes them too. Phase 1 only: Phase 2,
+  DMR and NXDN voice stay on the enhanced decoder.
 
 - **Playback**, a new page beside Listen: search everything the recorder has
   saved, not just the last 24 hours, by system, talkgroup, radio ID, a name or
