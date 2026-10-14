@@ -39,6 +39,9 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   so for a plugin that is withheld and, on every start, for one that is allowed. Voice and calls of a call that
   expires in the same moment as its decryption are treated as decrypted. See
   [Decrypted calls](docs/plugins/README.md#decrypted-calls).
+- **Delete old calls:** Setup → Recording → Recorder has **Keep calls for, days**, **Keep at most,
+  GB** and **Keep at most, % of the disk** (`recording.retention`). Past any that are set, the
+  oldest calls are deleted from the recordings folder, checked every ten minutes. Off by default.
 
 ## [0.1.10] — 2026-10-13
 
