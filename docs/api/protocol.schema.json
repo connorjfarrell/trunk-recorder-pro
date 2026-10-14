@@ -4505,12 +4505,7 @@
         },
         "vocoder": {
           "type": "string",
-          "enum": [
-            "fixed",
-            "enhanced",
-            "mbelib"
-          ],
-          "description": "IMBE vocoder for P25 Phase 1 voice."
+          "description": "IMBE vocoder for P25 Phase 1 voice; \"module:<id>\": a vocoder module in vocoders/<id>/ (id: 1 to 64 of A-Z a-z 0-9 . _ -, not starting with a dot; desktop and server only)."
         },
         "m4a": {
           "type": "object",

@@ -111,7 +111,7 @@ impl Slot {
 
     fn new(rng: mbe::Rng) -> Self {
         Slot {
-            dec: mbe::Decoder::new(rng, mbe::Profile::Enhanced),
+            dec: mbe::Decoder::new_ambe(rng),
             active: false,
             encrypted: false,
             algid: ALGID_CLEAR,
@@ -364,6 +364,8 @@ impl TdmaTracker {
                     for (f, bits, errs) in std::mem::take(&mut s.held) {
                         self.bad_frames += s.voice(c, f, bits, errs, out) as u64;
                     }
+                    // After the held voice: decoding it would open a module stream again.
+                    s.dec.release();
                     s.talker = None;
                 }
                 MAC_ACTIVE => s.first4v = if pdu.offset > 4 { 0 } else { pdu.offset as i32 },

@@ -1087,7 +1087,7 @@ const DSP = [
       { id: "bank", x: 710, y: 138, label: "Diversity bank", sub: "group by sample · pick best", text: "<code>p25::diversity::Bank</code>. Frames whose start samples are within 36 symbols form a group, released once every receiver has passed it by 0.35 s. <code>best_frame</code>: fewest NID corrections. <code>best_tsbks</code>: per block, the first CRC-valid decode. <code>best_imbe</code>: per IMBE codeword, the lowest soft cost per unit of reliability (erased bits count against a copy). <code>modulation</code> limits which receivers run: <code>fsk4</code> → C4FM only, <code>qpsk</code> → the two CQPSK." },
       { id: "tsbk", x: 940, y: 40, label: "TSDU → TSBKs", sub: "soft Viterbi · CRC-CCITT", text: "Control channel: 196-bit de-interleave, soft Viterbi over the 4-state rate-½ trellis (49 steps), CRC-CCITT over 80 bits. Three TSBKs per TSDU go to <code>TsbkParser</code> (section 05)." },
       { id: "trk", x: 940, y: 138, label: "VoiceTracker", sub: "HDU · LDU1/2 · TDU", text: "Voice: HDU gives algorithm and talkgroup; LDU1 link control (Hamming(10,6) + RS(24,12,13)) gives talkgroup, source, emergency, encryption, talker aliases; LDU2 the encryption sync (RS(24,16,9)); TDU / TDULC end the transmission. Encrypted frames are not vocoded." },
-      { id: "imbe", x: 940, y: 236, label: "IMBE vocoder", sub: "9 codewords per LDU · 8 kHz", text: "Each LDU carries nine 144-bit IMBE codewords: Golay(23,12) with Chase-II soft decoding, Hamming(15,11) maximum-likelihood soft decoding, PN whitening. The <code>fixed</code> profile (Pavel Yazev's fixed-point decoder) is the default. 20 ms of 8 kHz audio per codeword." }
+      { id: "imbe", x: 940, y: 236, label: "IMBE vocoder", sub: "9 codewords per LDU · 8 kHz", text: "Each LDU carries nine 144-bit IMBE codewords: Golay(23,12) with Chase-II soft decoding, Hamming(15,11) maximum-likelihood soft decoding, PN whitening. The <code>fixed</code> profile (Pavel Yazev's fixed-point decoder) is the default. With <code>module:&lt;id&gt;</code> the frames go to a vocoder module (a program started per call; the fixed-point decoder takes over for a call it can't serve). 20 ms of 8 kHz audio per codeword." }
     ], edges: [["head", "cq"], ["head", "eq"], ["head", "c4"], ["cq", "f1", "Symbols"], ["eq", "f2", "Symbols"], ["c4", "f3", "Symbols"], ["f1", "bank", "Frame"], ["f2", "bank", "Frame"], ["f3", "bank", "Frame"], ["bank", "tsbk", "control"], ["bank", "trk", "voice"], ["trk", "imbe", "codewords"]] } },
   { id: "c4fm", tab: "C4FM receiver", intro: "Inside the C4FM receiver (dsp/c4fm.rs), used for P25 C4FM, DMR (RRC α 0.2) and NXDN (2,400 or 4,800 Bd).",
     nodes: [
@@ -1117,7 +1117,7 @@ const DSP = [
       ["Burst type", "DUID", "4V bursts carry four AMBE codewords, 2V bursts two."],
       ["ESS · SACCH / FACCH", "RS(44,16,29) · RS(63,35)+CRC-12", "Encryption sync, and MAC PDUs: PTT (talker, talkgroup, algorithm), END_PTT, ACTIVE, talker aliases."],
       ["TdmaTracker", "two slots", "Each slot has its own AMBE decoder; only slots holding a recorded call are vocoded."],
-      ["AMBE+2 vocoder", "72-bit codewords · enhanced", "c0 Golay(24,12), c1 Golay(23,12) with Chase-II after PN23, c2 and c3 uncoded → 49 bits → 20 ms of 8 kHz audio."]
+      ["AMBE+2 vocoder", "72-bit codewords · enhanced", "c0 Golay(24,12), c1 Golay(23,12) with Chase-II after PN23, c2 and c3 uncoded → 49 bits → 20 ms of 8 kHz audio. With a vocoder module chosen that lists AMBE+2, a slot's frames go to the module (its stream opens on the slot's first frame and is released when the call ends); the enhanced decoder has any call the module can't serve."]
     ] },
   { id: "dmr", tab: "DMR", intro: "Trunked (Capacity Plus, Capacity Max, Connect Plus, Tier III) and conventional DMR. Every carrier of a trunked site is watched with its own receiver.",
     nodes: [
@@ -1126,7 +1126,7 @@ const DSP = [
       ["dmr::Framer", "9 sync patterns", "Bursts of CACH 12 + 132 dibits (30 ms). Lock on ≤ 3 sync errors; on the burst grid ≤ 7 (≤ 11 for base-station syncs). Unlock after 24 bursts without a sync."],
       ["Slot assignment", "CACH TACT · Hamming(7,4)", "On a repeater the CACH names the slot; in direct mode the sync does; a mobile is anchored to its last sync."],
       ["SlotDecoder × 2", "BPTC · RS(12,9) · CRC", "Golay(20,8) slot type, QR(16,7) EMB, soft BPTC(196,96) (Chase, up to 4 iterations), embedded LC soft-combined over up to 4 superframes. CSBKs and link control become trunking messages."],
-      ["AMBE+2 vocoder", "3 codewords per burst", "Soft decoded; only recorded slots are vocoded."]
+      ["AMBE+2 vocoder", "3 codewords per burst", "Soft decoded; only recorded slots are vocoded, by the enhanced decoder or a vocoder module that does AMBE+2."]
     ] },
   { id: "nxdn", tab: "NXDN", intro: "NXDN48 (6.25 kHz) and NXDN96 (12.5 kHz), Type-C and Type-D trunking and conventional.",
     nodes: [
@@ -1171,7 +1171,7 @@ const DSP = [
     ] },
   { id: "save", tab: "Vocoder and saving", intro: "From vocoder frames to the .wav / .json pair (mbe/, loudness.rs, trunk/record.rs).",
     nodes: [
-      ["Vocoder frame", "160 samples · 20 ms · 8 kHz", "IMBE 7200×4400 (Phase 1) or AMBE+2 3600×2450 (Phase 2, DMR, NXDN), ported from mbelib in double precision."],
+      ["Vocoder frame", "160 samples · 20 ms · 8 kHz", "IMBE 7200×4400 (Phase 1) or AMBE+2 3600×2450 (Phase 2, DMR, NXDN), ported from mbelib in double precision, or decoded by a vocoder module (<code>module:&lt;id&gt;</code>: a program in <code>vocoders/</code>, one process per call, with the built-in decoder as the fallback)."],
       ["Concealment", "TIA-102.BABA-A", "IMBE repeats a frame that fails or has too many errors, fades after 4 repeats or a high error rate; AMBE repeats above 3 errors."],
       ["Scale and limit", "×7/32768 · tanh above −3 dBFS", "A soft limiter instead of clipping."],
       ["Recording", "audio · frames · transmissions", "The call's buffer. Gaps over 0.5 s separate transmissions."],
@@ -1774,7 +1774,7 @@ const CFG = {
   "recording.archiveFilesOnFailure": ["bool", "true", "Per system."],
   "recording.filenameFormat": ["string", "\"\"", "Per system. \"\" = <short>/<Y>/<M>/<D>/<tg>-<epoch>_<freq>."],
   "recording.dropDuplicateCalls": ["bool", "true", "Multi-site dedupe."],
-  "recording.vocoder": ["fixed · enhanced · mbelib", "fixed", "IMBE vocoder for P25 Phase 1."],
+  "recording.vocoder": ["fixed · enhanced · mbelib · module:&lt;id&gt;", "fixed", "IMBE vocoder for P25 Phase 1."],
   "recording.m4a": ["{ encoder, bitrateKbps }", "{ auto, 32 }", "encoder auto · ffmpeg · afconvert · fdkaac · none."],
   "recording.ramSpool": ["{ enabled, sizeMb, dir }", "{ false, 256 }", "Files only plugins need go to a RAM disk."],
   "server": ["object", "", "The web server."],

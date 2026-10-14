@@ -5,6 +5,17 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+- **Vocoder modules:** use another vocoder, a library you are licensed for, or
+  a DVSI USB dongle, by installing a module in `vocoders/<id>/` and choosing
+  `module:<id>` as `recording.vocoder` (Setup → Recording → **External
+  module…**). A module is a program that turns vocoder frames into audio; the
+  app starts one per call, and a module that fails hands the rest of the call to
+  the built-in decoder. `tools/vocoder-modules` has the SDK and two examples a
+  user builds themselves, from openBLIP25's blip25-vocoder and blip25-mbe,
+  which are patent-encumbered and so aren't built into the app. `trunk-pro tool
+  revoice --profile module:<id>` tries one on a saved call. Desktop and server
+  only.
+
 - **Playback**, a new page beside Listen: search everything the recorder has
   saved, not just the last 24 hours, by system, talkgroup, radio ID, a name or
   alias, and a span of time, and play what turns up (one call after the next,

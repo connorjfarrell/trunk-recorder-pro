@@ -5,6 +5,7 @@
 //! reference implementations. IMBE can also go through Pavel Yazev's
 //! fixed-point decoder ([`fixed`], [`Profile::Fixed`]).
 
+pub mod external;
 pub mod fixed;
 mod fixed_tables;
 mod tone_table;
@@ -764,11 +765,19 @@ pub enum Profile {
     /// thresholds as `Enhanced`; AMBE as `Enhanced`. Listeners on WMATA found
     /// it the most natural-sounding (tools/vocoder-shootout).
     Fixed,
+    /// A vocoder module the user installed (`module:<id>`; [`external`]).
+    /// Decoders made with it use the registered provider's stream, or `Fixed`
+    /// (IMBE) / `Enhanced` (AMBE) when there is none.
+    External,
 }
 
 impl Profile {
-    /// "enhanced", "fixed" or "mbelib".
+    /// "enhanced", "fixed", "mbelib" or "module:<id>" (the id is the app's to
+    /// read: this only says it is a module).
     pub fn from_name(name: &str) -> Option<Profile> {
+        if name.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("module:")) {
+            return Some(Profile::External);
+        }
         match name.to_ascii_lowercase().as_str() {
             "enhanced" => Some(Profile::Enhanced),
             "fixed" | "fixed-point" => Some(Profile::Fixed),
@@ -782,6 +791,7 @@ impl Profile {
             Profile::Enhanced => "enhanced",
             Profile::Fixed => "fixed",
             Profile::Mbelib => "mbelib",
+            Profile::External => "module",
         }
     }
 }
@@ -805,6 +815,12 @@ pub struct Decoder {
     repeat_et: f64,
     /// The fixed-point IMBE decoder ([`Profile::Fixed`]).
     fixed: Option<Box<fixed::FixedImbe>>,
+    /// The codec a vocoder module decodes for this decoder ([`Profile::External`],
+    /// [`Decoder::new_ambe`]), its stream while a call uses one, and whether
+    /// the module failed this call (the built-in decoder has it until the next).
+    module: Option<external::Codec>,
+    external: Option<Box<dyn external::External>>,
+    degraded: bool,
     /// The tone (ID, level) the AMBE+2 stream is playing, held through a tone frame the FEC damaged.
     last_tone: Option<(u8, u8)>,
 }
@@ -821,6 +837,9 @@ const HARD_REPEAT: (u32, f64) = (3, 10.0);
 
 impl Decoder {
     pub fn new(rand: Rng, profile: Profile) -> Self {
+        // A module that doesn't take IMBE (or isn't there) leaves the fixed-point decoder.
+        let module = (profile == Profile::External && external::supports(external::Codec::Imbe)).then_some(external::Codec::Imbe);
+        let profile = if profile == Profile::External && module.is_none() { Profile::Fixed } else { profile };
         let mut d = Decoder {
             rand,
             uvq: 3,
@@ -834,10 +853,49 @@ impl Decoder {
             repeat_e0: SOFT_REPEAT.0,
             repeat_et: SOFT_REPEAT.1,
             fixed: (profile == Profile::Fixed).then(|| Box::new(fixed::FixedImbe::new())),
+            module,
+            external: None,
+            degraded: false,
             last_tone: None,
         };
         d.reset();
         d
+    }
+
+    /// A decoder for AMBE+2 (Phase 2, DMR, NXDN): the enhanced one, or the
+    /// vocoder module's if the config chose one and it does AMBE+2.
+    pub fn new_ambe(rand: Rng) -> Self {
+        let mut d = Decoder::new(rand, Profile::Enhanced);
+        d.module = external::supports(external::Codec::Ambe).then_some(external::Codec::Ambe);
+        d
+    }
+
+    /// The call is over: give back the module's stream (a dongle has few
+    /// channels). The next frame opens a new one.
+    pub fn release(&mut self) {
+        self.external = None;
+        self.degraded = false;
+        self.last_tone = None;
+    }
+
+    /// The module's stream for `codec`, opened on first use; `None` when this
+    /// decoder has no module for it, the module can't be opened now (busy, won't
+    /// start) or failed this call.
+    fn module_stream(&mut self, codec: external::Codec) -> Option<&mut (dyn external::External + 'static)> {
+        if self.module != Some(codec) || self.degraded {
+            return None;
+        }
+        if self.external.is_none() {
+            self.external = external::open(codec);
+            self.degraded = self.external.is_none();
+        }
+        self.external.as_deref_mut()
+    }
+
+    /// The module failed: the built-in decoder has the rest of this call.
+    fn module_failed(&mut self) {
+        self.external = None;
+        self.degraded = true;
     }
 
     /// Error counts come from hard-decision FEC: TIA's repeat thresholds.
@@ -853,6 +911,9 @@ impl Decoder {
         if let Some(f) = self.fixed.as_mut() {
             f.reset();
         }
+        // A new call: a fresh stream (and another try if the module failed).
+        self.external = None;
+        self.degraded = false;
         self.last_tone = None;
     }
 
@@ -860,6 +921,16 @@ impl Decoder {
     /// [`to_limited`] or [`to_unit`] for [−1, 1]). `e0`/`et`: FEC errors in u0 / in total;
     /// `erased`: the frame is known lost.
     pub fn imbe(&mut self, d: &[u8; 88], e0: u32, et: u32, erased: bool, out: &mut [f32; FRAME_SAMPLES]) -> Kind {
+        if let Some(e) = self.module_stream(external::Codec::Imbe) {
+            match e.imbe(d, e0, et, erased, out) {
+                Some(kind) => return kind,
+                None => self.module_failed(),
+            }
+        }
+        if self.profile == Profile::External && self.fixed.is_none() {
+            // No module for this call: the fixed-point decoder, made when first needed.
+            self.fixed = Some(Box::new(fixed::FixedImbe::new()));
+        }
         if let Some(f) = self.fixed.as_mut() {
             let mut s = [0i16; FRAME_SAMPLES];
             let r = f.decode_checked(&fixed::frame_vector(d), e0, et, erased, self.repeat_e0, self.repeat_et as f32, &mut s);
@@ -924,6 +995,12 @@ impl Decoder {
     /// Phase 2's thresholds alone). "Enhanced" fades where mbelib cuts to
     /// silence and resets: past 3 repeats, and on tone / erasure frames.
     pub fn ambe(&mut self, d: &[u8; 49], errs: u32, out: &mut [f32; FRAME_SAMPLES]) -> Kind {
+        if let Some(e) = self.module_stream(external::Codec::Ambe) {
+            match e.ambe(d, errs, out) {
+                Some(kind) => return kind,
+                None => self.module_failed(),
+            }
+        }
         let enhanced = self.profile != Profile::Mbelib;
         let r = decode_ambe2450_parms(d, &mut self.cur, &mut self.prev);
         let mut kind = Kind::Voice;
@@ -1065,6 +1142,95 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vocoder module that speaks a few frames, then fails.
+    struct Flaky(u32);
+
+    impl external::External for Flaky {
+        fn imbe(&mut self, _: &[u8; 88], _: u32, _: u32, _: bool, out: &mut [f32; FRAME_SAMPLES]) -> Option<Kind> {
+            self.0 += 1;
+            (self.0 <= 2).then(|| {
+                out.fill(0.5);
+                Kind::Tone
+            })
+        }
+
+        fn ambe(&mut self, _: &[u8; 49], _: u32, _: &mut [f32; FRAME_SAMPLES]) -> Option<Kind> {
+            None
+        }
+    }
+
+    /// Counts the streams opened; refuses them past `limit`.
+    struct FlakyProvider {
+        opened: std::sync::atomic::AtomicUsize,
+        limit: usize,
+    }
+
+    impl external::Provider for FlakyProvider {
+        /// IMBE only, so decoders made by other tests in this process are untouched.
+        fn supports(&self, codec: external::Codec) -> bool {
+            codec == external::Codec::Imbe
+        }
+
+        fn open(&self, codec: external::Codec) -> Option<Box<dyn external::External>> {
+            let n = self.opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (codec == external::Codec::Imbe && n < self.limit).then(|| Box::new(Flaky(0)) as Box<dyn external::External>)
+        }
+    }
+
+    #[test]
+    fn a_vocoder_module_stream_opens_late_fails_over_and_is_released() {
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(Profile::from_name("module:x"), Some(Profile::External));
+        assert_eq!(Profile::from_name("Module:x"), Some(Profile::External));
+        let provider = std::sync::Arc::new(FlakyProvider { opened: 0.into(), limit: 3 });
+        external::set_provider(Some(provider.clone()));
+        let mut dec = Decoder::new(lcg(1), Profile::External);
+        assert_eq!(provider.opened.load(SeqCst), 0, "a decoder makes no stream until it has a frame");
+        let mut out = [0f32; FRAME_SAMPLES];
+        for _ in 0..2 {
+            assert_eq!(dec.imbe(&imbe_frame(0), 0, 0, false, &mut out), Kind::Tone);
+            assert_eq!(out[0], 0.5);
+        }
+        assert_eq!(provider.opened.load(SeqCst), 1);
+        // The third call fails; the same call is answered by the fixed-point decoder, and so is the rest of the call.
+        assert_ne!(dec.imbe(&imbe_frame(1), 0, 0, false, &mut out), Kind::Tone);
+        assert!(dec.external.is_none() && dec.degraded);
+        assert_ne!(dec.imbe(&imbe_frame(2), 0, 0, false, &mut out), Kind::Tone);
+        assert_eq!(provider.opened.load(SeqCst), 1, "no new stream mid-call");
+        // The next call tries the module again.
+        dec.reset();
+        assert_eq!(dec.imbe(&imbe_frame(0), 0, 0, false, &mut out), Kind::Tone);
+        assert_eq!(provider.opened.load(SeqCst), 2);
+        // The call ended: the stream goes back, and the next frame opens another.
+        dec.release();
+        assert!(dec.external.is_none());
+        assert_eq!(dec.imbe(&imbe_frame(0), 0, 0, false, &mut out), Kind::Tone);
+        assert_eq!(provider.opened.load(SeqCst), 3);
+        // A module that is busy (refuses the stream): the built-in decoder for that call.
+        dec.release();
+        dec.reset();
+        assert_ne!(dec.imbe(&imbe_frame(0), 0, 0, false, &mut out), Kind::Tone);
+        // An AMBE decoder gets no stream from a module that doesn't do AMBE.
+        let mut ambe = Decoder::new_ambe(lcg(1));
+        assert!(ambe.module.is_none());
+        ambe.ambe(&[0; 49], 0, &mut out);
+        assert_eq!(provider.opened.load(SeqCst), 4);
+        external::set_provider(None);
+        // With no module registered, a module profile is just the fixed decoder.
+        let dec = Decoder::new(lcg(1), Profile::External);
+        assert_eq!(dec.profile, Profile::Fixed);
+    }
+
+    /// An arbitrary valid IMBE frame (pitch index well inside [0, 207]).
+    fn imbe_frame(k: usize) -> [u8; 88] {
+        let mut d = [0u8; 88];
+        for (i, b) in d.iter_mut().enumerate() {
+            *b = ((i * 7 + k * 13 + i * i) % 5 < 2) as u8;
+        }
+        d[..12].copy_from_slice(&[0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        d
+    }
 
     /// ambe_d for a tone frame: û0 = 0x3F signature then level(6..1), û1 = ID
     /// copy 1 and the high nibble of copy 2, û2 = low nibble of copy 2 and the

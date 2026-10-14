@@ -310,7 +310,9 @@ frame:
   mbelib in double precision, with TIA-102.BABA-A concealment. 160 samples (20 ms) at 8 kHz per
   frame.
 - Profiles: `fixed` (Pavel Yazev's fixed-point IMBE, the app default for Phase 1), `enhanced`,
-  `mbelib`. AMBE always uses `enhanced`.
+  `mbelib`. AMBE uses `enhanced`. `module:<id>` hands IMBE and/or AMBE+2 frames to an external
+  vocoder module (`mbe/external.rs`; the process host is `trunk-pro/src/vocoder_modules.rs`), and a
+  failed module falls back to `fixed` (IMBE) / `enhanced` (AMBE).
 - AMBE+2 tone frames (`û0(11..6)` all ones, `û3(3..0)` zero; BABA-A §2.10): the tone ID (sent four
   times, bitwise majority) indexes Annex T (`mbe/tone_table.rs`) for the fundamental and the one or
   two harmonics; those are voiced at `16384·10^(0.03555·(level−127))` and the rest silent, through
@@ -1028,7 +1030,7 @@ same frequency).
 | `archiveFilesOnFailure` | true | yes | |
 | `filenameFormat` | "" | yes | "" = `<short>/<Y>/<M>/<D>/<tg>-<epoch>_<freq>` |
 | `dropDuplicateCalls` | true | | multi-site dedupe |
-| `vocoder` | `fixed` | | `fixed`, `enhanced`, `mbelib` (IMBE) |
+| `vocoder` | `fixed` | | `fixed`, `enhanced`, `mbelib` (IMBE), `module:<id>` (a vocoder module) |
 | `m4a` | `{encoder: auto, bitrateKbps: 32}` | | auto / ffmpeg / afconvert / fdkaac / none |
 | `ramSpool` | `{enabled: false, sizeMb: 256, dir}` | | see 8.6 |
 

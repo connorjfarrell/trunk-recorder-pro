@@ -1,0 +1,5 @@
+{
+  "name": "blip25-mbe",
+  "description": "openBLIP25's blip25-mbe: IMBE (P25 Phase 1). Patent-encumbered; read its PATENT_NOTICE.md.",
+  "codecs": ["imbe"]
+}

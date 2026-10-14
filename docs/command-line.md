@@ -449,7 +449,7 @@ separation at each SNR.
 ### tool revoice
 
 ```bash
-trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile enhanced|fixed|mbelib]
+trunk-pro tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile enhanced|fixed|mbelib|module:<id>] [--modules-dir DIR]
                        [--seed 1] [--hard-fec] [--s16]
 ```
 
