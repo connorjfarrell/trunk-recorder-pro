@@ -510,7 +510,7 @@ impl Peer {
     /// `server.allowLanUnlock` is on, from a private-network address (not through a proxy) that asked
     /// for a name or address on this network, not a public name.
     fn may_unlock(&self, allow_lan: bool) -> bool {
-        self.loopback() || (allow_lan && !self.proxied && is_private(&self.addr.ip().to_canonical()) && self.host.as_deref().is_some_and(is_local_host))
+        self.loopback() || (allow_lan && !self.proxied && is_private(&self.addr.ip().to_canonical()) && self.host.as_deref().is_some_and(crate::plugins::guard::is_local_host))
     }
 }
 
@@ -520,20 +520,6 @@ fn is_private(ip: &std::net::IpAddr) -> bool {
         std::net::IpAddr::V4(a) => a.is_private() || a.is_link_local(),
         std::net::IpAddr::V6(a) => a.is_unique_local() || a.is_unicast_link_local(),
     }
-}
-
-/// A host that is on this network: a loopback, private or link-local address, `localhost`, a
-/// name with no dot, or one under a name reserved for local use. A name that merely resolves to
-/// a private address doesn't count (it isn't looked up).
-fn is_local_host(h: &str) -> bool {
-    let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() {
-        return false;
-    }
-    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-        return is_private(&ip.to_canonical()) || ip.to_canonical().is_loopback();
-    }
-    !h.contains('.') || ["local", "localhost", "lan", "internal", "home.arpa", "localdomain"].iter().any(|s| h.ends_with(&format!(".{s}")))
 }
 
 /// Whether `peer` may handle the keys now (the config as it is this moment).
