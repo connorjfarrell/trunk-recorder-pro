@@ -25,7 +25,7 @@ use std::sync::Arc;
 use aes::Aes256;
 use cbc::cipher::{BlockCipherEncrypt, KeyInit};
 use des::Des;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::KeyStore;
 use crate::p25::voice::{EncryptionSync, ALGID_CLEAR};
@@ -126,6 +126,8 @@ fn ofb<C: BlockCipherEncrypt>(cipher: &C, iv: &[u8], out: &mut [u8]) {
         let mut b = cbc::cipher::Block::<C>::try_from(&block[..]).expect("a block");
         cipher.encrypt_block(&mut b);
         block.copy_from_slice(&b);
+        // (The cipher's output block is key-derived like the rest: wiped, not left on the stack.)
+        b.as_mut_slice().zeroize();
         if pass > 0 {
             let n = (out.len() - taken).min(m);
             out[taken..taken + n].copy_from_slice(&block[..n]);

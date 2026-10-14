@@ -63,7 +63,8 @@ stopping and starting recording keeps it. After a restart you unlock again.
 
 - **Only from the computer the recorder runs on.** The unlock is accepted from a browser on that
   computer, at `http://localhost:<port>`, and refused from any other address or through a reverse
-  proxy: with `--bind 0.0.0.0` and no login, anyone on your network could otherwise try passwords.
+  proxy (one that sends no forwarding headers is still caught: the page must be asked for by a loopback name such as
+  `localhost`, and a proxy asks for its public one; with `keys.allowLanUnlock`, a name on your network): with `--bind 0.0.0.0` and no login, anyone on your network could otherwise try passwords.
   Over SSH, forward the port (`ssh -L 8080:localhost:8080 host`) and open `localhost`. Docker maps
   its connections from a gateway address, so a container uses a password file. If the interface
   is only on a network you trust, `keys.allowLanUnlock` (above) lets a private address unlock it too.
