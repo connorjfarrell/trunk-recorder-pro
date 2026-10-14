@@ -1,6 +1,6 @@
 # Checks for the decryption work: the tests, the browser (wasm32) build, the protocol schema, and a
 # scan of the whole history for secrets and live-system data. Runs only on request: press "Run workflow" on the Actions
-# tab (any branch), or put the label `run-ci` on a pull request (take it off and put it on again to
+# tab (any branch), or put the label `run-ci` on a pull request (`run-secrets` runs only the secrets scan) (take it off and put it on again to
 # run again). The repository's other workflows (build, docker) are unchanged.
 name: crypto-checks
 
@@ -42,7 +42,7 @@ jobs:
         working-directory: web
 
   secrets:
-    if: (github.event_name == 'workflow_dispatch' && inputs.which != 'tests') || github.event.label.name == 'run-ci'
+    if: (github.event_name == 'workflow_dispatch' && inputs.which != 'tests') || github.event.label.name == 'run-ci' || github.event.label.name == 'run-secrets'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
