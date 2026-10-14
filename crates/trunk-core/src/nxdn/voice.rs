@@ -58,7 +58,7 @@ impl NxdnVoice {
             framer: Framer::new(),
             frames: Vec::new(),
             sf: SacchAssembler::default(),
-            dec: mbe::Decoder::new(mbe::lcg(seed), mbe::Profile::Enhanced),
+            dec: mbe::Decoder::new_ambe(mbe::lcg(seed)),
             talkgroup: None,
             source: None,
             group: true,
@@ -176,6 +176,7 @@ impl NxdnVoice {
             2 | 4 if !special && s.short_id() != 0 => {
                 if s.repeater() == 31 {
                     // The end of a transmission ("go to repeater" 31).
+                    self.dec.release();
                     self.source = None;
                     self.encrypted = false;
                     return;
@@ -228,6 +229,7 @@ impl NxdnVoice {
             }
             Message::TxRel { .. } | Message::TxRelEx { .. } | Message::Disc { .. } => {
                 // End of the transmission: what it was doesn't carry over to the next.
+                self.dec.release();
                 self.source = None;
                 self.encrypted = false;
                 self.emergency = false;

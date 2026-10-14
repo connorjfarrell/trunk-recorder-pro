@@ -1,0 +1,18 @@
+[package]
+name = "blip25-mbe-module"
+description = "Trunk Recorder Pro vocoder module: IMBE through the blip25-mbe crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "blip25-mbe"
+path = "src/main.rs"
+
+[dependencies]
+vocoder-module-sdk = { path = "../sdk" }
+# Patent-encumbered: see this folder's README and the crate's PATENT_NOTICE.md.
+# Its 0.3 line isn't on crates.io yet (the name there is a 0.0.0 placeholder).
+blip25-mbe = { git = "https://github.com/openBLIP25/blip25-mbe.git", rev = "fc693babfd5edb5c535f3bc295981fa9d2918cad" }

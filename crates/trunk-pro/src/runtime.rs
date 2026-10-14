@@ -182,6 +182,7 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
     // `now_ms` is the one plus the other (wall time that never jumps).
     let epoch_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64);
     let epoch_at = Instant::now();
+    crate::vocoder_modules::select(&cfg.recording.vocoder);
     let mut session = Session::new(cfg.clone(), epoch_ms, &|name| fs::read_to_string(bandplan_path(name)).ok(), local_offset)?;
     session.attach(ctx.shared.clone());
     for (name, ring) in keys {

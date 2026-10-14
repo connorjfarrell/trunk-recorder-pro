@@ -1,0 +1,7 @@
+[package]
+name = "vocoder-module-sdk"
+description = "Write a Trunk Recorder Pro vocoder module: the stdio protocol, ready to implement a decoder against."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
