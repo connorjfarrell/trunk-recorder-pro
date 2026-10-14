@@ -69,6 +69,13 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   tone going, and tone frames no longer count as bad frames. The mbelib
   profile still plays none, as mbelib doesn't.
 
+- **Restart.** A Restart button beside Stop (while recording) stops and
+  starts again, so a run takes the settings changed since it began. When
+  you change a setting that only applies at start (radios, systems,
+  recording options like saving vocoder frames), a "Change requires
+  restart" banner offers Restart now. Settings the recorder takes live
+  (talkgroup files, plugins, the log) don't raise it.
+
 ## [0.1.11] — 2026-10-14
 
 - **Setup, reorganized.** Each Setup tab is now sections of cards, and
