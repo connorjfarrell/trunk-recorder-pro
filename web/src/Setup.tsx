@@ -2365,16 +2365,16 @@ export function Setup() {
                 <option value="fixed">Fixed-point</option>
                 <option value="enhanced">Enhanced</option>
                 <option value="mbelib">mbelib</option>
-                <option value="module">External module…</option>
+                {(!web || (c.recording.vocoder ?? "").startsWith("module:")) && <option value="module">External module…</option>}
               </select>
             </Field>
-            {(c.recording.vocoder ?? "").startsWith("module:") && (
+            {!web && (c.recording.vocoder ?? "").startsWith("module:") && (
               <Field label="Vocoder module" hint="The folder name in vocoders/ beside the config; built-in decoder if it can't run">
                 <input
                   className="mono"
                   value={c.recording.vocoder.slice("module:".length)}
                   placeholder="blip25-vocoder"
-                  onChange={(e) => updateConfig((x) => void (x.recording.vocoder = `module:${e.target.value.trim()}`))}
+                  onChange={(e) => updateConfig((x) => void (x.recording.vocoder = `module:${e.target.value.replace(/[^A-Za-z0-9._-]/g, "").replace(/^\.+/, "").slice(0, 64)}`))}
                 />
               </Field>
             )}

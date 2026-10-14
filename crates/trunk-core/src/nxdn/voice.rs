@@ -176,6 +176,7 @@ impl NxdnVoice {
             2 | 4 if !special && s.short_id() != 0 => {
                 if s.repeater() == 31 {
                     // The end of a transmission ("go to repeater" 31).
+                    self.dec.release();
                     self.source = None;
                     self.encrypted = false;
                     return;

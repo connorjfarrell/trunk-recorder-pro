@@ -1235,6 +1235,17 @@ pub fn default_capture_dir() -> PathBuf {
     home().join("TrunkRecorderPro")
 }
 
+/// The module id in a `recording.vocoder` of the form `module:<id>`.
+pub fn module_id(vocoder: &str) -> Option<&str> {
+    vocoder.get(..7).filter(|p| p.eq_ignore_ascii_case("module:")).map(|_| &vocoder[7..])
+}
+
+/// A vocoder module's folder name: 1 to 64 letters, digits, `-` `_` `.`, not
+/// starting with a dot, so it can't name a path outside `vocoders/`.
+pub fn valid_module_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && !id.starts_with('.') && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl Config {
     /// The config at `path`, with a linked channel file read in; the
     /// defaults when there's no file yet. A file that isn't a config is an
@@ -1444,6 +1455,11 @@ impl Config {
 
     /// Why this config can't start, or None.
     pub fn problem(&self) -> Option<String> {
+        if let Some(id) = module_id(&self.recording.vocoder) {
+            if !valid_module_id(id) {
+                return Some("Name the vocoder module: the folder in vocoders/, up to 64 letters, digits, - _ . (not starting with a dot).".into());
+            }
+        }
         if self.sources.is_empty() {
             return Some("Add a source (a dongle or a capture file).".into());
         }
@@ -1648,6 +1664,18 @@ pub fn auto_center(ccs: &[f64], rate_hz: f64, guard_hz: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vocoder_module_ids_are_folder_names() {
+        assert_eq!(module_id("Module:blip25"), Some("blip25"));
+        assert_eq!(module_id("fixed"), None);
+        for ok in ["blip25-vocoder", "a", "dvsi_3000.v2", &"x".repeat(64)] {
+            assert!(valid_module_id(ok), "{ok}");
+        }
+        for bad in ["", ".hidden", "..", "a/b", "a\\b", "a b", &"x".repeat(65)] {
+            assert!(!valid_module_id(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     #[test]

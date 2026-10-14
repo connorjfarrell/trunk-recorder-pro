@@ -833,6 +833,7 @@ impl Decoder {
     /// channels). The next frame opens a new one.
     pub fn release(&mut self) {
         self.external = None;
+        self.degraded = false;
     }
 
     /// The module's stream for `codec`, opened on first use; `None` when this

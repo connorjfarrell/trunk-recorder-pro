@@ -111,7 +111,9 @@ impl DmrVoice {
                 s.source = Some(src);
                 if from == LcFrom::Header {
                     // A new transmission: what an earlier one was (its
-                    // terminator lost in a fade) doesn't carry over.
+                    // terminator lost in a fade) doesn't carry over, nor does a
+                    // vocoder module's stream.
+                    s.dec.release();
                     s.encrypted = lc.encrypted();
                     s.emergency = lc.emergency();
                 } else {

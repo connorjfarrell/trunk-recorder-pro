@@ -72,7 +72,7 @@ pub fn select(vocoder: &str) {
 /// [`select`], with the modules in `root`.
 pub fn select_in(root: &Path, vocoder: &str) {
     external::set_provider(None);
-    let Some(id) = vocoder.get(..7).filter(|p| p.eq_ignore_ascii_case("module:")).map(|_| &vocoder[7..]) else { return };
+    let Some(id) = trunk_app::config::module_id(vocoder) else { return };
     match Module::find(root, id) {
         Ok(m) => {
             log::info!(
@@ -99,7 +99,7 @@ pub struct Module {
 
 impl Module {
     pub fn find(root: &Path, id: &str) -> Result<Module, String> {
-        if id.is_empty() || id.len() > 64 || id.starts_with('.') || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        if !trunk_app::config::valid_module_id(id) {
             return Err("the module's name must be letters, digits, - _ . only".into());
         }
         // Absolute: the module runs with its own folder as the working directory,
@@ -110,6 +110,9 @@ impl Module {
         let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
         if manifest.codecs.is_empty() {
             return Err("module.json lists no codecs".into());
+        }
+        if let Some(bad) = manifest.codecs.iter().find(|c| !["imbe", "ambe"].iter().any(|k| c.eq_ignore_ascii_case(k))) {
+            return Err(format!("module.json lists a codec I don't know, {bad:?} (\"imbe\" and \"ambe\")"));
         }
         let exe = dir.join(if cfg!(windows) { format!("{id}.exe") } else { id.to_string() });
         if !exe.is_file() {
@@ -418,6 +421,17 @@ done
         let mut p: PathBuf = std::iter::repeat_n("..", from.len() - common).collect();
         p.extend(&to[common..]);
         p
+    }
+
+    #[test]
+    fn a_manifest_with_an_unknown_codec_is_refused() {
+        let (root, _) = install("codec", None, ECHO);
+        std::fs::write(root.join("t/module.json"), r#"{"name": "t", "codecs": ["ambee"]}"#).unwrap();
+        let e = Module::find(&root, "t").err().expect("refused");
+        assert!(e.contains("ambee"), "{e}");
+        std::fs::write(root.join("t/module.json"), r#"{"name": "t", "codecs": ["IMBE", "ambe"]}"#).unwrap();
+        assert!(Module::find(&root, "t").is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

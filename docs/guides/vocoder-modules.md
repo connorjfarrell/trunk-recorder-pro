@@ -35,7 +35,9 @@ vocoders/
 
 Then choose it: in **Setup → Recording → P25 voice decoder** pick **External module…** and type
 the folder name, or set `"vocoder": "module:blip25-vocoder"` in `recording` (see
-[recording.md](../configuration/recording.md)). It takes effect when recording starts.
+[recording.md](../configuration/recording.md)). It takes effect when recording starts. A name that isn't a plain folder name (letters, digits,
+`- _ .`, up to 64, not starting with a dot) stops the start with a message; a valid name with no
+such folder just uses the built-in decoder, and says so in the log.
 
 One setting covers every codec the module lists: with `"codecs": ["imbe", "ambe"]` it decodes
 Phase 1 and also Phase 2, DMR and NXDN voice. A codec it doesn't list stays on the built-in decoder.
