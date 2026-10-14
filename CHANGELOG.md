@@ -13,6 +13,15 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   MS/s failed in testing, and 2.5 + 6 MS/s worked. A source at 2 MS/s or
   below runs its radio at 6 MS/s; use separate USB controllers if a
   pair doesn't fit.
+- **Encryption keys from a KFDtool container:** `keys` can name a KFDtool
+  key container (`.ekc`) instead of a JSON file, with `keysPasswordFile`
+  naming a file that holds its password. The keys stay encrypted on disk
+  and the password sits apart from them, so nothing in the config or the
+  keys file is a secret in the clear. A password file others can read is
+  refused. Keys the recorder can't decrypt (key-encryption keys, DES-XL)
+  are listed in the log and left out. `replay` takes
+  `--keys-password-file` too.
+
 - **Encryption keys are wiped from memory:** the keys in a system's keyring,
   the keys file's text and its parsed contents, and the cipher's key-derived
   state are overwritten when they are dropped, so a freed page doesn't keep a
