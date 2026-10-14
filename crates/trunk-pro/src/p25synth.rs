@@ -146,7 +146,6 @@ fn write_cu8(path: &str, iq: &[Complex32]) {
 fn run_phase2(a: &Args, path: &str, center: f64, freq: f64, fs: f64, start: Start, crypt: Option<Crypt>) {
     use trunk_core::nxdn::synth::ambe;
     use trunk_core::p25::synth_p2::{modulate, Call};
-    let _ = ();
     let call = Call {
         nac: ident(a, "nac", 0xfff, Some(0x293)),
         sys_id: ident(a, "sysid", 0xfff, Some(0x2a5)),

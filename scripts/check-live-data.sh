@@ -55,7 +55,7 @@ fail=0
 problem() { echo "::error::$*"; echo "FOUND: $*"; fail=1; }
 
 # ── What was added: "<file>\t<line>" for every added line in the range ──────────────────────────
-git log -p --no-color --format= -U0 "$range" -- . ':!Cargo.lock' ':!web/package-lock.json' | awk '
+git log -m -p --no-color --format= -U0 "$range" | awk '
   /^\+\+\+ b\// { f = substr($0, 7); next }
   /^\+\+\+ /    { f = ""; next }
   /^\+/         { print f "\t" substr($0, 2) }' > "$tmp/added.tsv"

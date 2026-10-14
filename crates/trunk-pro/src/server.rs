@@ -896,6 +896,48 @@ pub(crate) fn keys_result(v: &Value, result: Result<(), String>) -> Value {
 }
 
 /// What is held changed: the running session uses it from the next call, and browsers are told.
+/// Put back, in `new`, everything of the plugins `keys.shareDecrypted` allows (in `cur`) that the config says of them: the
+/// recorder-wide entry (executable path, settings) and each system's and conventional system's entry. An entry `cur` doesn't
+/// have is removed. True when anything differed.
+fn keep_authorized_plugins(cur: &Config, new: &mut Config) -> bool {
+    let mut changed = false;
+    for id in cur.keys.share_decrypted.keys() {
+        match (cur.plugins.get(id), new.plugins.get(id)) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), _) => {
+                new.plugins.insert(id.clone(), a.clone());
+                changed = true;
+            }
+            (None, Some(_)) => {
+                new.plugins.remove(id);
+                changed = true;
+            }
+            (None, None) => {}
+        }
+        for s in &mut new.systems {
+            let want = cur.systems.iter().find(|o| o.short_name == s.short_name).and_then(|o| o.plugins.get(id)).cloned();
+            if s.plugins.get(id) != want.as_ref() {
+                match want {
+                    Some(w) => s.plugins.insert(id.clone(), w),
+                    None => s.plugins.remove(id),
+                };
+                changed = true;
+            }
+        }
+        for s in &mut new.conventional {
+            let want = cur.conventional.iter().find(|o| o.short_name == s.short_name).and_then(|o| o.plugins.get(id)).cloned();
+            if s.plugins.get(id) != want.as_ref() {
+                match want {
+                    Some(w) => s.plugins.insert(id.clone(), w),
+                    None => s.plugins.remove(id),
+                };
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Queue `store` as what the engine is to hold, in place of any such command already waiting.
 fn queue_keys(cmds: &mut Vec<crate::runtime::EngineCmd>, store: Option<Arc<trunk_core::crypto::KeyStore>>) {
     cmds.retain(|c| !matches!(c, crate::runtime::EngineCmd::Keys(_)));
@@ -989,12 +1031,18 @@ async fn command(ctx: &Arc<Ctx>, v: &Value, listen: &mut Option<Listen>, subs: &
                 // can't change them from here: who may unlock the keys, and which plugins may be
                 // given decrypted calls.
                 if !peer.loopback() {
-                    let cur = ctx.config.lock().unwrap().keys.clone();
+                    let current = ctx.config.lock().unwrap().clone();
+                    let cur = &current.keys;
                     if c.keys.allow_lan_unlock != cur.allow_lan_unlock || c.keys.share_decrypted != cur.share_decrypted {
                         log::warn!("A settings change from another computer tried to change keys.allowLanUnlock or keys.shareDecrypted (set in the config file only): left as they were");
                     }
                     c.keys.allow_lan_unlock = cur.allow_lan_unlock;
-                    c.keys.share_decrypted = cur.share_decrypted;
+                    c.keys.share_decrypted = cur.share_decrypted.clone();
+                    // A plugin that is allowed decrypted calls is the executable and the settings the config says: another
+                    // computer can't point it somewhere else (another `path`, another server) while it keeps the permission.
+                    if keep_authorized_plugins(&current, &mut c) {
+                        log::warn!("A settings change from another computer tried to change a plugin that keys.shareDecrypted allows (its path or settings, recorder-wide or per system): left as they were");
+                    }
                 }
                 // While linked, a conventional system's channels are its file's
                 // (re-read: a spreadsheet may have changed it). Files are linked
@@ -1312,6 +1360,36 @@ mod tests {
         assert!(!is_local(&peer("127.0.0.1:5000"), &host("recorder.example.com"), true));
         assert!(!is_local(&peer("127.0.0.1:5000"), &host("192.168.1.2:8080"), false), "loopback, but not asked for by a loopback name");
         assert!(!is_local(&peer("127.0.0.1:5000"), &HeaderMap::new(), true), "no Host at all");
+    }
+
+    /// Another computer can't redirect a plugin that is allowed decrypted calls.
+    #[test]
+    fn an_authorized_plugins_entries_are_kept_from_other_computers() {
+        let cfg = |plugin_path: &str, server: &str, extra: bool| -> Config {
+            let mut c: Config = serde_json::from_value(serde_json::json!({
+                "keys": { "shareDecrypted": { "rdioscanner": "x" } },
+                "plugins": { "rdioscanner": { "enabled": true, "path": plugin_path }, "other": { "enabled": true, "path": "/bin/x" } },
+                "systems": [{ "shortName": "s1", "controlChannelsHz": [851000000], "plugins": { "rdioscanner": { "server": server } } }]
+            }))
+            .unwrap();
+            if extra {
+                c.systems.push(serde_json::from_value(serde_json::json!({ "shortName": "s2", "controlChannelsHz": [852000000], "plugins": { "rdioscanner": { "server": "http://evil" }, "other": { "k": 1 } } })).unwrap());
+            }
+            c
+        };
+        let cur = cfg("/opt/rdio", "http://10.0.0.5", false);
+        // The client changes the executable, the server, adds a system sending to its own server, and changes an unrelated plugin.
+        let mut new = cfg("/tmp/mine", "http://evil.example", true);
+        new.plugins.get_mut("other").unwrap().path = "/bin/y".into();
+        assert!(keep_authorized_plugins(&cur, &mut new));
+        assert_eq!(new.plugins["rdioscanner"], cur.plugins["rdioscanner"], "the executable is the configured one");
+        assert_eq!(new.systems[0].plugins["rdioscanner"], cur.systems[0].plugins["rdioscanner"], "and its server");
+        assert!(new.systems[1].plugins.get("rdioscanner").is_none(), "a new system gets no entry for it");
+        assert!(new.systems[1].plugins.get("other").is_some(), "an unrelated plugin is the client's to set");
+        assert_eq!(new.plugins["other"].path, "/bin/y");
+        // Nothing changed: nothing reported.
+        let mut same = cur.clone();
+        assert!(!keep_authorized_plugins(&cur, &mut same));
     }
 
     /// Key changes that come before the engine runs are not lost, and only the latest is kept.

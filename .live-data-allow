@@ -8,4 +8,7 @@
 ^\.live-data-allow$ ::: (A4A452206523E33BAD358AF571CB029A|321E62FAB980355BFA5EF396BCC07E65)
 # Made-up private addresses in the unit tests of the unlock check and the plugin guard: examples
 # only there (the same address in a config or a log would still be flagged).
-^crates/trunk-pro/src/(server|plugins/guard|plugins/host)\.rs$ ::: (192\.168\.1\.(5|9|20)|10\.(1\.2\.3|0\.0\.5)|172\.(16\.0\.9|20\.5\.7|31\.255\.1|17\.0\.1))([^0-9]|$)
+^crates/trunk-pro/src/(server|plugins/guard|plugins/host)\.rs$ ::: (192\.168\.1\.(2|5|9|20)|10\.(1\.2\.3|0\.0\.5)|172\.(16\.0\.9|20\.5\.7|31\.255\.1|17\.0\.1))([^0-9]|$)
+# The lockfiles' checksums and integrity hashes are the one thing in them that looks like a key.
+(^|/)Cargo\.lock$ ::: checksum = "[0-9a-f]{64}"
+(^|/)package-lock\.json$ ::: "integrity": "sha[0-9]+-[A-Za-z0-9+/=]+"

@@ -1,0 +1,3 @@
+# Findings gitleaks may ignore: one fingerprint per line (as its report prints it), each with a comment
+# saying why. Only the throwaway test container and its password belong here; nothing is listed
+# until a run reports it.

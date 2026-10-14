@@ -1,9 +1,6 @@
-# gitleaks' default rules, plus an allowlist for the one fixture: a throwaway key container whose
-# password is written in the tests (that one file). Nothing else.
+# gitleaks' default rules, with no suppressions of its own. The one fixture (a throwaway key container
+# whose password is written in the tests) is excused, if gitleaks reports it, by its fingerprint in
+# .gitleaksignore (the finding's `file:rule:line`, as the report prints it): a path or a regex here would
+# excuse the same thing anywhere else too.
 [extend]
 useDefault = true
-
-[allowlist]
-description = "the throwaway test container and its password"
-paths = ['''crates/trunk-core/src/crypto/testdata/dummy-test-keys\.ekc''']
-regexes = ['''testing1234''']
