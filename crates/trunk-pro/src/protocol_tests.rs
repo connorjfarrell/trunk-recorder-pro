@@ -283,6 +283,7 @@ fn ctx(cfg: Config, dir: &Path) -> Arc<crate::runtime::Ctx> {
         host_last: Mutex::new(None),
         spool: Mutex::new(None),
         keys: Default::default(),
+        session_dir: Mutex::new(None),
     })
 }
 
