@@ -2358,10 +2358,12 @@ export function Setup() {
               <input className="mono" value={c.recording.prerollS} onChange={(e) => updateConfig((x) => void (x.recording.prerollS = Math.max(0, Math.min(3, Number(e.target.value) || 0))))} />
             </Field>
             <Field label="P25 voice decoder" hint="Fixed-point usually sounds most natural">
-              <select value={c.recording.vocoder ?? "fixed"} onChange={(e) => updateConfig((x) => void (x.recording.vocoder = e.target.value as "fixed" | "enhanced" | "mbelib"))}>
+              <select value={c.recording.vocoder ?? "fixed"} onChange={(e) => updateConfig((x) => void (x.recording.vocoder = e.target.value as "fixed" | "enhanced" | "mbelib" | "blip25-mbe" | "blip25-vocoder"))}>
                 <option value="fixed">Fixed-point</option>
                 <option value="enhanced">Enhanced</option>
                 <option value="mbelib">mbelib</option>
+                <option value="blip25-mbe">blip25-mbe</option>
+                <option value="blip25-vocoder">blip25-vocoder</option>
               </select>
             </Field>
           </div>

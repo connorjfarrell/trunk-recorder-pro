@@ -4508,7 +4508,9 @@
           "enum": [
             "fixed",
             "enhanced",
-            "mbelib"
+            "mbelib",
+            "blip25-mbe",
+            "blip25-vocoder"
           ],
           "description": "IMBE vocoder for P25 Phase 1 voice."
         },

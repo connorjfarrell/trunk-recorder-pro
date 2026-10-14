@@ -7,6 +7,7 @@
 
 pub mod fixed;
 mod fixed_tables;
+mod blip25;
 
 use std::f64::consts::{E, PI};
 use std::sync::Arc;
@@ -726,15 +727,24 @@ pub enum Profile {
     /// thresholds as `Enhanced`; AMBE as `Enhanced`. Listeners on WMATA found
     /// it the most natural-sounding (tools/vocoder-shootout).
     Fixed,
+    /// IMBE through the openBLIP25 `blip25-mbe` crate: the spec's synthesis with
+    /// no post-filter and its own concealment. AMBE as `Enhanced`.
+    Blip25Mbe,
+    /// IMBE through the openBLIP25 `blip25-vocoder` crate (same family, bit-exact
+    /// with the reference vocoder, takes the FEC error severity directly).
+    /// AMBE as `Enhanced`.
+    Blip25Vocoder,
 }
 
 impl Profile {
-    /// "enhanced", "fixed" or "mbelib".
+    /// "enhanced", "fixed", "mbelib", "blip25-mbe" or "blip25-vocoder".
     pub fn from_name(name: &str) -> Option<Profile> {
         match name.to_ascii_lowercase().as_str() {
             "enhanced" => Some(Profile::Enhanced),
             "fixed" | "fixed-point" => Some(Profile::Fixed),
             "mbelib" => Some(Profile::Mbelib),
+            "blip25-mbe" => Some(Profile::Blip25Mbe),
+            "blip25-vocoder" => Some(Profile::Blip25Vocoder),
             _ => None,
         }
     }
@@ -744,6 +754,8 @@ impl Profile {
             Profile::Enhanced => "enhanced",
             Profile::Fixed => "fixed",
             Profile::Mbelib => "mbelib",
+            Profile::Blip25Mbe => "blip25-mbe",
+            Profile::Blip25Vocoder => "blip25-vocoder",
         }
     }
 }
@@ -767,6 +779,8 @@ pub struct Decoder {
     repeat_et: f64,
     /// The fixed-point IMBE decoder ([`Profile::Fixed`]).
     fixed: Option<Box<fixed::FixedImbe>>,
+    /// The openBLIP25 IMBE decoders ([`Profile::Blip25Mbe`], [`Profile::Blip25Vocoder`]).
+    blip25: Option<Box<blip25::Blip25>>,
 }
 
 /// Repeat thresholds for soft-decision FEC counts (the default). A soft
@@ -794,6 +808,11 @@ impl Decoder {
             repeat_e0: SOFT_REPEAT.0,
             repeat_et: SOFT_REPEAT.1,
             fixed: (profile == Profile::Fixed).then(|| Box::new(fixed::FixedImbe::new())),
+            blip25: match profile {
+                Profile::Blip25Mbe => Some(Box::new(blip25::Blip25::mbe())),
+                Profile::Blip25Vocoder => Some(Box::new(blip25::Blip25::vocoder())),
+                _ => None,
+            },
         };
         d.reset();
         d
@@ -811,6 +830,9 @@ impl Decoder {
         self.se = 10000.0;
         if let Some(f) = self.fixed.as_mut() {
             f.reset();
+        }
+        if let Some(b) = self.blip25.as_mut() {
+            b.reset();
         }
     }
 
@@ -830,6 +852,11 @@ impl Decoder {
                 fixed::Out::Repeat => Kind::Repeat,
                 fixed::Out::Muted => Kind::Muted,
             };
+        }
+        if let Some(b) = self.blip25.as_mut() {
+            let et = if erased { 0 } else { et };
+            let bad = erased || e0 >= self.repeat_e0 || et as f64 >= self.repeat_et;
+            return b.imbe(d, et, erased, bad, out);
         }
         if self.profile == Profile::Mbelib {
             let errs2 = if erased { 99 } else { et };
@@ -960,6 +987,51 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An arbitrary valid IMBE frame (pitch index well inside [0, 207]).
+    fn imbe_frame(k: usize) -> [u8; 88] {
+        let mut d = [0u8; 88];
+        for (i, b) in d.iter_mut().enumerate() {
+            *b = ((i * 7 + k * 13 + i * i) % 5 < 2) as u8;
+        }
+        d[..12].copy_from_slice(&[0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        d
+    }
+
+    #[test]
+    fn profile_names_round_trip() {
+        for p in [Profile::Enhanced, Profile::Fixed, Profile::Mbelib, Profile::Blip25Mbe, Profile::Blip25Vocoder] {
+            assert_eq!(Profile::from_name(p.name()), Some(p));
+        }
+        assert_eq!(Profile::from_name("BLIP25-MBE"), Some(Profile::Blip25Mbe));
+        assert_eq!(Profile::from_name("nope"), None);
+    }
+
+    /// The openBLIP25 profiles speak on clean frames and conceal erased ones.
+    #[test]
+    fn blip25_profiles_decode_and_conceal() {
+        for profile in [Profile::Blip25Mbe, Profile::Blip25Vocoder] {
+            let mut dec = Decoder::new(lcg(1), profile);
+            let mut peak = 0f32;
+            for k in 0..20 {
+                let mut out = [0f32; FRAME_SAMPLES];
+                let kind = dec.imbe(&imbe_frame(k), 0, 0, false, &mut out);
+                assert_eq!(kind, Kind::Voice, "{profile:?} frame {k}");
+                peak = out.iter().fold(peak, |m, v| m.max(v.abs()));
+            }
+            assert!(peak > 1.0, "{profile:?} is silent on clean frames (peak {peak})");
+            let mut out = [0f32; FRAME_SAMPLES];
+            let kind = dec.imbe(&imbe_frame(0), 0, 0, true, &mut out);
+            assert_ne!(kind, Kind::Voice, "{profile:?} played an erased frame");
+            // A frame the repeat rule rejects (E0 past the threshold) is concealed too.
+            dec.reset();
+            dec.imbe(&imbe_frame(1), 0, 0, false, &mut out);
+            let kind = dec.imbe(&imbe_frame(2), 6, 20, false, &mut out);
+            if profile == Profile::Blip25Mbe {
+                assert_ne!(kind, Kind::Voice, "{profile:?} played a frame over the repeat thresholds");
+            }
+        }
+    }
 
     /// 200 frames of one steady frame (harmonics voiced where
     /// `l % voiced_mod == 0`; 0: all unvoiced) through the enhanced synthesis,
