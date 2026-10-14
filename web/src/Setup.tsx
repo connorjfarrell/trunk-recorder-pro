@@ -2458,16 +2458,16 @@ export function Setup() {
               </Field>
               <Field label="P25 voice decoder" hint="Fixed-point usually sounds most natural">
                 <select
-                  value={(c.recording.vocoder ?? "fixed").startsWith("module:") ? "module" : (c.recording.vocoder ?? "fixed")}
+                  value={/^module:/i.test(c.recording.vocoder ?? "") ? "module" : (c.recording.vocoder ?? "fixed")}
                   onChange={(e) => updateConfig((x) => void (x.recording.vocoder = e.target.value === "module" ? "module:" : (e.target.value as "fixed" | "enhanced" | "mbelib")))}
                 >
                   <option value="fixed">Fixed-point</option>
                   <option value="enhanced">Enhanced</option>
                   <option value="mbelib">mbelib</option>
-                  {(!web || (c.recording.vocoder ?? "").startsWith("module:")) && <option value="module">External module…</option>}
+                  {(!web || /^module:/i.test(c.recording.vocoder ?? "")) && <option value="module">External module…</option>}
                 </select>
               </Field>
-              {!web && (c.recording.vocoder ?? "").startsWith("module:") && (
+              {!web && /^module:/i.test(c.recording.vocoder ?? "") && (
                 <Field label="Vocoder module" hint="The folder name in vocoders/ beside the config; built-in decoder if it can't run">
                   <input
                     className="mono"
