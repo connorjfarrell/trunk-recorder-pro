@@ -356,7 +356,6 @@ impl TdmaTracker {
                 }
                 MAC_END_PTT => {
                     s.active = false;
-                    s.dec.release();
                     s.algid = ALGID_CLEAR;
                     s.set_es(None, keys);
                     s.last_vb = None;
@@ -365,6 +364,8 @@ impl TdmaTracker {
                     for (f, bits, errs) in std::mem::take(&mut s.held) {
                         self.bad_frames += s.voice(c, f, bits, errs, out) as u64;
                     }
+                    // After the held voice: decoding it would open a module stream again.
+                    s.dec.release();
                     s.talker = None;
                 }
                 MAC_ACTIVE => s.first4v = if pdu.offset > 4 { 0 } else { pdu.offset as i32 },

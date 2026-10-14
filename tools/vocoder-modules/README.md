@@ -19,6 +19,7 @@ interoperability study.** Read them before building one; building and installing
 ## Build and install
 
 ```
+cd tools/vocoder-modules
 cargo build --release
 ```
 
