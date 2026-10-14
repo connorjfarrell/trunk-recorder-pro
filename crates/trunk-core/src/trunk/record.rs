@@ -73,15 +73,29 @@ impl Reception {
 /// gaps between voice frames inside one (P25 delivers 180 ms at a time).
 const TRANSMISSION_GAP_S: f64 = 0.5;
 
+/// What the air said of one transmission.
+#[derive(Clone, Copy, Debug, Default)]
+struct TxFlags {
+    encrypted: bool,
+    decrypted: bool,
+}
+
+impl TxFlags {
+    /// Left out: encrypted, not decrypted.
+    fn dropped(self) -> bool {
+        self.encrypted && !self.decrypted
+    }
+}
+
 /// Where in a call's audio each transmission starts (sample index), and
-/// which were encrypted.
+/// which were encrypted, and of those which decrypted.
 #[derive(Clone, Debug, Default)]
 pub struct Transmissions {
     pub starts: Vec<usize>,
-    /// Per start: the transmission was encrypted.
-    encrypted: Vec<bool>,
-    /// Encryption was announced before the next transmission's audio came.
-    encrypted_next: bool,
+    /// Per start.
+    flags: Vec<TxFlags>,
+    /// Announced before the next transmission's audio came.
+    next: TxFlags,
     last_s: Option<f64>,
 }
 
@@ -90,32 +104,43 @@ impl Transmissions {
     pub fn note(&mut self, at: usize, t_s: f64) {
         if self.last_s.is_none_or(|l| t_s - l > TRANSMISSION_GAP_S) && self.starts.last() != Some(&at) {
             self.starts.push(at);
-            self.encrypted.push(std::mem::take(&mut self.encrypted_next));
+            self.flags.push(std::mem::take(&mut self.next));
         }
         self.last_s = Some(t_s);
+    }
+
+    /// The flags of the transmission going on at `t_s`, or (none is) the next one's.
+    fn at(&mut self, t_s: f64) -> &mut TxFlags {
+        match self.flags.last_mut() {
+            Some(f) if self.last_s.is_some_and(|l| t_s - l <= TRANSMISSION_GAP_S) => f,
+            _ => &mut self.next,
+        }
     }
 
     /// The air said, at `t_s`, that the call is encrypted: the transmission
     /// going on then, or (none is) the next one.
     pub fn mark_encrypted(&mut self, t_s: f64) {
-        match self.encrypted.last_mut() {
-            Some(e) if self.last_s.is_some_and(|l| t_s - l <= TRANSMISSION_GAP_S) => *e = true,
-            _ => self.encrypted_next = true,
-        }
+        self.at(t_s).encrypted = true;
     }
 
-    /// The transmission going on now is encrypted.
-    pub fn current_encrypted(&self) -> bool {
-        self.encrypted.last().copied().unwrap_or(self.encrypted_next)
+    /// The voice tracker decrypted, at `t_s`: the transmission going on
+    /// then, or (none is) the next one.
+    pub fn mark_decrypted(&mut self, t_s: f64) {
+        self.at(t_s).decrypted = true;
+    }
+
+    /// The transmission going on now is left out: encrypted, not decrypted.
+    pub fn current_dropped(&self) -> bool {
+        self.flags.last().copied().unwrap_or(self.next).dropped()
     }
 
     /// The parts of a call's `len` samples of audio to keep: every
     /// transmission but those shorter than `min_s` (Trunk Recorder's
     /// minTransmissionDuration: key-ups, data bursts) and the encrypted ones
-    /// (what a vocoder makes of them before the cipher is known is noise).
-    /// None: all of it.
+    /// that weren't decrypted (what a vocoder makes of them before the
+    /// cipher is known is noise). None: all of it.
     pub fn kept(&self, len: usize, min_s: f64, rate: u32) -> Option<Vec<std::ops::Range<usize>>> {
-        if (min_s <= 0.0 && !self.encrypted.contains(&true)) || self.starts.is_empty() {
+        if (min_s <= 0.0 && !self.flags.iter().any(|f| f.dropped())) || self.starts.is_empty() {
             return None;
         }
         let min = (min_s.max(0.0) * rate as f64) as usize;
@@ -123,8 +148,8 @@ impl Transmissions {
         let mut bounds: Vec<usize> = self.starts.iter().copied().filter(|&s| s > 0 && s < len).collect();
         bounds.insert(0, 0);
         bounds.push(len);
-        let encrypted = |at: usize| self.starts.iter().zip(&self.encrypted).find(|&(&s, _)| s == at).is_some_and(|(_, &e)| e);
-        Some(bounds.windows(2).filter(|w| w[1] - w[0] >= min && !encrypted(w[0])).map(|w| w[0]..w[1]).collect())
+        let dropped = |at: usize| self.starts.iter().position(|&s| s == at).is_some_and(|i| self.flags[i].dropped());
+        Some(bounds.windows(2).filter(|w| w[1] - w[0] >= min && !dropped(w[0])).map(|w| w[0]..w[1]).collect())
     }
 }
 
@@ -160,7 +185,7 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
     let _ = write!(
         j,
         "{{\"call_num\":{},\"freq\":{},\"freq_error\":{},\"signal\":{},\"noise\":{},\"snr\":{},\"clean_voice_pct\":{},\"source_num\":0,\"recorder_num\":{},\"tdma_slot\":{},\"phase2_tdma\":{},\
-\"start_time\":{},\"stop_time\":{},\"start_time_ms\":{},\"stop_time_ms\":{},\"emergency\":{},\"priority\":{},\"mode\":{},\"duplex\":{},\"encrypted\":{},\
+\"start_time\":{},\"stop_time\":{},\"start_time_ms\":{},\"stop_time_ms\":{},\"emergency\":{},\"priority\":{},\"mode\":{},\"duplex\":{},\"encrypted\":{},\"algid\":{},\"key_id\":{},\"decrypted\":{},\
 \"call_length\":{},\"call_length_ms\":{},\"talkgroup\":{},\"talkgroup_tag\":\"{}\",\"talkgroup_description\":\"{}\",\"talkgroup_group_tag\":\"{}\",\
 \"talkgroup_group\":\"{}\",\"color_code\":{},\"ran\":{},\"tone_mode\":\"{}\",\"tone_detected\":\"{}\",\"tone_confidence\":{:.3},\
 \"audio_type\":\"{}\",\"short_name\":\"{}\",",
@@ -183,6 +208,10 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
         call.mode as u8,
         call.duplex as u8,
         call.encrypted as u8,
+        // The cipher its encryption sync named (-1: none heard).
+        call.cipher.map_or(-1, |c| c.algid as i32),
+        call.cipher.map_or(-1, |c| c.keyid as i32),
+        call.decrypted as u8,
         secs.round() as i64,
         (secs * 1000.0).round() as i64,
         call.talkgroup,
@@ -221,14 +250,15 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (String, String) {
     for (i, s) in call.sources.iter().enumerate() {
         let _ = write!(
             j,
-            "{}{{\"src\":{},\"time\":{},\"pos\":{},\"emergency\":{},\"signal_system\":\"\",\"tag\":\"{}\",\"tag_ota\":\"{}\"}}",
+            "{}{{\"src\":{},\"time\":{},\"pos\":{},\"emergency\":{},\"signal_system\":\"\",\"tag\":\"{}\",\"tag_ota\":\"{}\"{}}}",
             if i > 0 { "," } else { "" },
             s.src,
             ms(s.time_s).div_euclid(1000),
             ((s.time_s - call.start_s) * 100.0).round().max(0.0) / 100.0,
             s.emergency as u8,
             esc(&UnitTags::name(info.unit_tags, info.units, s.src).unwrap_or_default()),
-            esc(info.units.and_then(|u| u.get(s.src)).unwrap_or(""))
+            esc(info.units.and_then(|u| u.get(s.src)).unwrap_or("")),
+            s.position.map_or(String::new(), |(lat, lon)| format!(",\"lat\":{lat:.6},\"lon\":{lon:.6}"))
         );
     }
     j.push_str("]}");
@@ -266,6 +296,46 @@ mod tests {
         // The last one turns out encrypted: only it goes.
         tx.mark_encrypted(5.3);
         assert_eq!(tx.kept(audio.len(), 0.0, 8000), Some(vec![0..8000, 8000..9600]));
+        assert!(tx.current_dropped());
+        // Unless it was decrypted.
+        tx.mark_decrypted(5.4);
+        assert!(!tx.current_dropped());
+        assert_eq!(tx.kept(audio.len(), 0.0, 8000), None);
+        // Announced before its audio: the next transmission's.
+        let mut tx = Transmissions::default();
+        tx.mark_encrypted(0.0);
+        tx.mark_decrypted(0.0);
+        tx.note(0, 0.1);
+        assert!(!tx.current_dropped());
+    }
+
+    #[test]
+    fn a_sources_position_is_in_the_call_json() {
+        use crate::position::Position;
+        use crate::trunk::calls::CallManager;
+        let mut call = Call { talkgroup: 101, ..Default::default() };
+        for src in [7, 8] {
+            CallManager::note_source(&mut call, src, 0.0, false);
+        }
+        assert!(CallManager::note_position(&mut call, &Position { unit: 8, lat: 30.0529, lon: -83.17565, source: "HarrisP25_TDMA" }));
+        assert!(!CallManager::note_position(&mut call, &Position { unit: 8, lat: 30.0529, lon: -83.17565, source: "HarrisP25_TDMA" }), "the same again");
+        assert!(!CallManager::note_position(&mut call, &Position { unit: 9, lat: 1.0, lon: 1.0, source: "HarrisP25_TDMA" }), "not on the call");
+        let errors = FrameErrors::default();
+        let info = ConcludeInfo {
+            short_name: "s",
+            epoch_ms_at_zero: 0.0,
+            audio_seconds: 1.0,
+            errors: &errors,
+            recorder_num: 0,
+            end_s: 1.0,
+            units: None,
+            unit_tags: None,
+            freq_error_hz: 0,
+            reception: Reception::default(),
+        };
+        let (json, _) = call_record(&call, &info);
+        assert!(json.contains("\"src\":7,") && json.matches("\"lat\"").count() == 1, "{json}");
+        assert!(json.contains("\"tag_ota\":\"\",\"lat\":30.052900,\"lon\":-83.175650}]"), "{json}");
     }
 }
 

@@ -164,6 +164,10 @@ export interface System {
   /** Multi-site: sites with one group are one system (a call on several is saved once).
    *  Absent: grouped by what the control channels say (P25 WACN + System ID, SmartNet System ID). */
   siteGroup?: string;
+  /** Desktop: its P25 encryption keys file, absolute or relative to the config file's folder (read when recording starts; never sent here). */
+  keys?: string;
+  /** Desktop: the file holding the password of `keys` when that is a KFDtool key container (`.ekc`); never sent here. */
+  keysPasswordFile?: string;
   /** Plugins' settings for this system, by plugin id (each plugin's `system_config` schema); a list for several copies of one. */
   plugins?: Record<string, SystemPluginValues>;
 }
@@ -175,6 +179,8 @@ export interface PluginSetup {
   settings?: PluginValues;
   /** Run this executable instead of the installed plugin (a build of the user's own). */
   path?: string;
+  /** Config file only: the sentence (docs/plugins/README.md, "Decrypted calls") that lets this plugin be given calls decrypted with the recorder's keys. Without it, none are. */
+  shareDecrypted?: string;
 }
 
 /** The settings each system can set again for itself (crates/trunk-app/src/config.rs RecordingOverride). */
@@ -285,6 +291,10 @@ export interface Conventional {
   /** Its own recording rules; each left out is the Recording tab's. */
   recording?: RecordingOverride;
   unitNames?: UnitNames;
+  /** Desktop: its P25 channels' encryption keys file (as System's). */
+  keys?: string;
+  /** Desktop: the password file for `keys`, when that is a key container (as System's). */
+  keysPasswordFile?: string;
 }
 
 export interface Config {
@@ -299,6 +309,8 @@ export interface Config {
     autoStart: boolean;
     /** Web pages from other origins that may use the API ("http://host:port", "null" a file, "*" any). */
     allowedOrigins?: string[];
+    /** Config file only: let a private-network address, not only the recorder's own computer, unlock and lock key containers (plain HTTP: the password is not encrypted on the way). */
+    allowLanUnlock?: boolean;
     /** Interfaces of your own, served at /ui/<name>/ (docs/api). */
     interfaces?: CustomInterface[];
     /** What / shows: "" the built-in interface (always at /builtin/ too), else an interface's name. */
@@ -453,10 +465,12 @@ export interface SourceStatus {
   /** When it was, Unix seconds. */
   lastErrorS?: number | null;
   ended: boolean;
-  /** Its frequency error as measured on the control channels, ppm (+: signals come in high); null until measured. */
+  /** Its frequency error, ppm (+: signals come in high): the median of its last control channel and call measurements; null until measured. */
   errorPpm?: number | null;
   /** The correction autoTune applies now, ppm. */
   tunePpm?: number;
+  /** The correction is an earlier run's score (nothing measured yet). */
+  tuneSeeded?: boolean;
 }
 
 export interface CallView {
@@ -478,6 +492,8 @@ export interface CallView {
   state: "recording" | "monitoring";
   reason: "ignored" | "unknown_tg" | "encrypted" | "no_source" | "no_recorder" | null;
   encrypted: boolean;
+  /** Its encrypted voice is being decrypted (the system has the key). */
+  decrypted: boolean;
   emergency: boolean;
   startS: number;
   sources: number[];
@@ -521,6 +537,11 @@ export interface CallRecord {
   /** 1 / 0. */
   emergency: number;
   encrypted: number;
+  /** The cipher its encryption sync named: P25 ALGID and key ID; -1 when none was heard (absent in calls saved before). */
+  algid?: number;
+  key_id?: number;
+  /** 1: its encrypted voice was decrypted, at least in part (absent in calls saved before). */
+  decrypted?: number;
   phase2_tdma: number;
   duplex: number;
   /** Its P25 priority and service-option mode bit. */
@@ -554,9 +575,9 @@ export interface CallRecord {
   errorList: { pos: number; len: number; frames: number; error_count: number; bad_frames: number; max_frame_errors: number }[];
   /**
    * The radios that talked: `time` Unix s, `pos` s into the audio. `tag`: the unit's name (the unit names
-   * file or the alias heard, by the system's mode); `tag_ota`: the alias heard.
+   * file or the alias heard, by the system's mode); `tag_ota`: the alias heard. `lat`, `lon`: where the radio said it was (GPS, decimal degrees), when it did.
    */
-  srcList: { src: number; time: number; pos: number; emergency: number; signal_system: string; tag: string; tag_ota: string }[];
+  srcList: { src: number; time: number; pos: number; emergency: number; signal_system: string; tag: string; tag_ota: string; lat?: number; lon?: number }[];
 }
 
 /** A recorded call: `path` (no extension) under the capture folder. */
@@ -565,8 +586,8 @@ export interface CallEntry {
   record: CallRecord;
   /**
    * Whether its audio / its JSON stay in the recordings folder once the
-   * upload plugins are done (Keep the audio / the call JSON after uploading).
-   * False: they're gone, or soon will be. Missing: kept (the browser version).
+   * plugins are done (Keep audio / Keep call JSON). False: they're gone, or
+   * soon will be. Missing: kept (the browser version).
    */
   audio?: boolean;
   json?: boolean;
@@ -655,6 +676,8 @@ export interface SurveyMonitor {
   idens: number;
   good: number;
   bad: number;
+  /** Seconds of air the decoded messages account for (P25), of `elapsedS`. */
+  airS?: number;
   modulation: string;
   snrDb: number | null;
   offsetHz: number | null;
@@ -1030,10 +1053,23 @@ export interface TgRow {
   secs: number;
   totalCalls: number;
   encPct: number;
+  /** The ciphers its calls' encryption sync named, most recent first. */
+  ciphers: CipherSeen[];
   /** First heard in the last day (once the system has a baseline). */
   new: boolean;
   /** Calls per hour, oldest first. */
   hourly: number[];
+}
+
+/** A cipher heard on a talkgroup: P25 ALGID and key ID. */
+export interface CipherSeen {
+  algid: number;
+  keyId: number;
+  /** What the ALGID is called ("ADP", "AES-256", …). */
+  name: string;
+  calls: number;
+  /** Unix seconds. */
+  last: number;
 }
 
 /** A radio as heard (radioQuery units / unit). */
@@ -1128,6 +1164,32 @@ export interface RadioResultBody {
   histogram?: LengthHistogram;
 }
 
+/** Which key containers (KFDtool `.ekc`) the systems name that wait for a typed password (those with no `keysPasswordFile`). */
+export interface KeysStatus {
+  containers: KeyContainer[];
+  /** Counts every change of what is held, to know when to ask keysQuery again. */
+  version: number;
+}
+
+export interface KeyContainer {
+  /** The systems' `keys` setting, as written. */
+  file: string;
+  /** The systems that use it (short names). */
+  systems: string[];
+  state: "locked" | "unlocked";
+  /** Keys held from it. */
+  count: number;
+}
+
+/** A key held: which, not what. */
+export interface HeldKey {
+  file: string;
+  /** The P25 algorithm id (0x81 DES-OFB, 0x84 AES-256, 0xAA ADP). */
+  algId: number;
+  keyId: number;
+  name: string;
+}
+
 export type FromRecorder =
   | {
       type: "hello";
@@ -1151,8 +1213,16 @@ export type FromRecorder =
       host?: { type: "host"; t: number; values: Record<string, number>; platform: PlatformInfo } | null;
       /** Every plugin's runtime, by id (desktop app). */
       pluginRuntime?: Record<string, PluginRuntime>;
+      /** Which key containers are locked or open (desktop app). */
+      keys?: { type: "keys" } & KeysStatus;
     }
   | { type: "radios"; radios: Radios }
+  /** Which key containers wait for a password and which are open changed. Never the keys. */
+  | ({ type: "keys" } & KeysStatus)
+  /** Answers keysQuery: the keys held by algorithm, key id and name (never the keys), to a connection from the recorder's own computer only; `restricted` otherwise. `canUnlock`: whether this connection may unlock and lock (decided from where it is from and `server.allowLanUnlock`). */
+  | { type: "keysList"; version: number; keys: HeldKey[]; restricted?: boolean; canUnlock?: boolean }
+  /** Answers keysUnlock / keysLock, with the `id` the command carried. */
+  | { type: "keysResult"; id?: number; ok: boolean; message: string | null }
   | ({ type: "state" } & PhaseState)
   | { type: "config"; config: Config }
   | { type: "status"; status: EngineStatus; sources: SourceStatus[]; load: number; calls: CallView[] }
@@ -1248,6 +1318,12 @@ export interface PlaybackResultBody {
 
 export type ToRecorder =
   | { type: "setConfig"; config: Config }
+  /** The keys held, as a keysList (answered in full only to the recorder's own computer). */
+  | { type: "keysQuery" }
+  /** Open the key container `file` (a system's `keys` setting, as written) with its password. Only from the recorder's own computer (not over a network or a proxy), unless `server.allowLanUnlock`; the password is neither stored nor sent back. */
+  | { type: "keysUnlock"; file: string; password: string; id?: number }
+  /** Forget the keys of container `file` (all, without it): calls in progress stop decrypting. Same rule as keysUnlock. */
+  | { type: "keysLock"; file?: string; id?: number }
   | { type: "start" }
   | { type: "stop" }
   | { type: "devices" }

@@ -70,7 +70,7 @@ fn to_js(out: &mut Vec<Output>, history: &mut History) -> Array {
                 set(&obj, "t", "text");
                 set(&obj, "json", t);
             }
-            Output::Audio { system, short_name, tg, frame } => {
+            Output::Audio { system, short_name, tg, frame, .. } => {
                 set(&obj, "t", "audio");
                 set(&obj, "system", system);
                 set(&obj, "shortName", short_name);
@@ -202,6 +202,14 @@ impl WebSession {
     /// Those codes as JSON to save, when they changed since the last call.
     pub fn heard_unsaved(&mut self) -> Option<String> {
         self.s.heard_unsaved()
+    }
+    /// Start AutoTune sources from the scores [`WebSession::tune_unsaved`] gave on an earlier run.
+    pub fn load_tune(&mut self, json: &str) {
+        self.s.load_tune(json);
+    }
+    /// The sources' AutoTune scores as JSON to save, when they changed since the last call.
+    pub fn tune_unsaved(&mut self) -> Option<String> {
+        self.s.tune_unsaved()
     }
     /// Each system's band plan, as JSON `{shortName: plan}`.
     pub fn bandplans(&self) -> String {

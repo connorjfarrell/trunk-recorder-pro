@@ -26,7 +26,7 @@ under **Recording override**.
 | `maxRecorders` | | `32` | integer | Calls recorded at once, across all trunked systems. The interface allows 1–64 |
 | `callTimeoutS` | | `3` | number | Per system. A call ends this long after its last grant or audio, s. The interface allows 1–30 |
 | `recordUnknown` | | `true` | bool | Per system. Record talkgroups that aren't in the talkgroup file. Only matters when there is a talkgroup file; a talkgroup patched with a listed one is recorded anyway |
-| `recordEncrypted` | | `false` | bool | Per system. Keep calls flagged encrypted (by the grant or the talkgroup's `Mode`), with their radios, even with no audio. Encrypted transmissions are always left out of the audio. Config only: not in the interface |
+| `recordEncrypted` | | `false` | bool | Per system. Keep calls flagged encrypted (by the grant or the talkgroup's `Mode`), with their radios, even with no audio. Encrypted transmissions are always left out of the audio, unless decrypted (see [systems.md](systems.md#encryption-keys-keys)). Config only: not in the interface |
 | `recordUnitToUnit` | | `true` | bool | Per system. Record P25 unit-to-unit (private) calls |
 | `keepSilentCalls` | | `false` | bool | Per system. Keep calls with no audio (encrypted, or nothing decoded) |
 | `minCallS` | | `0` | number | Per system. Delete calls with less audio than this, s, before they're uploaded. `0` keeps all. The interface allows 0–60 |
@@ -36,9 +36,9 @@ under **Recording override**.
 | `digitalLevelDb` | | `0` | number | Per system. Then raise or lower digital calls by this much, dB; the limiter keeps them from clipping. Applied up to ±40; the interface allows ±20 |
 | `analogLevelDb` | | `0` | number | Per system. The same for analog calls |
 | `compressWav` | | `false` | bool | Per system. Also save an `.m4a` of every call. Needs an encoder: see `m4a` |
-| `audioArchive` | | `true` | bool | Per system. Keep the audio once every upload plugin has had the call. `false`: deleted then |
-| `callLog` | | `true` | bool | Per system. Keep the call JSON once every upload plugin has had the call |
-| `archiveFilesOnFailure` | | `true` | bool | Per system. When an upload failed, keep the files whatever the two above say |
+| `audioArchive` | | `true` | bool | Per system. **Keep audio**: keep it once the plugins are done with the call. `false`: deleted then (with no plugin, never saved) |
+| `callLog` | | `true` | bool | Per system. **Keep call JSON**: the same, for the call JSON |
+| `archiveFilesOnFailure` | | `true` | bool | Per system. **Keep when a plugin fails**: a plugin's failure keeps the audio and JSON whatever the two above say (a skip doesn't) |
 | `filenameFormat` | | `""` | string | Per system. Folders and file names under `captureDir`. See [File names](#file-names) |
 | `dropDuplicateCalls` | | `true` | bool | Multi-site: a call heard on several sites of one system is saved once, keeping the cleanest copy or the talkgroup's Preferred Site. See [systems.md](systems.md#multi-site) |
 | `vocoder` | | `"fixed"` | string | The IMBE voice decoder for P25 Phase 1 (trunked and conventional): `"fixed"` (fixed-point, usually sounds most natural), `"enhanced"` or `"mbelib"`. An unknown value is `"fixed"` |
@@ -47,7 +47,8 @@ under **Recording override**.
 | `ramSpool` | | see below | object | Keep files only the upload plugins need in RAM instead of `captureDir` |
 
 When a call flagged encrypted at its grant isn't kept (`recordEncrypted` off), it isn't recorded at
-all. One that turns encrypted part-way is kept with its clear transmissions.
+all, unless its system has [encryption keys](systems.md#encryption-keys-keys). One that turns
+encrypted part-way is kept with its clear transmissions.
 
 ### `m4a`
 
@@ -61,8 +62,8 @@ Each call is encoded once, and the same `.m4a` serves `compressWav` and every pl
 
 ### `ramSpool`
 
-With `audioArchive` or `callLog` off, some files exist only so the upload plugins can send them, and
-are deleted right after. The RAM spool keeps those in memory instead of writing them to the disk
+With `audioArchive` or `callLog` off, some files exist only so the plugins can have them, and are
+deleted right after (see [The archive](../guides/recordings.md#the-archive-whats-kept-and-whats-deleted)). The RAM spool keeps those in memory instead of writing them to the disk
 (easier on an SD card or SSD).
 
 | Key | Required | Default | Type | Description |
@@ -71,7 +72,7 @@ are deleted right after. The RAM spool keeps those in memory instead of writing 
 | `sizeMb` | | `256` | integer | Its size, MB (Linux: the most it may hold). Read as 16–65536; the interface allows 16–8192 |
 | `dir` | | `""` | string | A RAM-backed folder of your own (a tmpfs mount) instead. Config only |
 
-- A failed upload's files are moved to `captureDir`, following `archiveFilesOnFailure`.
+- A call a plugin failed on has its files moved to `captureDir`, following `archiveFilesOnFailure`.
 - When the spool is full, calls go straight to `captureDir`.
 - It applies at the next **Start**. If it can't be made, the log says why and calls go to
   `captureDir`.

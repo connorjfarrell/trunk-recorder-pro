@@ -177,7 +177,7 @@ trunk-pro replay --source cap1.cu8,center,rate[,format] [--source …] --cc Hz[,
 | `--source file,center,rate[,format]` | | A capture with its own centre and rate; repeat for several radios. They're fed in step, as they would be live. |
 | `--format cu8\|cs16\|cf32` | from the extension | Sample format: `cu8` (rtl_sdr), `cs16` (`.cs16`, `.sc16`), `cf32` (`.cf32`, `.cfile`, `.fc32`). Anything else is refused. |
 | `--guard Hz` | 75000 | Left unused at each edge of a source's band (the guard band) |
-| `--auto-tune` | off | Correct the sources' frequency error as measured on the control channels. The error is reported at the end either way. |
+| `--auto-tune` | off | Correct the sources' frequency error as measured on the control channels and calls. The error is reported at the end either way. |
 
 ### A trunked system
 
@@ -243,6 +243,8 @@ called `conv`.
 | `--epoch s` | 0 | The Unix time the capture started, for call times and file names |
 | `--no-unknown` | off | Don't record talkgroups that aren't in the talkgroup file |
 | `--record-encrypted` | off | Record (and keep) encrypted calls |
+| `--keys file` | none | Decrypt P25 voice with these [keys](configuration/systems.md#encryption-keys-keys) (every system): a JSON file, or a [KFDtool container](configuration/systems.md#keys-in-a-kfdtool-container) with `--keys-password-file` |
+| `--keys-password-file file` | none | The file holding the password of a key container given to `--keys` |
 | `--keep-silent` | off | Keep calls with no audio |
 | `--min-call s` | 0 | Drop calls shorter than this |
 | `--max-call s` | 0 (no limit) | Split calls longer than this |
@@ -330,6 +332,7 @@ stdout with a summary on stderr. Where a tool takes `--rate`, `--fs` is accepted
 | `tool nxdnscan` | Every NXDN carrier in a capture |
 | `tool nxdn` | One NXDN channel's messages |
 | `tool nxdnsynth` | Make a synthetic NXDN capture |
+| `tool p25synth` | Make a synthetic P25 Phase 1 capture, encrypted with a key of yours or clear |
 | `tool snr` | Weak-signal curves: decode a strong channel again with noise added |
 | `tool revoice` | Run a call's saved vocoder frames through the vocoder again |
 
@@ -402,6 +405,32 @@ synthetic capture, handy for checking a setup when there's no NXDN on the air ne
 - `typeC` (the default): a control channel at centre + 18.75 kHz granting group 3001 on
   channel 12, whose call is at centre + 68.75 kHz
 - `typeD`: repeaters at centre + 12.5 and + 62.5 kHz, the call on the second
+
+### tool p25synth
+
+```bash
+trunk-pro tool p25synth <out.cu8|out.cf32> [--center 851000000] [--freq centre+100000]
+                        [--rate 2400000] [--keys keys.json] [--mi HEX] [--voice call.frames.jsonl]
+                        [--superframes 10] [--wav out.wav] [--nac 659] [--tg 1201]
+```
+
+Writes one P25 Phase 1 transmission (a header, then 180 ms voice frames, then a terminator) on
+`--freq`. With `--keys`, the voice is encrypted with the first key in that
+[keys file](configuration/systems.md#encryption-keys-keys), under its algorithm and key ID, with
+`--mi` (16 hex digits) as the first message indicator. Without it the transmission is clear.
+`--voice` takes the voice from a call saved with **Save vocoder frames** (`.sdr` or
+`.frames.jsonl`); otherwise the frames are made up and sound like noise. `--wav` also writes the
+transmission as 48 kHz discriminator audio, the input DSD-style decoders take.
+
+Use it to check decryption without an encrypted system on the air:
+
+```bash
+trunk-pro tool p25synth test.cu8 --keys keys.json --voice call.frames.jsonl
+trunk-pro replay test.cu8 --center 851000000 --rate 2400000 --p25 851100000 --keys keys.json
+```
+
+The call should be saved with `"decrypted": 1` and sound like the call `--voice` came from.
+Replay it with a different key and it's noise.
 
 ### tool snr
 
@@ -486,6 +515,7 @@ trunk-pro plugin run openmhz ~/TrunkRecorderPro/dcfd --limit 3
 | `TRUNK_PRO_UHD` | The UHD library file to load for USRPs, instead of searching for it |
 | `TRUNK_PRO_AIRSPY` | The libairspy library file to load, instead of searching |
 | `TRUNK_PRO_SOAPY` | The SoapySDR library file to load, instead of searching |
+| `TRUNK_PRO_SDRPLAY_API` | The SDRplay API library file (`libsdrplay_api`), used to run two SDRplay radios in one process, instead of searching |
 | `NO_COLOR` | When set (and `log.color` is empty), the log isn't coloured |
 | `XDG_CONFIG_HOME` | Linux: where the default config folder goes (`$XDG_CONFIG_HOME/trunk-pro`) |
 | `HOME` (or `USERPROFILE`) | Your home folder: the default config folder (macOS, Linux) and recordings folder (`~/TrunkRecorderPro`), and `~/` in paths |

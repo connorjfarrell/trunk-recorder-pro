@@ -405,7 +405,7 @@ svg .label-free { fill: var(--muted); font: 11px var(--mono); }
   <h3>Hunting, AutoTune and patches</h3>
   <ul>
     <li><b>Hunting</b> (<code>CC_HUNT_S</code> = 5 s). If no step decoded cleanly for 5 s and the system lists more than one control channel, <code>tune(next)</code> removes the control head, opens one on the next covered frequency, resets the protocol and forgets the site's identity. Steps from a site that fails the lock never count as good, so a foreign control channel is hunted away from. DMR and NXDN watch every carrier and never hunt.</li>
-    <li><b>AutoTune</b>. Every 10 s, if the control channel decoded in the last second, the engine records ppm = applied ppm + offset/f × 10⁶ (|ppm| ≤ 50; last 20 averaged). With <code>autoTune</code> on, new heads open at f × (1 + ppm·10⁻⁶) − centre, and a P25 control channel more than 150 Hz off is reopened (at most every 200 s). The error is always measured and shown.</li>
+    <li><b>AutoTune</b>. Every 10 s, if the control channel decoded in the last second, the engine records ppm = applied ppm + offset/f × 10⁶, and so does each call of a second or more (|ppm| ≤ 50; the median of the last 20, of both kinds; kept for the next run). With <code>autoTune</code> on, new heads open at f × (1 + ppm·10⁻⁶) − centre, and a P25 control channel more than 150 Hz off is reopened (at most every 200 s). The error is always measured and shown.</li>
     <li><b>Patches</b>. Supergroup → member → last heard. Members expire after 10 s (P25) or 4 s (SmartNet). A call's <code>patched_talkgroups</code> come from <code>members_of(tg)</code>.</li>
   </ul>
 </section>
@@ -487,7 +487,7 @@ svg .label-free { fill: var(--muted); font: 11px var(--mono); }
       <tr><td>Restarts</td><td>Back-off from 1 s doubling to 60 s, reset after a run longer than 60 s. Exit code 78 means a config error: not restarted, and calls stop waiting for it.</td></tr>
       <tr><td>Settings change</td><td>Plugins are restarted; new processes start only after the old ones exit (they share data folders). Events wait meanwhile.</td></tr>
       <tr><td>Shutdown</td><td><code>shutdown {grace_s}</code> is queued behind pending events and stdin closes after it. A plugin gets its grace (10 s at stop) from when it has read it, after up to 30 s to drain, then it is killed.</td></tr>
-      <tr><td>Archive</td><td>For each call, takers = live processes subscribed to <code>call.concluded</code>. Each <code>call.result</code> counts down; at zero <code>audioArchive</code>, <code>callLog</code>, <code>archiveFilesOnFailure</code> and <code>compressWav</code> decide what to delete. A call no plugin takes keeps its files; an unsettled call is kept after 1 h.</td></tr>
+      <tr><td>Archive</td><td>For each call, takers = live processes subscribed to <code>call.concluded</code>. Each <code>call.result</code> counts down; at zero <code>audioArchive</code>, <code>callLog</code>, <code>archiveFilesOnFailure</code> and <code>compressWav</code> decide what to delete: <code>ok</code> and <code>skipped</code> count the same; only a <code>failed</code> keeps files (with <code>archiveFilesOnFailure</code>). An unsettled call counts as failed after 1 h. With no takers the Keep rules alone decide.</td></tr>
       <tr><td>Audio formats</td><td>WAV always; M4A if an encoder exists (ffmpeg, afconvert or fdkaac) and the plugin asked. The WAV is piped to the encoder from memory and written to disk only when kept, when a plugin takes WAV, or when encoding failed.</td></tr>
       <tr><td>RAM spool</td><td>With <code>recording.ramSpool</code>, files that will be deleted once plugins are done go to a RAM disk (macOS <code>hdiutil</code>, Linux <code>/dev/shm</code>) to spare the SSD. No room → recordings folder. Files older than 2 h are moved out.</td></tr>
       <tr><td>Store</td><td>Registry <code>index.json</code> from the TrunkRecorder/plugins repository (cached 15 min, built-in fallback). Install: download ≤ 200 MiB → SHA-256 must match → unpack to staging (no links, no path escapes) → <code>--describe</code> must match id and version → atomic rename into place. A GitHub release with <code>SHA256SUMS</code> can be installed unlisted.</td></tr>
@@ -1175,7 +1175,7 @@ const DSP = [
       ["Concealment", "TIA-102.BABA-A", "IMBE repeats a frame that fails or has too many errors, fades after 4 repeats or a high error rate; AMBE repeats above 3 errors."],
       ["Scale and limit", "×7/32768 · tanh above −3 dBFS", "A soft limiter instead of clipping."],
       ["Recording", "audio · frames · transmissions", "The call's buffer. Gaps over 0.5 s separate transmissions."],
-      ["save_call", "SaveRules", "Drops transmissions shorter than <code>minTransmissionS</code> and encrypted ones; refuses a call too short or silent (unless <code>keepSilentCalls</code> / <code>recordEncrypted</code>)."],
+      ["save_call", "SaveRules", "Drops transmissions shorter than <code>minTransmissionS</code> and encrypted ones that weren't decrypted; refuses a call too short or silent (unless <code>keepSilentCalls</code> / <code>recordEncrypted</code>)."],
       ["Loudness", "−12 dBFS speech (≈ −14 LUFS)", "BS.1770-style gated measurement; gain −18..+24 dB plus the system's level; look-ahead limiter at −2.5 dBFS."],
       ["JSON + WAV", "Trunk Recorder fields + reception", "16-bit mono 8 kHz WAV and the call JSON (section 09)."]
     ] }
@@ -1286,7 +1286,7 @@ const PROTO = {
       { id: "m", x: D, y: 105, w: 270, label: "Matching call?", sub: "talkgroup · freq · slot · phase 2", cls: "k-dec", text: "If one exists it is refreshed: <code>last_update_s</code>, patches, encrypted / emergency latched on, a new talking unit added. Nothing is admitted again." },
       { id: "ign", x: D, y: 190, w: 270, label: "Ignored talkgroup?", sub: "CSV Ignore or priority < 0", cls: "k-dec", text: "Reason <code>ignored</code>." },
       { id: "unk", x: D, y: 275, w: 270, label: "Unknown talkgroup?", sub: "and recordUnknown off", cls: "k-dec", text: "Not in a non-empty talkgroup file and not a member of a known patch. Reason <code>unknown_tg</code>. A later PatchAdd can re-admit it." },
-      { id: "enc", x: D, y: 360, w: 270, label: "Encrypted?", sub: "and recordEncrypted off", cls: "k-dec", text: "Reason <code>encrypted</code>. The engine may still <b>follow</b> it: open the channel with no recording, to collect talking units and aliases, if recordings plus followed channels are below <code>maxRecorders</code> (never for analog)." },
+      { id: "enc", x: D, y: 360, w: 270, label: "Encrypted?", sub: "and recordEncrypted off", cls: "k-dec", text: "Unless the system has keys and the call is P25 (it is then recorded, to see whether a key fits): reason <code>encrypted</code>. The engine may still <b>follow</b> it: open the channel with no recording, to collect talking units and aliases, if recordings plus followed channels are below <code>maxRecorders</code> (never for analog)." },
       { id: "pool", x: D, y: 445, w: 270, label: "Recorder free?", sub: "recordings < maxRecorders", cls: "k-dec", text: "Reason <code>no_recorder</code> otherwise. No priority, no preemption, no retry: the call is monitored until it times out." },
       { id: "src", x: D, y: 530, w: 270, label: "Source covers it?", sub: "Radio::source_for(freq)", cls: "k-dec", text: "The first source whose usable band holds the frequency. Reason <code>no_source</code> otherwise." },
       { id: "take", x: D, y: 615, w: 270, label: "Take a recorder", sub: "lowest free number · Recording", text: "The recorder number (the JSON's <code>recorder_num</code>) comes from <code>free_nums</code>; a <code>Recording</code> is inserted; <code>open_channel</code> runs." },
@@ -1639,7 +1639,7 @@ const OBJ = [
     ["start_time · stop_time · *_ms", "", "Unix s / ms"], ["emergency · priority · mode · duplex · encrypted", "", ""], ["call_length · call_length_ms", "", ""],
     ["talkgroup · talkgroup_tag · talkgroup_description · talkgroup_group_tag · talkgroup_group", "", ""], ["color_code · ran", "", "−1 if none"], ["tone_mode · tone_detected · tone_confidence", "", "conventional"],
     ["audio_type", "", "analog · digital tdma · digital"], ["short_name", "", ""], ["patched_talkgroups", "", "only when more than one"],
-    ["freqList", "[{freq, time, pos, len, error_count, spike_count}]", ""], ["errorList", "[{pos, len, frames, error_count, bad_frames, max_frame_errors}]", ""], ["srcList", "[{src, time, pos, emergency, signal_system, tag, tag_ota}]", ""]]],
+    ["freqList", "[{freq, time, pos, len, error_count, spike_count}]", ""], ["errorList", "[{pos, len, frames, error_count, bad_frames, max_frame_errors}]", ""], ["srcList", "[{src, time, pos, emergency, signal_system, tag, tag_ota, lat?, lon?}]", ""]]],
   ["Manifest", "plugin", "trunk-recorder-plugin/src/protocol.rs", "What a plugin prints for --describe.", [
     ["id · name · version · description", "String", ""], ["api", "u32", "1 ≤ api ≤ API_VERSION"], ["subscribe", "Vec<String>", "call.start, call.end, call.concluded, unit, audio, status"], ["audio_formats", "Vec<String>", "m4a, wav"],
     ["config · system_config", "Option<JSON Schema>", "the Plugins page's forms"], ["homepage · repository · authors · license", "", ""]]],
@@ -1699,7 +1699,7 @@ const CFG = {
   "sources[].gainDb": ["number", "rtlsdr 25.4 · usrp 40 · soapy null", "Tuner gain. Soapy null leaves the device as it is."],
   "sources[].agc": ["bool", "false (soapy true)", "Tuner AGC instead of gainDb."],
   "sources[].ppm": ["number", "rtlsdr required (integer) · others 0", "Crystal correction applied in the driver."],
-  "sources[].autoTune": ["bool", "false", "Apply the frequency error measured on control channels to new heads (section 05)."],
+  "sources[].autoTune": ["bool", "false", "Apply the frequency error measured on control channels and calls to new heads (section 05)."],
   "sources[].guardHz": ["number", "75000", "Unusable edge of the band. Usable half-width = max(rate/2 − guardHz, rate/4)."],
   "sources[].antenna": ["string", "\"\"", "usrp / soapy antenna."],
   "sources[].gainMode": ["linearity · sensitivity · manual", "linearity", "airspy; with gainStep 14, or lnaStep / mixerStep / vgaStep 10 in manual."],

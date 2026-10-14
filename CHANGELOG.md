@@ -11,6 +11,103 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   in time order if you like). Lists the talkgroups and radios heard in the
   span, and **Only talkgroups not in my list** answers "what's this new
   talkgroup?". The app only, for now; the browser version has Listen.
+- **Two SDRplay radios in one process:** a second RSP source no longer
+  fails with `SelectDevice() failed`. SoapySDRPlay3 opens one SDRplay API
+  session per process, which can select only one radio, so trunk-pro now
+  opens one more session for each further SDRplay source (as SDRTrunk
+  does). Two radios on one USB bus can still run out of bandwidth: 3 + 3
+  MS/s failed in testing, and 2.5 + 6 MS/s worked. A source at 2 MS/s or
+  below runs its radio at 6 MS/s; use separate USB controllers if a
+  pair doesn't fit.
+- **Encryption keys from a KFDtool container:** `keys` can name a KFDtool
+  key container (`.ekc`) instead of a JSON file, with `keysPasswordFile`
+  naming a file that holds its password. The keys stay encrypted on disk
+  and the password sits apart from them, so nothing in the config or the
+  keys file is a secret in the clear. A password file others can read is
+  refused. Keys the recorder can't decrypt (key-encryption keys, DES-XL)
+  are listed in the log and left out. `replay` takes
+  `--keys-password-file` too.
+- **Unlock a key container from the interface:** a container with no
+  `keysPasswordFile` waits for its password, typed into Setup → Recording →
+  Key containers. The keys are held in memory only, reach calls in progress,
+  and **Lock** takes them away at once. Only a browser on the recorder's own
+  computer may unlock (or, with `server.allowLanUnlock`, one on the private
+  network); no browser is ever sent a key.
+
+- **Encryption keys are wiped from memory:** the keys in a system's keyring,
+  the keys file's text and its parsed contents, and the cipher's key-derived
+  state are overwritten when they are dropped, so a freed page doesn't keep a
+  key for a crash dump or a memory scan to find.
+- **Decrypted calls aren't uploaded unless you say so, plugin by plugin.** A call decrypted with your keys
+  is no longer given (its live audio, files and JSON) to any plugin (OpenMHz, Broadcastify, Rdio Scanner,
+  a stream, a script) unless that plugin's entry says, in so many words, that it may
+  (`plugins.<id>.shareDecrypted`, in the config file). A plugin on your own network needs it too. The log says
+  so for a plugin that is withheld and, on every start, for one that is allowed. Voice and calls of a call that
+  expires in the same moment as its decryption are treated as decrypted. See
+  [Decrypted calls](docs/plugins/README.md#decrypted-calls).
+
+## [0.1.10] — 2026-10-13
+
+- **Encryption heard:** a talkgroup's page on the Radio dashboard lists
+  the ciphers its encrypted P25 calls used, with each algorithm (ADP,
+  DES, AES-256, …), key ID, number of calls and when it was last heard.
+  Hover over a talkgroup's **ENC** badge to see the same. A call's JSON
+  now has `algid` and `key_id`.
+- **Decrypting P25 (experimental):** if you are authorized to monitor an
+  encrypted P25 system and hold its keys, give the system a `keys` file
+  (ADP, DES, 3DES, AES-128 or AES-256; see Configuration → Systems →
+  Encryption keys). Its encrypted P25 calls, Phase 1 and Phase 2, are
+  then recorded, decrypted and saved, marked `"decrypted": 1` in the call
+  JSON, and can be played in Listen. A key of the wrong length stops
+  recording from starting, with a message saying which key to fix.
+  Plugins get `algid`, `key_id` and `decrypted` with each call.
+  `trunk-pro replay --keys` does the same for captures, and `trunk-pro
+  tool p25synth` makes an encrypted test capture with a key of yours, to
+  check a setup without an encrypted system on the air. The decryption
+  was checked against OP25 and dsd-fme on such captures.
+- **Fixed:** conventional channels on a source running below about
+  1 MS/s never opened (at 480 kS/s and under, none did): the noise floor
+  was measured in slices narrower than a channel, so a transmission read
+  as noise. Slices are now at least 30 kHz wide. The analog squelch of
+  trunked calls on such sources used the same floor and is fixed too.
+  Sources at 1.92 MS/s and above behave as before.
+- **Archive settings, clearer and predictable.** The three settings that
+  decide what of a call stays in the recordings folder are now under
+  **Archive** in Setup's Recording tab: **Keep audio**, **Keep call JSON**
+  and **Keep when a plugin fails** (the config keys are unchanged). Off, a
+  Keep setting deletes that file once the plugins are done with the call;
+  a plugin that skipped a call is done with it, just as one that uploaded
+  it. Only a failure keeps the files, with **Keep when a plugin fails** on,
+  which is greyed out when both Keep settings are on. Changes: with no
+  plugin taking calls, the Keep settings now apply too (before, every call
+  was kept whole), and Setup says when that means nothing is saved; a call
+  a plugin never answered on counts as failed after an hour (before, it was
+  always kept).
+- **P25: multi-block control channel messages.** Some sites send part of
+  their control channel as multi-block (MBT) messages, which were
+  dropped. Those sites now show their WACN and System ID (so a site lock
+  and multi-site grouping work), and multi-block grants, patch grants,
+  affiliations and registrations are followed like the single-block ones.
+  On a site that uses them, control messages a second go up: CLMRN-I
+  went from about 12 to 22.
+- **Control channel coverage.** The Decode page (a tile on each P25
+  system's card, and a chart under Over time) and Find my system show how
+  much of the control channel decoded: an estimate from timing, of the
+  air decoded against the most the channel could carry. It reads the same
+  on every system, unlike messages a second, which are lower where a site
+  sends multi-block messages (one takes the air of two or three).
+- **P25: manufacturers' messages.** Motorola and L3Harris radios' GPS
+  positions, sent while they talk, are kept on the radio in the call JSON
+  (`lat`, `lon` in `srcList`). Motorola patch deletes end a patch when the
+  site says so; Motorola's base station ID logs the site's callsign;
+  Motorola emergency alarms are logged and sent to plugins as unit events
+  (`emergency_alarm`); denied and queued requests are logged with the
+  reason. On Phase 2, a Motorola patched call names its talker.
+- **P25 fixes.** On Motorola systems, a supergroup being set up (and a
+  queued request) was taken for a unit-to-unit call, and a patch-add in a
+  voice channel's link control for a talker. An L3Harris regroup of a
+  radio was taken for a talkgroup patch; an encrypted L3Harris patch is
+  now marked. A refused registration or affiliation isn't counted as one.
 - **NXDN talker aliases:** Kenwood radios' programmed names are read from the
   traffic channel and shown as each radio's name (`tag_ota`, the Calls page,
   `<shortName>.units.csv`), as P25's are. ASCII aliases only; Icom's format

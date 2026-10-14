@@ -37,6 +37,7 @@ channel. Each site you record from its own control channel is its own entry, wit
 | `expect` | | `{}` | object | Site lock: only follow a control channel with this identity. See [Site lock](#site-lock-expect) |
 | `voiceChannelsHz` | | `[]` | array of numbers | Voice channels Find my system heard. Used only to place Auto sources so they cover them too |
 | `siteGroup` | | `""` | string | Groups sites whose calls are the same calls. See [Multi-site](#multi-site) |
+| `keys` | | `""` | string | P25: a file of encryption keys, absolute or relative to the config file's folder (desktop app only; not in the interface). See [Encryption keys](#encryption-keys-keys) |
 | `recording` | | `{}` | object | This system's own call rules; a rule left out follows the global `recording`. See [recording.md](recording.md#per-system-rules) |
 | `plugins` | | `{}` | object | This system's plugin settings, by plugin id. See [plugins.md](plugins.md#per-system-settings) |
 
@@ -132,6 +133,87 @@ A non-empty `siteGroup` replaces that grouping:
 Give DMR and NXDN Type-D sites a group name, since they announce no system identity. Give systems
 linked by ISSI one too. To prefer a site for a talkgroup, use the talkgroup file's `Preferred Site`
 or `Preferred NAC` column.
+
+## Encryption keys (`keys`)
+
+**Experimental.** If you are authorized to monitor an encrypted P25 system and hold its keys, the
+recorder can decrypt its voice, P25 Phase 1 and Phase 2. DMR and NXDN calls stay encrypted.
+
+The keys live in a file of their own, never in the config, which the interface reads and edits:
+
+```json
+{ "keys": [
+    { "algId": "0xAA", "keyId": "0x1B50", "key": "1234567890" },
+    { "algId": "0x84", "keyId": "0x0002", "key": "<64 hex digits>" },
+    { "algId": "0x84", "key": "<64 hex digits>", "talkgroups": [1201, 1202] }
+]}
+```
+
+| Key | Description |
+|---|---|
+| `algId` | The algorithm: `0xAA` ADP, `0x81` DES-OFB, `0x83` 3DES, `0x85` AES-128 (`0x89` is read as the same), `0x84` AES-256. Hex in a string, or a number |
+| `keyId` | The key ID the radios send. Hex in a string, or a number |
+| `key` | The key in hex, exactly as long as the algorithm needs: ADP 10 digits, DES 16, AES-128 32, 3DES 48, AES-256 64. Spaces are allowed. A shorter key is an error, never padded |
+| `talkgroups` | Optional. Use this key on these talkgroups whatever key ID the air names (or only under its `keyId`, if it gives one). Tried before the keys matched by key ID |
+
+- The file is read when recording starts. After editing it, stop and start recording. A file that
+  can't be read, or a key that is wrong, stops the start with a message saying which key and what to
+  fix. The key itself is never shown, logged or sent to plugins.
+- Make the file readable only by you (`chmod 600 keys.json`). The log warns when other users can
+  read it.
+- A system with keys records its encrypted P25 calls, even with `recordEncrypted` off, because the
+  key ID only arrives with the voice. A call whose key isn't in the file is then left out, as an
+  encrypted call always is. One that was decrypted is saved with `"decrypted": 1` in its JSON and
+  can be played in Listen.
+- A call joined late, or one whose encryption sync was lost to a fade, is decrypted from the next
+  sync on, and the voice just before that sync too: at most the frames lost with the sync are
+  missing.
+- The talkgroup page on the Radio dashboard lists the ciphers heard (algorithm and key ID), which
+  tells you which keys a talkgroup needs.
+
+### Keys in a KFDtool container
+
+`keys` can name a KFDtool key container (`.ekc`) instead of a JSON file. The container is encrypted
+with its own password, so keys at rest are never in the clear on the recorder, and the password sits
+in a separate file named by `keysPasswordFile` (relative to the config file's folder, or absolute).
+Conventional systems take both settings too.
+
+```json
+{ "keys": "keys.ekc", "keysPasswordFile": "/run/secrets/keys-password" }
+```
+
+- The password file holds the password on its first line. On Unix it must not be readable by
+  others (`chmod 600`), except under `/run/secrets`, where the container runtime sets the modes;
+  otherwise the start is refused.
+- Every voice key in the container is used by key ID on any talkgroup. Key-encryption keys, and
+  algorithms that can't be decrypted (DES-XL), are listed in the log and left out; the rest still
+  load. A container with the wrong password, or a damaged one, stops the start.
+- `keysPasswordFile` with a JSON keys file is an error.
+
+#### Typing the password in the interface
+
+A container with **no** `keysPasswordFile` is not an error: the recorder starts, records the system as
+it would without keys, and waits. **Setup → Recording → Key containers** lists each such container, the
+systems that use it, and a password box. Unlock it and its keys are held in memory, for calls that begin
+from then on **and calls in progress** (decrypted from the next encryption sync). **Lock** forgets them
+and stops decrypting at once, in calls in progress too, which are muted from then on, not passed on as
+heard. Several systems naming one container share it.
+
+- The password is sent once, over the WebSocket, straight into memory that is wiped when it is dropped.
+  It is never stored, logged, shown again or sent back, and the keys are never sent to any browser: the
+  interface is told which keys are held (algorithm, key ID and the container's name for it), never the
+  keys.
+- Only a browser on the recorder's own computer may unlock, lock, or see which keys are held: the
+  connection must come from the loopback address, not through a reverse proxy, and ask for `localhost`,
+  `127.0.0.1` or `[::1]`. From another computer, open the interface through an SSH port forward
+  (`ssh -L 8080:localhost:8080 host`, then `http://localhost:8080`).
+- `server.allowLanUnlock: true` in the config file also lets a computer on a private network (RFC 1918,
+  link-local, unique-local; not through a proxy, and asking for a name or address on that network)
+  unlock and lock. **The interface is plain HTTP, so the password is not encrypted on the way**; use it on
+  a network you trust, or not at all. Such a computer is never shown which keys are held. The setting
+  can only be changed in the config file, not from the interface when it is open from another computer.
+- Tries are at least a second apart, and a wrong password changes nothing.
+- A container is forgotten when no system names it any more, and when the app quits.
 
 ## Talkgroup file
 

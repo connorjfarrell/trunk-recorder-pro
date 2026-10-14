@@ -15,6 +15,8 @@
 //!   analog FM:   discriminator, squelch, MDC1200 / FleetSync unit IDs
 //! ```
 
+use std::sync::Arc;
+
 use num_complex::Complex32;
 
 use super::calls::Call;
@@ -22,6 +24,7 @@ use super::frames::VoiceFrame;
 use super::tdma::TdmaTracker;
 use super::tracker::VoiceTracker;
 use crate::alias::Alias;
+use crate::position::Position;
 use crate::dmr::voice::{DmrVoice, VOICE_BURST_S};
 use crate::dsp::c4fm::C4fm;
 use crate::dsp::cqpsk::{self, Cqpsk};
@@ -33,6 +36,7 @@ use crate::nxdn::voice::{NxdnVoice, VCH_S};
 use crate::nxdn::Rate;
 use crate::metrics::{Instrumented, Sink};
 use crate::p25::alias::AliasLc;
+use crate::p25::crypt::Keyring;
 use crate::p25::diversity::{best_frame, Bank, BankConfig, Group};
 use crate::p25::phase2::{self, Packet};
 
@@ -73,6 +77,14 @@ impl VoiceKind {
     }
 }
 
+/// The cipher a transmission is encrypted with, as its encryption sync named
+/// it (P25: the ALGID and key ID).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CipherId {
+    pub algid: u8,
+    pub keyid: u16,
+}
+
 /// What a voice tracker heard, for the call on its slot.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrackerOut {
@@ -80,6 +92,12 @@ pub enum TrackerOut {
     Audio(Vec<f32>, VoiceFrame),
     /// Link control named a source / emergency, or the call turned out encrypted.
     Info { source: Option<u32>, emergency: bool, encrypted: bool },
+    /// The transmission's encryption sync named its cipher (once a
+    /// transmission, and again if it changes).
+    Cipher(CipherId),
+    /// The transmission's voice is being decrypted (once a transmission,
+    /// before its first decrypted audio).
+    Decrypted,
     /// Analog FM voice (a SmartNet analog call, a conventional FM channel): 8 kHz audio, squelched.
     AnalogAudio(Vec<f32>),
     /// Analog FM: the same audio before the 300 Hz high-pass (CTCSS / DCS
@@ -89,6 +107,8 @@ pub enum TrackerOut {
     Alias(Alias),
     /// What a terminator / MAC message showed of talker aliases (counted).
     AliasLc(AliasLc),
+    /// The talker's GPS position.
+    Position(Position),
 }
 
 /// What one decoder produced: an output for the call on `slot`, from air
@@ -120,7 +140,7 @@ pub struct VoiceParams {
 }
 
 /// How to make a decoder.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct VoiceSpec {
     pub kind: VoiceKind,
     /// The channel's sample rate, Hz.
@@ -138,6 +158,8 @@ pub struct VoiceSpec {
     /// Analog: also hand out the audio below 300 Hz (CTCSS / DCS) as
     /// [`TrackerOut::Subaudible`].
     pub subaudible: bool,
+    /// The system's keys: P25 voice it has the key for is decrypted.
+    pub keys: Option<Arc<Keyring>>,
 }
 
 /// One voice channel's decoding: channel IQ in, outputs for the calls on
@@ -150,6 +172,9 @@ pub trait VoiceDecoder: Send {
     fn flush(&mut self, _out: &mut Vec<VoiceOut>) {}
     /// Which slots are being recorded (DMR vocodes only those).
     fn listen(&mut self, _slots: [bool; 2]) {}
+    /// The system's keys changed: P25 voice is decrypted with these from now on, calls in progress
+    /// too (a call is decrypted from its next encryption sync; with none, it stops at once).
+    fn set_keys(&mut self, _keys: Option<Arc<Keyring>>) {}
     /// What the control channel says voice needs (Phase 2: the scrambler key).
     fn set_params(&mut self, _p: &VoiceParams) {}
     /// Analog: the carrier power that opens the squelch.
@@ -178,7 +203,7 @@ pub fn build(spec: &VoiceSpec) -> Box<dyn VoiceDecoder> {
     match spec.kind {
         VoiceKind::Fdma => Box::new(P25Fdma {
             bank: Bank::new(spec.rate, spec.bank),
-            tracker: VoiceTracker::new(mbe::lcg(spec.seed), spec.vocoder),
+            tracker: VoiceTracker::new(mbe::lcg(spec.seed), spec.vocoder, spec.keys.clone()),
             groups: Vec::new(),
             t0: spec.t0,
             rate: spec.rate,
@@ -186,7 +211,7 @@ pub fn build(spec: &VoiceSpec) -> Box<dyn VoiceDecoder> {
             air: None,
         }),
         VoiceKind::Tdma => {
-            let mut tracker = TdmaTracker::new(spec.seed);
+            let mut tracker = TdmaTracker::new(spec.seed, spec.keys.clone());
             tracker.soft = spec.bank.soft;
             // Decision-feedback differential detection: ~1 dB in noise on Phase 2
             // voice (tool snr); not used on Phase 1, where simulcast didn't like it.
@@ -236,6 +261,9 @@ impl VoiceDecoder for P25Fdma {
     fn kind(&self) -> VoiceKind {
         VoiceKind::Fdma
     }
+    fn set_keys(&mut self, keys: Option<Arc<Keyring>>) {
+        self.tracker.set_keys(keys);
+    }
     fn report(&self, sink: &mut dyn Sink) {
         self.bank.report(sink);
     }
@@ -277,6 +305,9 @@ impl VoiceDecoder for P25Tdma {
     fn kind(&self) -> VoiceKind {
         VoiceKind::Tdma
     }
+    fn set_keys(&mut self, keys: Option<Arc<Keyring>>) {
+        self.tracker.set_keys(keys);
+    }
     fn report(&self, sink: &mut dyn Sink) {
         if let Some(e) = self.rx.phase_error_deg() {
             sink.gauge("phaseErr", e as f64);
@@ -294,6 +325,9 @@ impl VoiceDecoder for P25Tdma {
             self.tracker.packet(p, t, &mut self.tout);
             out.extend(self.tout.drain(..).map(|(slot, o)| VoiceOut { slot: slot as u8, t, out: o }));
         }
+    }
+    fn offset_hz(&self) -> Option<f32> {
+        self.rx.offset_hz()
     }
     fn set_params(&mut self, p: &VoiceParams) {
         if let Some((nac, sys, wacn)) = p.tdma_key {

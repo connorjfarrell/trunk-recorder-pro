@@ -212,6 +212,14 @@ impl Source {
             Source::Rtlsdr { rate_hz, .. } | Source::Usrp { rate_hz, .. } | Source::Airspy { rate_hz, .. } | Source::Soapy { rate_hz, .. } | Source::File { rate_hz, .. } => *rate_hz,
         }
     }
+    /// The frequency correction set for it, ppm (a file: 0).
+    pub fn ppm(&self) -> f64 {
+        match self {
+            Source::Rtlsdr { ppm, .. } => *ppm as f64,
+            Source::Usrp { ppm, .. } | Source::Airspy { ppm, .. } | Source::Soapy { ppm, .. } => *ppm,
+            Source::File { .. } => 0.0,
+        }
+    }
     pub fn auto_tune(&self) -> bool {
         match self {
             Source::Rtlsdr { auto_tune, .. } | Source::Usrp { auto_tune, .. } | Source::Airspy { auto_tune, .. } | Source::Soapy { auto_tune, .. } | Source::File { auto_tune, .. } => *auto_tune,
@@ -322,6 +330,14 @@ pub struct System {
     /// ISSI, or to keep a site out of its system's group.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub site_group: String,
+    /// Its encryption keys file (P25; see [`crate::keys`]), absolute or
+    /// relative to the config file's folder. Empty: none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub keys: String,
+    /// The file holding the password of `keys`, when that is a KFDtool key
+    /// container (`.ekc`) rather than a JSON file. Empty: none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub keys_password_file: String,
     /// Plugins' settings for this system, by plugin id (as each plugin's
     /// `system_config` schema describes them); a list for several copies of one.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -394,6 +410,8 @@ impl Default for System {
     fn default() -> Self {
         System {
             other: BTreeMap::new(),
+            keys: String::new(),
+            keys_password_file: String::new(),
             short_name: "sys1".into(),
             name: String::new(),
             kind: "p25".into(),
@@ -510,6 +528,12 @@ pub struct Conventional {
     /// Names for the radios heard on them.
     #[serde(skip_serializing_if = "UnitNames::is_empty")]
     pub unit_names: UnitNames,
+    /// Its encryption keys file, for its P25 channels (as [`System::keys`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub keys: String,
+    /// The password file for `keys`, when that is a key container (as [`System::keys_password_file`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub keys_password_file: String,
     /// Keys this version doesn't know (a newer version's, a hand edit's):
     /// kept, and saved back as they were.
     #[serde(flatten)]
@@ -545,6 +569,8 @@ impl Default for Conventional {
     fn default() -> Self {
         Conventional {
             other: BTreeMap::new(),
+            keys: String::new(),
+            keys_password_file: String::new(),
             short_name: "conv".into(),
             name: String::new(),
             enabled: true,
@@ -798,6 +824,10 @@ pub struct PluginSetup {
     /// Run this executable instead of the installed plugin (a build of your own).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// The sentence the documentation gives (plugins README, "Decrypted calls") that lets this plugin be given calls
+    /// decrypted with the recorder's keys (their audio and files). Without it, none are: uploading them is risky.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub share_decrypted: String,
 }
 
 impl Default for Recording {
@@ -931,6 +961,12 @@ pub struct Server {
     /// What / shows: "" the built-in interface, else an interface's name.
     /// The built-in one is at /builtin/ either way.
     pub home: String,
+    /// Let a computer on the private network, not only this one, unlock and
+    /// lock the key containers from the interface. Off: only a browser on the
+    /// recorder's own computer may. On plain HTTP the password isn't encrypted
+    /// on the way, and only this computer can change the setting.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_lan_unlock: bool,
     /// Keys this version doesn't know (a newer version's, a hand edit's):
     /// kept, and saved back as they were.
     #[serde(flatten)]
@@ -939,7 +975,7 @@ pub struct Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Server { bind: "127.0.0.1".into(), port: 8080, auto_start: false, allowed_origins: vec![], interfaces: vec![], home: String::new(), other: BTreeMap::new() }
+        Server { bind: "127.0.0.1".into(), port: 8080, auto_start: false, allowed_origins: vec![], interfaces: vec![], home: String::new(), allow_lan_unlock: false, other: BTreeMap::new() }
     }
 }
 
@@ -980,6 +1016,19 @@ pub struct CallSystem<'a> {
     pub kind: &'static str,
     /// Its plugin settings, by plugin id.
     pub plugins: &'a BTreeMap<String, serde_json::Value>,
+}
+
+/// A system's keys, as [`Config::load_keys`] read them.
+pub struct SystemKeys {
+    pub name: String,
+    /// The `keys` setting, as written.
+    pub file: String,
+    /// None: a key container still locked (`locked_path`).
+    pub ring: Option<std::sync::Arc<trunk_core::p25::crypt::Keyring>>,
+    /// Container keys left out (never the key).
+    pub skipped: Vec<String>,
+    /// The container (resolved) that needs a typed password, when the system's `keys` is one with no password file.
+    pub locked_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1174,6 +1223,30 @@ impl Config {
         }
         let p = PathBuf::from(f);
         Some(if p.is_absolute() { p } else { config_path.parent().unwrap_or(Path::new(".")).join(p) })
+    }
+
+    /// Read the keys files of the systems that name one, for
+    /// [`crate::session::Session::set_keys`]. A container with no
+    /// `keysPasswordFile` is "locked" until a password is typed in: `held`
+    /// gives the keys already unlocked from it (by its resolved path). An
+    /// error names the file and what is wrong in it (never a key).
+    pub fn load_keys(&self, config_path: &Path, held: &dyn Fn(&Path) -> Option<std::sync::Arc<trunk_core::p25::crypt::Keyring>>) -> Result<Vec<SystemKeys>, String> {
+        let trunked = self.active_systems().map(|s| (&s.short_name, &s.keys, &s.keys_password_file));
+        let conv = self.conventional.iter().filter(|c| c.enabled).map(|c| (&c.short_name, &c.keys, &c.keys_password_file));
+        let mut out = Vec::new();
+        for (name, setting, pw) in trunked.chain(conv) {
+            let Some(p) = crate::keys::path(setting, config_path) else { continue };
+            let pw = crate::keys::path(pw, config_path);
+            let at = |e: String| format!("{name}: {e}");
+            if pw.is_none() && crate::keys::is_container(&p).map_err(at)? {
+                let ring = held(&p);
+                out.push(SystemKeys { name: name.clone(), file: setting.trim().to_string(), ring, skipped: vec![], locked_path: Some(p) });
+                continue;
+            }
+            let l = crate::keys::load(&p, pw.as_deref()).map_err(at)?;
+            out.push(SystemKeys { name: name.clone(), file: setting.trim().to_string(), ring: Some(std::sync::Arc::new(l.ring)), skipped: l.skipped, locked_path: None });
+        }
+        Ok(out)
     }
 
     /// Read every conventional system's linked channel file (errors are in
@@ -1458,6 +1531,8 @@ impl Config {
                     Protocol::P25
                 },
                 site_group: s.site_group.trim().to_string(),
+                // (Read by the app: [`Config::load_keys`].)
+                keys: None,
             })
             .collect();
         // A conventional system's P25 / DMR channels look up the talkgroup names
@@ -1479,6 +1554,7 @@ impl Config {
                     save: r.save_rules(),
                     talkgroups: named.map(|s| s.talkgroups.clone()).unwrap_or_default(),
                     unit_tags: v.unit_names.engine(),
+                    keys: None,
                 }
             })
             .collect();

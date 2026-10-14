@@ -22,7 +22,7 @@
         },
         "audio": {
           "type": "boolean",
-          "description": "Whether its audio / its JSON stay in the recordings folder once the upload plugins are done (Keep the audio / the call JSON after uploading). False: they're gone, or soon will be. Missing: kept (the browser version)."
+          "description": "Whether its audio / its JSON stay in the recordings folder once the plugins are done (Keep audio / Keep call JSON). False: they're gone, or soon will be. Missing: kept (the browser version)."
         },
         "json": {
           "type": "boolean"
@@ -95,6 +95,17 @@
         },
         "encrypted": {
           "type": "number"
+        },
+        "algid": {
+          "type": "number",
+          "description": "The cipher its encryption sync named: P25 ALGID and key ID; -1 when none was heard (absent in calls saved before)."
+        },
+        "key_id": {
+          "type": "number"
+        },
+        "decrypted": {
+          "type": "number",
+          "description": "1: its encrypted voice was decrypted, at least in part (absent in calls saved before)."
         },
         "phase2_tdma": {
           "type": "number"
@@ -282,6 +293,12 @@
               },
               "tag_ota": {
                 "type": "string"
+              },
+              "lat": {
+                "type": "number"
+              },
+              "lon": {
+                "type": "number"
               }
             },
             "required": [
@@ -295,7 +312,7 @@
             ],
             "additionalProperties": false
           },
-          "description": "The radios that talked: `time` Unix s, `pos` s into the audio. `tag`: the unit's name (the unit names file or the alias heard, by the system's mode); `tag_ota`: the alias heard."
+          "description": "The radios that talked: `time` Unix s, `pos` s into the audio. `tag`: the unit's name (the unit names file or the alias heard, by the system's mode); `tag_ota`: the alias heard. `lat`, `lon`: where the radio said it was (GPS, decimal degrees), when it did."
         }
       },
       "required": [
@@ -415,6 +432,10 @@
         "encrypted": {
           "type": "boolean"
         },
+        "decrypted": {
+          "type": "boolean",
+          "description": "Its encrypted voice is being decrypted (the system has the key)."
+        },
         "emergency": {
           "type": "boolean"
         },
@@ -456,6 +477,7 @@
         "state",
         "reason",
         "encrypted",
+        "decrypted",
         "emergency",
         "startS",
         "sources"
@@ -583,6 +605,37 @@
       "additionalProperties": false,
       "description": "A channel listened to now, with its power and the noise floor under it."
     },
+    "CipherSeen": {
+      "type": "object",
+      "properties": {
+        "algid": {
+          "type": "number"
+        },
+        "keyId": {
+          "type": "number"
+        },
+        "name": {
+          "type": "string",
+          "description": "What the ALGID is called (\"ADP\", \"AES-256\", …)."
+        },
+        "calls": {
+          "type": "number"
+        },
+        "last": {
+          "type": "number",
+          "description": "Unix seconds."
+        }
+      },
+      "required": [
+        "algid",
+        "keyId",
+        "name",
+        "calls",
+        "last"
+      ],
+      "additionalProperties": false,
+      "description": "A cipher heard on a talkgroup: P25 ALGID and key ID."
+    },
     "Config": {
       "type": "object",
       "properties": {
@@ -626,6 +679,10 @@
                 "type": "string"
               },
               "description": "Web pages from other origins that may use the API (\"http://host:port\", \"null\" a file, \"*\" any)."
+            },
+            "allowLanUnlock": {
+              "type": "boolean",
+              "description": "Config file only: let a private-network address, not only the recorder's own computer, unlock and lock key containers (plain HTTP: the password is not encrypted on the way)."
             },
             "interfaces": {
               "type": "array",
@@ -716,6 +773,14 @@
         },
         "unitNames": {
           "$ref": "#/definitions/UnitNames"
+        },
+        "keys": {
+          "type": "string",
+          "description": "Desktop: its P25 channels' encryption keys file (as System's)."
+        },
+        "keysPasswordFile": {
+          "type": "string",
+          "description": "Desktop: the password file for `keys`, when that is a key container (as System's)."
         }
       },
       "required": [
@@ -1352,6 +1417,32 @@
                 "$ref": "#/definitions/PluginRuntime"
               },
               "description": "Every plugin's runtime, by id (desktop app)."
+            },
+            "keys": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "containers": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/KeyContainer"
+                  }
+                },
+                "version": {
+                  "type": "number",
+                  "description": "Counts every change of what is held, to know when to ask keysQuery again."
+                },
+                "type": {
+                  "type": "string",
+                  "const": "keys"
+                }
+              },
+              "required": [
+                "containers",
+                "type",
+                "version"
+              ],
+              "description": "Which key containers are locked or open (desktop app)."
             }
           },
           "required": [
@@ -1380,6 +1471,88 @@
           "required": [
             "type",
             "radios"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "containers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/KeyContainer"
+              }
+            },
+            "version": {
+              "type": "number",
+              "description": "Counts every change of what is held, to know when to ask keysQuery again."
+            },
+            "type": {
+              "type": "string",
+              "const": "keys"
+            }
+          },
+          "required": [
+            "containers",
+            "type",
+            "version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysList"
+            },
+            "version": {
+              "type": "number"
+            },
+            "keys": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/HeldKey"
+              }
+            },
+            "restricted": {
+              "type": "boolean"
+            },
+            "canUnlock": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "version",
+            "keys"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysResult"
+            },
+            "id": {
+              "type": "number"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "ok",
+            "message"
           ],
           "additionalProperties": false
         },
@@ -2829,6 +3002,32 @@
       "additionalProperties": false,
       "description": "A code a conventional frequency carried (crates/trunk-app/src/heard.rs), in a row's Tone form (\"\" = none)."
     },
+    "HeldKey": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "algId": {
+          "type": "number",
+          "description": "The P25 algorithm id (0x81 DES-OFB, 0x84 AES-256, 0xAA ADP)."
+        },
+        "keyId": {
+          "type": "number"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "algId",
+        "keyId",
+        "name"
+      ],
+      "additionalProperties": false,
+      "description": "A key held: which, not what."
+    },
     "Identity": {
       "type": "object",
       "properties": {
@@ -2869,6 +3068,40 @@
         "sysId",
         "rfss",
         "site"
+      ],
+      "additionalProperties": false
+    },
+    "KeyContainer": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "The systems' `keys` setting, as written."
+        },
+        "systems": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The systems that use it (short names)."
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "locked",
+            "unlocked"
+          ]
+        },
+        "count": {
+          "type": "number",
+          "description": "Keys held from it."
+        }
+      },
+      "required": [
+        "file",
+        "systems",
+        "state",
+        "count"
       ],
       "additionalProperties": false
     },
@@ -4085,6 +4318,10 @@
         "path": {
           "type": "string",
           "description": "Run this executable instead of the installed plugin (a build of the user's own)."
+        },
+        "shareDecrypted": {
+          "type": "string",
+          "description": "Config file only: the sentence (docs/plugins/README.md, \"Decrypted calls\") that lets this plugin be given calls decrypted with the recorder's keys. Without it, none are."
         }
       },
       "required": [
@@ -4936,11 +5173,15 @@
             "number",
             "null"
           ],
-          "description": "Its frequency error as measured on the control channels, ppm (+: signals come in high); null until measured."
+          "description": "Its frequency error, ppm (+: signals come in high): the median of its last control channel and call measurements; null until measured."
         },
         "tunePpm": {
           "type": "number",
           "description": "The correction autoTune applies now, ppm."
+        },
+        "tuneSeeded": {
+          "type": "boolean",
+          "description": "The correction is an earlier run's score (nothing measured yet)."
         }
       },
       "required": [
@@ -5341,6 +5582,10 @@
         },
         "bad": {
           "type": "number"
+        },
+        "airS": {
+          "type": "number",
+          "description": "Seconds of air the decoded messages account for (P25), of `elapsedS`."
         },
         "modulation": {
           "type": "string"
@@ -5783,6 +6028,14 @@
           "type": "string",
           "description": "Multi-site: sites with one group are one system (a call on several is saved once). Absent: grouped by what the control channels say (P25 WACN + System ID, SmartNet System ID)."
         },
+        "keys": {
+          "type": "string",
+          "description": "Desktop: its P25 encryption keys file, absolute or relative to the config file's folder (read when recording starts; never sent here)."
+        },
+        "keysPasswordFile": {
+          "type": "string",
+          "description": "Desktop: the file holding the password of `keys` when that is a KFDtool key container (`.ekc`); never sent here."
+        },
         "plugins": {
           "type": "object",
           "additionalProperties": {
@@ -6018,6 +6271,13 @@
         "encPct": {
           "type": "number"
         },
+        "ciphers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CipherSeen"
+          },
+          "description": "The ciphers its calls' encryption sync named, most recent first."
+        },
         "new": {
           "type": "boolean",
           "description": "First heard in the last day (once the system has a baseline)."
@@ -6041,6 +6301,7 @@
         "secs",
         "totalCalls",
         "encPct",
+        "ciphers",
         "new",
         "hourly"
       ],
@@ -6067,6 +6328,62 @@
           "required": [
             "type",
             "config"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysQuery"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysUnlock"
+            },
+            "file": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "id": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "file",
+            "password"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "keysLock"
+            },
+            "file": {
+              "type": "string"
+            },
+            "id": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "type"
           ],
           "additionalProperties": false
         },

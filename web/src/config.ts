@@ -160,7 +160,7 @@ export function watchedChannels(x: System): number[] {
 const SYSTEM_KEYS: (keyof System)[] = [
   "shortName", "name", "type", "bandplan", "bandplanBaseHz", "bandplanSpacingHz", "bandplanOffset", "bandplanHighHz", "lcnTableHz", "dmrChannelsHz",
   "colorCode", "nxdnType", "nxdnRate", "nxdnChannelsHz", "ran", "defaultMode", "enabled", "controlChannelsHz", "modulation", "talkgroupsCsv",
-  "talkgroupsName", "expect", "voiceChannelsHz", "recording", "unitNames", "siteGroup", "plugins",
+  "talkgroupsName", "expect", "voiceChannelsHz", "recording", "unitNames", "siteGroup", "keys", "plugins",
 ];
 
 /** `x` without the keys in `known`: what this version doesn't know of it, kept as it was (as the recorder's `other`). */
@@ -214,6 +214,7 @@ export function normalizeSystem(x: Partial<System>): System {
     ...(x.recording && Object.keys(x.recording).length ? { recording: x.recording } : {}),
     ...(x.unitNames && (x.unitNames.csv || x.unitNames.mode) ? { unitNames: x.unitNames } : {}),
     ...(x.siteGroup?.trim() ? { siteGroup: x.siteGroup } : {}),
+    ...(x.keys?.trim() ? { keys: x.keys } : {}),
     ...(plain(x.plugins) && Object.keys(x.plugins!).length ? { plugins: x.plugins } : {}),
   };
 }
@@ -933,8 +934,8 @@ export function importTrunkRecorderConfig(
   for (const s of sources) {
     const dev = typeof s.device === "string" ? s.device : "";
     const center = typeof s.center === "number" ? s.center : 0;
-    // Trunk Recorder's "error" is a fixed offset in Hz; here it is ppm.
-    const ppm = typeof s.ppm === "number" ? s.ppm : typeof s.error === "number" && center ? Math.round((s.error / center) * 1e6 * 100) / 100 : 0;
+    // Trunk Recorder's "error" is a fixed offset in Hz it tunes up by (+ = signals come in high); here it is ppm, the other way.
+    const ppm = typeof s.ppm === "number" ? s.ppm : typeof s.error === "number" && center ? Math.round((-s.error / center) * 1e6 * 100) / 100 : 0;
     const gain = typeof s.gain === "number" ? s.gain : undefined;
     const agc = s.agc === true;
     const autoTune = s.autoTune === true ? { autoTune: true } : {};
