@@ -1,0 +1,17 @@
+[package]
+name = "blip25-vocoder-module"
+description = "Trunk Recorder Pro vocoder module: IMBE and AMBE+2 through the blip25-vocoder crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "blip25-vocoder"
+path = "src/main.rs"
+
+[dependencies]
+vocoder-module-sdk = { path = "../sdk" }
+# Patent-encumbered: see this folder's README and the crate's PATENT_NOTICE.md.
+blip25-vocoder = "1.0"

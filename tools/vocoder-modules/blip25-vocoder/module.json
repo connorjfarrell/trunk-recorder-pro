@@ -1,0 +1,5 @@
+{
+  "name": "blip25-vocoder",
+  "description": "openBLIP25's blip25-vocoder: IMBE (P25 Phase 1) and AMBE+2 (Phase 2, DMR, NXDN). Patent-encumbered; read its PATENT_NOTICE.md.",
+  "codecs": ["imbe", "ambe"]
+}

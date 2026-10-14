@@ -24,7 +24,7 @@ struct Slot {
 
 impl Slot {
     fn new(seed: u32) -> Self {
-        Slot { dec: mbe::Decoder::new(mbe::lcg(seed), mbe::Profile::Enhanced), talkgroup: None, source: None, group: true, encrypted: false, emergency: false }
+        Slot { dec: mbe::Decoder::new_ambe(mbe::lcg(seed)), talkgroup: None, source: None, group: true, encrypted: false, emergency: false }
     }
 }
 
@@ -98,6 +98,7 @@ impl DmrVoice {
                 let Some(group) = lc.voice_user() else { return };
                 if from == LcFrom::Terminator {
                     // End of the transmission (repeated through the hang time): not a call of its own.
+                    s.dec.release();
                     s.source = None;
                     s.encrypted = false;
                     s.emergency = false;
@@ -110,7 +111,9 @@ impl DmrVoice {
                 s.source = Some(src);
                 if from == LcFrom::Header {
                     // A new transmission: what an earlier one was (its
-                    // terminator lost in a fade) doesn't carry over.
+                    // terminator lost in a fade) doesn't carry over, nor does a
+                    // vocoder module's stream.
+                    s.dec.release();
                     s.encrypted = lc.encrypted();
                     s.emergency = lc.emergency();
                 } else {

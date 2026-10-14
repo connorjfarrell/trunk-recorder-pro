@@ -1,0 +1,16 @@
+# Example vocoder modules for Trunk Recorder Pro, built by the user and
+# installed in the app's vocoders/ folder. Not part of the app's workspace: the
+# app ships none of the code these pull in.
+[workspace]
+resolver = "3"
+members = ["sdk", "blip25-vocoder", "blip25-mbe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

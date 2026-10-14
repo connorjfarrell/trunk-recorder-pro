@@ -2424,12 +2424,26 @@ export function Setup() {
                 <input className="mono" value={c.recording.prerollS} onChange={(e) => updateConfig((x) => void (x.recording.prerollS = Math.max(0, Math.min(3, Number(e.target.value) || 0))))} />
               </Field>
               <Field label="P25 voice decoder" hint="Fixed-point usually sounds most natural">
-                <select value={c.recording.vocoder ?? "fixed"} onChange={(e) => updateConfig((x) => void (x.recording.vocoder = e.target.value as "fixed" | "enhanced" | "mbelib"))}>
+                <select
+                  value={/^module:/i.test(c.recording.vocoder ?? "") ? "module" : (c.recording.vocoder ?? "fixed")}
+                  onChange={(e) => updateConfig((x) => void (x.recording.vocoder = e.target.value === "module" ? "module:" : (e.target.value as "fixed" | "enhanced" | "mbelib")))}
+                >
                   <option value="fixed">Fixed-point</option>
                   <option value="enhanced">Enhanced</option>
                   <option value="mbelib">mbelib</option>
+                  {(!web || /^module:/i.test(c.recording.vocoder ?? "")) && <option value="module">External module…</option>}
                 </select>
               </Field>
+              {!web && /^module:/i.test(c.recording.vocoder ?? "") && (
+                <Field label="Vocoder module" hint="The folder name in vocoders/ beside the config; built-in decoder if it can't run">
+                  <input
+                    className="mono"
+                    value={c.recording.vocoder.slice("module:".length)}
+                    placeholder="blip25-vocoder"
+                    onChange={(e) => updateConfig((x) => void (x.recording.vocoder = `module:${e.target.value.replace(/[^A-Za-z0-9._-]/g, "").replace(/^\.+/, "").slice(0, 64)}`))}
+                  />
+                </Field>
+              )}
               <Toggle
                 label="Save a call heard on several sites once"
                 hint="Keeps the cleanest copy, or the Preferred Site's"

@@ -251,8 +251,8 @@ export interface Recording extends RecordingRules {
   captureFrames: boolean;
   /** A call heard on several sites of one system: save the best copy only. */
   dropDuplicateCalls: boolean;
-  /** IMBE vocoder for P25 Phase 1 voice. */
-  vocoder: "fixed" | "enhanced" | "mbelib";
+  /** IMBE vocoder for P25 Phase 1 voice; "module:<id>": a vocoder module in vocoders/<id>/ (id: 1 to 64 of A-Z a-z 0-9 . _ -, not starting with a dot; desktop and server only). */
+  vocoder: "fixed" | "enhanced" | "mbelib" | `module:${string}`;
   /** M4A for the plugins that upload it, and for compressWav (desktop app). */
   m4a?: { encoder: string; bitrateKbps: number };
   /**

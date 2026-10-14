@@ -347,7 +347,8 @@ A call that isn't kept logs `Call not saved - no audio, or shorter than the mini
 - **P25 voice decoder** (`vocoder`): which IMBE vocoder turns P25 Phase 1 voice into audio.
   **Fixed-point** (the default) is Pavel Yazev's decoder, Trunk Recorder's `softVocoder: false`, and
   usually sounds most natural. **Enhanced** is Trunk Recorder's floating-point synthesis. **mbelib**
-  behaves exactly like mbelib.
+  behaves exactly like mbelib. A [vocoder module](vocoder-modules.md) you install can replace
+  these, for P25 Phase 1 and, if it does AMBE+2, for Phase 2, DMR and NXDN too.
 - **Save vocoder frames** (`captureFrames`, off): also saves each digital call's raw vocoder frames
   as `<name>.sdr`, MimoSDR's call file ([sdr-stream](https://github.com/MimoCAD/sdr-stream)):
   the call's identity and the voice still coded, about a tenth the size of the WAV. MimoSDR's
