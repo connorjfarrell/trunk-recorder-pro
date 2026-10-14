@@ -48,6 +48,15 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 - **Delete old calls:** Setup → Recording → Recorder has **Keep calls for, days**, **Keep at most,
   GB** and **Keep at most, % of the disk** (`recording.retention`). Past any that are set, the
   oldest calls are deleted from the recordings folder, checked every ten minutes. Off by default.
+- **Phase 2, DMR and NXDN tone frames now play as tones:** a dispatch tone-out sent
+  as AMBE+2 tone frames (a pure tone or a pair, with a tone ID and a level)
+  came out as silence with a click at each frame edge, because the decoder
+  took the tone ID for part of a pitch and faded to nothing. It now reads the
+  frame by TIA-102.BABA-A §2.10 and plays the Annex T tone at the level it
+  names, continuous from frame to frame (checked against the reference
+  vocoder's amplitude to within 4 %). A tone frame the FEC damaged keeps the
+  tone going, and tone frames no longer count as bad frames. The mbelib
+  profile still plays none, as mbelib doesn't.
 
 ## [0.1.11] — 2026-10-14
 
