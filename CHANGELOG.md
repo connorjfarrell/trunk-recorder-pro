@@ -94,6 +94,40 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   plugin's card in Setup → Plugins (`plugins.<id>.shareDecrypted`) for each one that should have
   them. Voice of a call that ends in the same moment it is decrypted is no longer taken for clear.
   See [Decrypted calls](docs/plugins/README.md#decrypted-calls).
+- **Two more P25 voice decoders:** `recording.vocoder` (and **P25 voice
+  decoder** in Setup) accepts `blip25-mbe` and `blip25-vocoder`, openBLIP25's
+  MIT-licensed Rust IMBE decoders, which follow the spec's synthesis with no
+  post-filter. `trunk-pro tool revoice --profile` takes them too. Phase 1
+  only: Phase 2, DMR and NXDN voice stay on the enhanced decoder.
+
+- **Playback**, a new page beside Listen: search everything the recorder has
+  saved, not just the last 24 hours, by system, talkgroup, radio ID, a name or
+  alias, and a span of time, and play what turns up (one call after the next,
+  in time order if you like). Lists the talkgroups and radios heard in the
+  span, and **Only talkgroups not in my list** answers "what's this new
+  talkgroup?". The app only, for now; the browser version has Listen.
+- **Two SDRplay radios in one process:** a second RSP source no longer
+  fails with `SelectDevice() failed`. SoapySDRPlay3 opens one SDRplay API
+  session per process, which can select only one radio, so trunk-pro now
+  opens one more session for each further SDRplay source (as SDRTrunk
+  does). Two radios on one USB bus can still run out of bandwidth: 3 + 3
+  MS/s failed in testing, and 2.5 + 6 MS/s worked. A source at 2 MS/s or
+  below runs its radio at 6 MS/s; use separate USB controllers if a
+  pair doesn't fit.
+- **Encryption keys from a KFDtool container:** `keys` can name a KFDtool
+  key container (`.ekc`) instead of a JSON file, with `keysPasswordFile`
+  naming a file that holds its password. The keys stay encrypted on disk
+  and the password sits apart from them, so nothing in the config or the
+  keys file is a secret in the clear. A password file others can read is
+  refused. Keys the recorder can't decrypt (key-encryption keys, DES-XL)
+  are listed in the log and left out. `replay` takes
+  `--keys-password-file` too.
+- **Unlock a key container from the interface:** a container with no
+  `keysPasswordFile` waits for its password, typed into Setup → Recording →
+  Key containers. The keys are held in memory only, reach calls in progress,
+  and **Lock** takes them away at once. Only a browser on the recorder's own
+  computer may unlock (or, with `server.allowLanUnlock`, one on the private
+  network); no browser is ever sent a key.
 
 - **Encryption keys are wiped from memory:** the keys in a system's keyring,
   the keys file's text and its parsed contents, and the cipher's key-derived

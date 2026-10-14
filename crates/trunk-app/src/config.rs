@@ -766,7 +766,8 @@ pub struct Recording {
     pub drop_duplicate_calls: bool,
     /// IMBE vocoder for P25 Phase 1 voice: "fixed" (Pavel Yazev's fixed-point
     /// decoder, Trunk Recorder's softVocoder false), "enhanced" (TR's float
-    /// synthesis) or "mbelib".
+    /// synthesis), "mbelib", or one of openBLIP25's decoders: "blip25-mbe" or
+    /// "blip25-vocoder".
     pub vocoder: String,
     /// M4A for the plugins that upload it, encoded once per call.
     pub m4a: M4a,

@@ -16,7 +16,7 @@
 //! JSON lines, then OSW counts and the measured carrier offset.
 //!
 //! `tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile
-//! enhanced|fixed|mbelib] [--seed 1] [--hard-fec] [--s16]` — vocode a call's
+//! enhanced|fixed|mbelib|blip25-mbe|blip25-vocoder] [--seed 1] [--hard-fec] [--s16]` — vocode a call's
 //! frame capture (the recording setting "Save vocoder frames") again, e.g.
 //! with another vocoder profile; `--hard-fec` uses TIA's repeat thresholds,
 //! `--s16` writes raw 16-bit samples at the vocoder's own scale instead of a
@@ -355,7 +355,7 @@ fn run_revoice(a: &Args) {
     use trunk_core::trunk::frames::Codec;
     let path = a.positional.get(1).unwrap_or_else(|| die("tool revoice <call.sdr | call.frames.jsonl> <out.wav>"));
     let out = a.positional.get(2).unwrap_or_else(|| die("tool revoice: no output .wav"));
-    let profile = a.get("profile").map_or(mbe::Profile::Enhanced, |p| mbe::Profile::from_name(p).unwrap_or_else(|| die("tool revoice: --profile enhanced|fixed|mbelib")));
+    let profile = a.get("profile").map_or(mbe::Profile::Enhanced, |p| mbe::Profile::from_name(p).unwrap_or_else(|| die("tool revoice: --profile enhanced|fixed|mbelib|blip25-mbe|blip25-vocoder")));
     let mbelib = profile == mbe::Profile::Mbelib;
     let mut dec = mbe::Decoder::new(mbe::lcg(a.num("seed", 1.0) as u32), profile);
     if a.flag("hard-fec") {
