@@ -410,9 +410,11 @@ pub fn run_with(source: usize, mut cfg: SoapyConfig, tx: SyncSender<SourceMsg>, 
 /// session that already has one, and SoapySDRPlay3 opens a single session per
 /// process, so a second RSP fails with "SelectDevice() failed". As SDRTrunk
 /// does, open another session just before a radio is opened while another is
-/// in use, once per source (a retry reuses it). Sessions are never closed:
-/// closing one makes the others unusable. The open and the select must not
-/// interleave with another radio's, hence the lock held until `made()`.
+/// in use and the API's current session (the one opened or released last) has
+/// a radio on it. A session that stays idle (a failed open, a radio released)
+/// is reused, so retries and restarts don't pile them up. Sessions are never
+/// closed: closing one makes the others unusable. The open and the select must
+/// not interleave with another radio's, hence the lock held until `made()`.
 /// The `driver=` in device arguments, if they name one.
 fn explicit_driver(args: &str) -> Option<String> {
     args.split(',').find_map(|kv| kv.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("driver")).map(|(_, v)| v.trim().to_ascii_lowercase()))
@@ -441,16 +443,18 @@ struct SdrplaySlot {
     /// Arguments for `make` that name the device found by the fallback detection (None: use the source's own).
     make_args: Option<String>,
     live: bool,
+    /// The radio opened (so its release leaves the current session idle).
+    opened: bool,
     _opening: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 static SDRPLAY_OPENING: Mutex<()> = Mutex::new(());
-static SDRPLAY: Mutex<(usize, Vec<usize>)> = Mutex::new((0, Vec::new())); // (radios in use, sources that opened a session)
+static SDRPLAY: Mutex<(usize, bool)> = Mutex::new((0, true)); // (radios in use, the API's current session has no radio on it)
 
 impl SdrplaySlot {
     /// `args` that aren't an SDRplay (or no API library to open sessions with) take no slot.
-    fn take(a: &Api, source: usize, args: &str) -> SdrplaySlot {
-        let mut none = SdrplaySlot { make_args: None, live: false, _opening: None };
+    fn take(a: &Api, args: &str) -> SdrplaySlot {
+        let mut none = SdrplaySlot { make_args: None, live: false, opened: false, _opening: None };
         let explicit = explicit_driver(args);
         if explicit.as_deref().is_some_and(|d| d != "sdrplay") {
             return none;
@@ -485,18 +489,22 @@ impl SdrplaySlot {
             return none;
         };
         let mut st = SDRPLAY.lock().unwrap();
-        if st.0 > 0 && !st.1.contains(&source) {
+        if st.0 > 0 && !st.1 {
             // SAFETY: see above.
             if unsafe { open() } == 0 {
-                st.1.push(source);
+                st.1 = true;
             }
         }
         st.0 += 1;
-        SdrplaySlot { make_args, live: true, _opening: Some(guard) }
+        SdrplaySlot { make_args, live: true, opened: false, _opening: Some(guard) }
     }
 
     /// The radio is open (or failed to): let the next one open.
-    fn made(&mut self) {
+    fn made(&mut self, opened: bool) {
+        if self.live && opened {
+            self.opened = true;
+            SDRPLAY.lock().unwrap().1 = false;
+        }
         self._opening = None;
     }
 }
@@ -504,7 +512,11 @@ impl SdrplaySlot {
 impl Drop for SdrplaySlot {
     fn drop(&mut self) {
         if self.live {
-            SDRPLAY.lock().unwrap().0 -= 1;
+            let mut st = SDRPLAY.lock().unwrap();
+            st.0 -= 1;
+            if self.opened {
+                st.1 = true; // the radio is released first (see `stream_once`): its session is the current one, idle
+            }
         }
     }
 }
@@ -569,13 +581,13 @@ fn stream_once(source: usize, cfg: &SoapyConfig, tx: &SyncSender<SourceMsg>, sto
     let a = api()?;
     // Modules load here rather than inside make, so a broken one is reported.
     modules();
-    let mut sdrplay = SdrplaySlot::take(a, source, &cfg.args);
+    let mut sdrplay = SdrplaySlot::take(a, &cfg.args);
     let args = CString::new(sdrplay.make_args.as_deref().unwrap_or(&cfg.args)).map_err(|e| e.to_string())?;
     let mut d = Device { a, dev: std::ptr::null_mut(), stream: std::ptr::null_mut(), active: false };
     // SAFETY: SoapySDR C API calls on the device and stream `d` owns.
     unsafe {
         d.dev = (a.make)(args.as_ptr());
-        sdrplay.made();
+        sdrplay.made(!d.dev.is_null());
         if d.dev.is_null() {
             let why = a.last_error.map(|f| cstr(f())).filter(|s| !s.is_empty()).unwrap_or_else(|| "no matching device".into());
             return Err(format!("SoapySDR open {}: {why}", if cfg.args.is_empty() { "(first)" } else { &cfg.args }));
