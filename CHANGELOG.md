@@ -22,14 +22,6 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   in time order if you like). Lists the talkgroups and radios heard in the
   span, and **Only talkgroups not in my list** answers "what's this new
   talkgroup?". The app only, for now; the browser version has Listen.
-- **Two SDRplay radios in one process:** a second RSP source no longer
-  fails with `SelectDevice() failed`. SoapySDRPlay3 opens one SDRplay API
-  session per process, which can select only one radio, so trunk-pro now
-  opens one more session whenever a radio is opened while another is in
-  use (as SDRTrunk does), including after Setup's Restart. Two radios on one USB bus can still run out of bandwidth: 3 + 3
-  MS/s failed in testing, and 2.5 + 6 MS/s worked. A source at 2 MS/s or
-  below runs its radio at 6 MS/s; use separate USB controllers if a
-  pair doesn't fit.
 - **Encryption keys from a KFDtool container:** `keys` can name a KFDtool
   key container (`.ekc`) instead of a JSON file, with `keysPasswordFile`
   naming a file that holds its password. The keys stay encrypted on disk
@@ -75,6 +67,16 @@ under `## [<version>]` when the tag `v<version>` is pushed).
   recording options like saving vocoder frames), a "Change requires
   restart" banner offers Restart now. Settings the recorder takes live
   (talkgroup files, plugins, the log) don't raise it.
+- **Two SDRplay radios in one process:** a second RSP source no longer
+  fails with `SelectDevice() failed`. SoapySDRPlay3 opens one SDRplay API
+  session per process, which can select only one radio, so trunk-pro now
+  opens one more session whenever a source with `driver=sdrplay` in its
+  device arguments opens while another radio is in use (as SDRTrunk does),
+  including after Setup's Restart. Two radios on one USB bus
+  can still run out of bandwidth: 3 + 3 MS/s failed in testing, and
+  2.5 + 6 MS/s worked. A source at 2 MS/s or
+  below runs its radio at 6 MS/s; use separate USB controllers if a
+  pair doesn't fit.
 
 ## [0.1.11] — 2026-10-14
 
