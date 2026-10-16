@@ -311,6 +311,12 @@ frame:
   frame.
 - Profiles: `fixed` (Pavel Yazev's fixed-point IMBE, the app default for Phase 1), `enhanced`,
   `mbelib`. AMBE always uses `enhanced`.
+- AMBE+2 tone frames (`û0(11..6)` all ones, `û3(3..0)` zero; BABA-A §2.10): the tone ID (sent four
+  times, bitwise majority) indexes Annex T (`mbe/tone_table.rs`) for the fundamental and the one or
+  two harmonics; those are voiced at `16384·10^(0.03555·(level−127))` and the rest silent, through
+  the ordinary voiced synthesis. A damaged one (> 3 errors) goes on with the playing tone if its ID
+  names it, else repeats it up to 3 times. Checked in `Decoder::ambe` before mbelib's parameter
+  decode, so the `mbelib` profile reads them as mbelib does.
 - Scaling: ×7/32768, then a tanh soft limiter above −3 dBFS.
 - `record::save_call`: drops transmissions shorter than `minTransmissionS` and encrypted ones
   that weren't decrypted,
@@ -911,7 +917,7 @@ Constants: `API_VERSION` = 1, `EXIT_CONFIG` = 78, conventional system index base
 | `call.concluded` | `path`, `system`, `call: CallRecord` (the call JSON), `files { json, wav, m4a }` |
 | `unit` | `system`, `short_name`, `kind` (registration, deregistration, affiliation, acknowledge, location, data_grant, answer_request, call_alert, emergency_alarm), `unit`, `talkgroup`, `time` |
 | `audio` | `call_id`, `system`, `short_name`, `talkgroup`, `sample_rate`, `pcm` (base64 i16 LE) |
-| `status` | `time`, `systems [{ index, short_name, control_channel_hz, decode_rate, active_calls, recording }]` |
+| `status` | `time`, `systems [{ index, short_name, control_channel_hz, decode_rate, active_calls, recording, nac, wacn, sys_id, rfss, site }]` (the identity fields once the control channel has stated them) |
 | `shutdown` | `grace_s` |
 
 **`PluginMessage`** (tag `type`): `ready`; `log { level, message }`; `status { state: ok |
