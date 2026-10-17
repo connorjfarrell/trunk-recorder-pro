@@ -178,7 +178,7 @@ What a page may do depends on the port it came from:
 | `setConfig`, `start`, `stop`, `quit`, plugins, interfaces, keys, the survey, files on the recorder's computer | refused with an `error` | ✓ |
 
 A listen-only connection may send `subscribe`, `statsQuery`, `radioQuery`,
-`olderCalls` and `listen`. Its `hello` has no `configPath`, `keys` or
+`olderCalls`, `playbackQuery` and `listen`. Its `hello` has no `configPath`, `keys` or
 `pluginRuntime`, and it isn't sent `plugins`, `pluginRuntime`,
 `pluginStore`, `pluginInstall`, `interfaces`, `interfaceStore`,
 `interfaceInstall` or `keys`. An interface that needs more says
@@ -440,6 +440,7 @@ Every message is a JSON object with a `type`. Exact fields are in
 | `monitorEvent` | Something notable happened | `t`, `level`, `kind` (`controlLost`, `tgFirstSeen`, `sourceDrops`, `pluginHealth`, `linkDown`, `diskLow`, `spoolLow`, `spoolFull`, …) and its fields |
 | `subscribed` | Answers `subscribe` | `topics` |
 | `statsResult` | Answers `statsQuery` | `id`, `from`, `to`, `loading` (the history files are still being read), `series`: name → `{ t0, stepS, v, lo, hi, n }` |
+| `playbackResult` | Answers `playbackQuery` | `id`, `from`, `to`, `before`, `entries` (`CallEntry[]`, newest first), `more`, `total`, `truncated` (too many calls in the span to read: the oldest were left out), `systems`, and, on the first page only (no `before`), `talkgroups` (each with its calls, seconds, first and last heard, and `known`: whether the system's talkgroup file lists it) and `units` (radios heard, with the alias recorded); both `null` on later pages |
 | `radioResult` | Answers `radioQuery` | `id`, `what`, and by `what`: `rows` (talkgroups / radios / frequencies), `row` and its detail, `systems` (summary), `histogram` |
 | `concluded` | A call was recorded | `entry`: `{ path, record, audio, json }`; `audio` / `json`: whether they stay in the recordings folder once the plugins are done (**Keep audio** / **Keep call JSON**; false: deleted then) |
 | `callFiles` | A call's upload plugins are done, and it kept other than its entry said (an upload failed and its files stay) | `path`, `audio`, `json` |
@@ -496,6 +497,7 @@ aren't understood are ignored.
 | `installPlugin` | `id`, or `repository` + `tag?` | Install or update a plugin (→ `pluginInstall` as it goes). |
 | `subscribe` | `topics` | What this connection watches (replaces the last): `spectrum:<source>`, `log`, `rf:<source>`, `decode:<shortName>`, `platform` (→ `subscribed`). |
 | `statsQuery` | `id`, `series` (names, or prefixes ending in `*`), `range` (`10m` / `1h` / `6h` / `24h` / `7d`) or `from` / `to` (Unix s), `points?` | The minute history of series, averaged down to about `points` steps (→ `statsResult`). |
+| `playbackQuery` | `id`, `system?`, `talkgroup?`, `unit?`, `text?`, `newOnly?`, `from?`, `to?`, `before?`, `limit?` | Search the recordings folder, any time back (`olderCalls` is the last 24 hours): calls newest first, by system (short name), talkgroup, radio, words in a talkgroup's name or a radio's alias (`text`), or only talkgroups the system's talkgroup file lacks (`newOnly`: "what's this new talkgroup?"). `from` / `to` are Unix ms (default the last 24 hours); `limit` is 100 by default, at most 500; `before` (Unix ms) asks for the next page. Folders are listed and call JSONs read on each query, so a long span takes a moment (→ `playbackResult`). |
 | `radioQuery` | `id`, `what`, `system?`, `key?`, `hours?`, `limit?` | The radio registry: `summary`, `talkgroups`, `units`, `tg` (`key`: the talkgroup), `unit` (`key`: the radio), `freqs`, `lengths` (→ `radioResult`). |
 | `quit` | — | Stop recording and exit the recorder. |
 

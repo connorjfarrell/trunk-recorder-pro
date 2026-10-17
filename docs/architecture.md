@@ -512,7 +512,7 @@ is generated from it (`npm run schema`), and
   `installPlugin`, `interfaces`, `interfaceStore`, `installInterface`,
   `addInterface`, `removeInterface`, `subscribe`, `statsQuery`,
   `radioQuery`, `quit`. A listen-only connection may send only `subscribe`,
-  `statsQuery`, `radioQuery`, `olderCalls` and `listen`.
+  `statsQuery`, `radioQuery`, `olderCalls`, `playbackQuery` and `listen`.
 - **HTTP routes**, on every interface's port (`server::api`):
   - `/api/ws`, `/api/version`, `/api/docs`, `/api/schema`, `/api/protocol.ts`,
     `/api/*` (the docs/api folder).

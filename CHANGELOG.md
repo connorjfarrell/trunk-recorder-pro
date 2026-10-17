@@ -5,6 +5,12 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+- **`playbackQuery`: search every recording, for interfaces.** The API can now search the recordings folder
+  any time back (`olderCalls` reaches 24 hours): by system, talkgroup, radio, words in a name or
+  alias, or only talkgroups the talkgroup file lacks, a page at a time, with the talkgroups and
+  radios heard in the span. A listen-access interface may send it. It reads the folders on each
+  query, with no index.
+
 ## [0.1.14] — 2026-10-16
 
 - **Interfaces for people who listen, from an interface store.** Besides its own interface, the
