@@ -1289,7 +1289,6 @@ mod tests {
         assert_eq!(mb.ambe(&tone_bits(32, 100), 0, &mut out), Kind::Erasure);
         assert!(out.iter().all(|&s| s == 0.0));
     }
-    }
 
     /// A vocoder module that speaks a few frames, then fails.
     struct Flaky(u32);
