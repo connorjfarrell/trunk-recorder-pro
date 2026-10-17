@@ -84,7 +84,7 @@ struct Slot {
 impl Slot {
     fn new(rng: mbe::Rng) -> Self {
         Slot {
-            dec: mbe::Decoder::new(rng, mbe::Profile::Enhanced),
+            dec: mbe::Decoder::new_ambe(rng),
             active: false,
             voice: Encryption::Unknown,
             first4v: None,
@@ -220,6 +220,8 @@ impl Slot {
     /// waiting for a sync that won't come goes out (or is dropped).
     fn end(&mut self, c: usize, keys: &Option<Arc<Keyring>>, out: &mut Vec<(usize, TrackerOut)>) -> u64 {
         let bad = self.release_held(c, out);
+        // After the held voice: decoding it would open a module stream again.
+        self.dec.release();
         self.active = false;
         self.set_es(None, keys);
         self.last_vb = None;

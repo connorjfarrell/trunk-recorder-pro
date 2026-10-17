@@ -4664,14 +4664,19 @@
         },
         "vocoder": {
           "type": "string",
-          "enum": [
-            "fixed",
-            "enhanced",
-            "mbelib",
-            "blip25-mbe",
-            "blip25-vocoder"
+          "anyOf": [
+            {
+              "enum": [
+                "fixed",
+                "enhanced",
+                "mbelib"
+              ]
+            },
+            {
+              "pattern": "^module:[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$"
+            }
           ],
-          "description": "IMBE vocoder for P25 Phase 1 voice."
+          "description": "IMBE vocoder for P25 Phase 1 voice: fixed, enhanced, mbelib, or module:<id> for a vocoder module installed in vocoders/<id>/ (see docs/guides/vocoder-modules.md)."
         },
         "m4a": {
           "type": "object",

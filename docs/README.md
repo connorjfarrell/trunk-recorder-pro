@@ -62,6 +62,7 @@ LimeSDR...).
 - [SmartNet](guides/smartnet.md)
 - [Trunked DMR](guides/dmr.md)
 - [NXDN](guides/nxdn.md)
+- [Vocoder modules](guides/vocoder-modules.md): use another vocoder, a licensed library or a DVSI dongle
 - [Several systems and sites](guides/multi-site.md)
 - [Talkgroups and unit names](guides/talkgroups-and-units.md)
 - [Conventional channels](guides/conventional.md)

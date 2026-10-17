@@ -224,6 +224,8 @@ impl VoiceTracker {
                 }
                 // Voice still waiting for a sync that won't come.
                 self.release_held(out);
+                // After the held voice: decoding it would open a module stream again.
+                self.dec.release();
                 self.end(out);
                 self.active = false;
                 self.set_es(None);
@@ -403,6 +405,7 @@ impl VoiceTracker {
             // Quiet with no terminator: the next transmission re-learns its cipher.
             self.end(out);
             self.active = false;
+            self.dec.release();
         }
         if !self.active {
             self.start(t, None);

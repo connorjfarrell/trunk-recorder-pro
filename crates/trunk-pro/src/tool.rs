@@ -16,7 +16,8 @@
 //! JSON lines, then OSW counts and the measured carrier offset.
 //!
 //! `tool revoice <call.sdr | call.frames.jsonl> <out.wav> [--profile
-//! enhanced|fixed|mbelib|blip25-mbe|blip25-vocoder] [--seed 1] [--hard-fec] [--s16]` — vocode a call's
+//! enhanced|fixed|mbelib|module:<id>] [--modules-dir DIR] [--seed 1] [--hard-fec]
+//! [--s16]` — vocode a call's
 //! frame capture (the recording setting "Save vocoder frames") again, e.g.
 //! with another vocoder profile; `--hard-fec` uses TIA's repeat thresholds,
 //! `--s16` writes raw 16-bit samples at the vocoder's own scale instead of a
@@ -355,12 +356,18 @@ fn run_revoice(a: &Args) {
     use trunk_core::trunk::frames::Codec;
     let path = a.positional.get(1).unwrap_or_else(|| die("tool revoice <call.sdr | call.frames.jsonl> <out.wav>"));
     let out = a.positional.get(2).unwrap_or_else(|| die("tool revoice: no output .wav"));
-    let profile = a.get("profile").map_or(mbe::Profile::Enhanced, |p| mbe::Profile::from_name(p).unwrap_or_else(|| die("tool revoice: --profile enhanced|fixed|mbelib|blip25-mbe|blip25-vocoder")));
+    let profile = a.get("profile").map_or(mbe::Profile::Enhanced, |p| mbe::Profile::from_name(p).unwrap_or_else(|| die("tool revoice: --profile enhanced|fixed|mbelib|module:<id>")));
     let mbelib = profile == mbe::Profile::Mbelib;
+    if profile == mbe::Profile::External {
+        let root = a.get("modules-dir").map_or_else(crate::vocoder_modules::modules_dir, std::path::PathBuf::from);
+        crate::vocoder_modules::select_in(&root, a.get("profile").unwrap_or_default());
+    }
     let mut dec = mbe::Decoder::new(mbe::lcg(a.num("seed", 1.0) as u32), profile);
     if a.flag("hard-fec") {
         dec.hard_fec();
     }
+    // A vocoder module has a stream per codec: IMBE on `dec`, AMBE+2 on this one.
+    let mut dec_ambe = (profile == mbe::Profile::External).then(|| mbe::Decoder::new_ambe(mbe::lcg(a.num("seed", 1.0) as u32)));
     // --s16: raw 16-bit samples at the vocoder's own scale (mbelib's ×7), no limiter.
     let s16 = a.flag("s16");
     let mut pcm: Vec<i16> = Vec::new();
@@ -374,7 +381,7 @@ fn run_revoice(a: &Args) {
             }
             Codec::Ambe => {
                 let bits: [u8; 49] = f.bits[..].try_into().unwrap();
-                dec.ambe(&bits, f.errs, &mut buf)
+                dec_ambe.as_mut().unwrap_or(&mut dec).ambe(&bits, f.errs, &mut buf)
             }
         };
         differ += (kind != f.kind) as u32;
