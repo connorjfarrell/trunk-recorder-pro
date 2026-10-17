@@ -27,7 +27,7 @@ pub enum Door {
 }
 
 /// Commands a listen-only page may send.
-const LISTEN_COMMANDS: &[&str] = &["subscribe", "statsQuery", "radioQuery", "olderCalls", "listen"];
+const LISTEN_COMMANDS: &[&str] = &["subscribe", "statsQuery", "radioQuery", "olderCalls", "playbackQuery", "listen"];
 
 /// Messages only control access hears (plugin and interface management, key containers).
 const CONTROL_MESSAGES: &[&str] = &["plugins", "pluginRuntime", "pluginStore", "pluginInstall", "interfaces", "interfaceStore", "interfaceInstall", "keys"];
@@ -90,7 +90,7 @@ mod tests {
         assert!(!r.to_string().contains("apiKey") && !r.to_string().contains("k.json"));
         assert_eq!(r["systems"][0]["shortName"], "x");
         assert_eq!(r["server"]["port"], 8080);
-        assert!(may(ApiAccess::Listen, "listen") && may(ApiAccess::Listen, "olderCalls"));
+        assert!(may(ApiAccess::Listen, "listen") && may(ApiAccess::Listen, "olderCalls") && may(ApiAccess::Listen, "playbackQuery"));
         for c in ["setConfig", "start", "stop", "quit", "installPlugin", "listDir", "unlockKeys", "installInterface"] {
             assert!(!may(ApiAccess::Listen, c) && may(ApiAccess::Control, c), "{c}");
         }

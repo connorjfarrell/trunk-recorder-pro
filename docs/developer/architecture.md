@@ -1341,7 +1341,7 @@ full reference is `docs/api/README.md`.
 | On connect | `hello`, then `plugins` |
 | Every client | `state`, `status`, `stats`, `host`, `concluded`, `callFiles`, `monitorEvent`, `unitAlias`, `heard`, `config`, `survey`, `surveySpectrum`, `pluginRuntime`, `pluginInstall`, `quit` |
 | Topic subscribers | `spectrum` (`spectrum:<source>`, about 7/s, 512 bins), `log` (`log`), `rfDetail` (`rf:<source>`, 1/s), `decodeDetail` (`decode:<shortName>`, 1/s), per-core detail in `host` (`platform`) |
-| The sender only | `devices`, `radios`, `dir`, `trConfig`, `pluginStore`, `subscribed`, `statsResult`, `radioResult`, `olderCalls`, `sourceProfile`, `error`, `notice` |
+| The sender only | `devices`, `radios`, `dir`, `trConfig`, `pluginStore`, `subscribed`, `statsResult`, `radioResult`, `olderCalls`, `playbackResult`, `sourceProfile`, `error`, `notice` |
 | Binary, to listeners | live audio frames |
 
 Nothing is computed for a topic nobody watches. A client more than 4,096 messages behind on the
@@ -1352,7 +1352,7 @@ hub skips the oldest without notice.
 | Area | Commands |
 |---|---|
 | Recording | `setConfig`, `start`, `stop`, `quit`, `channelFile` |
-| Watching | `subscribe`, `listen`, `statsQuery`, `radioQuery`, `olderCalls` |
+| Watching | `subscribe`, `listen`, `statsQuery`, `radioQuery`, `olderCalls`, `playbackQuery` |
 | Setup | `devices`, `findRadios`, `listDir`, `readTrConfig`, `profileSource`, `surveyStart`, `surveyListen`, `surveyRescan`, `surveyStop` |
 | Plugins | `plugins`, `pluginStore`, `installPlugin` (by id, or repository and tag), `addPlugin`, `removePlugin` |
 
