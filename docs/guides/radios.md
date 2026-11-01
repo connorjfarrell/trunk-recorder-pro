@@ -2,13 +2,13 @@
 
 This page explains how Trunk Recorder Pro uses your radios (it calls them *sources*): how much
 spectrum each covers, where it is tuned, gain, frequency correction, and running several at once.
-Installing drivers for USRP, Airspy and SoapySDR radios is covered in
+Installing drivers for USRP, Airspy, bladeRF and SoapySDR radios is covered in
 [Other radios](../install/other-radios.md); every source key is listed in the
 [configuration reference](../configuration/sources.md).
 
 All of these settings are on the **Radios** tab of **Setup**, one card per source. **Add a
-source** adds another; the buttons at the top of a card pick its kind: **RTL-SDR**, **USRP**,
-**Airspy**, **SoapySDR** or **Capture file** (USRP, Airspy and SoapySDR only in the desktop app).
+source** adds another; the buttons at the top of a card pick its kind: **RTL-SDR**, **HackRF**, **USRP**,
+**Airspy**, **bladeRF**, **SoapySDR** or **Capture file** (USRP, Airspy, bladeRF and SoapySDR only in the desktop app).
 
 ## What a source is
 
@@ -35,8 +35,10 @@ The sample rates offered for each kind:
 | Kind | Offered | Notes |
 |---|---|---|
 | RTL-SDR | 2.4, 2.048, 2.56, 3.2, 1.92, 1.024 MSPS | 2.4 MSPS is the default |
+| HackRF | 1 to 20 MSPS | |
 | USRP | 2.4 to 20 MSPS, or any rate typed in | any rate its master clock divides to; default 8 MSPS |
 | Airspy | 10, 6, 3, 2.5 MSPS | R2: 10 or 2.5; Mini: 6 or 3 |
+| bladeRF | any rate typed in, 0.52 to 61.44 MSPS | over ~40 MSPS needs USB 3 and a fast CPU |
 | SoapySDR | 2 to 10 MSPS, or any rate typed in | one the device supports |
 
 Wider costs more CPU, but not by much: see [CPU](#cpu). A system whose frequencies spread wider
@@ -143,11 +145,18 @@ usually works better for trunked systems, so the default is AGC off (except on S
 | Kind | Gain setting | Default |
 |---|---|---|
 | RTL-SDR | **Gain, dB**, 0 to 49.6 on most dongles, or **AGC** | 25.4 dB, AGC off |
+| HackRF | **LNA, dB** 0 to 40 in steps of 8, **VGA, dB** 0 to 62 in steps of 2, and the **Amp** (+14 dB, overloads near strong signals) | LNA 16, VGA 20, amp off |
 | USRP | **Gain, dB** (B200/B210: 0 to 76), or **AGC** (B200 / B210 and E3xx only) | 40 dB, AGC off |
 | Airspy | **Gain**: **Linearity** or **Sensitivity**, a step 0 to 21; or **Each stage**: **LNA** 0 to 14, **Mixer** and **VGA (IF)** 0 to 15, with **AGC** for the LNA and mixer | Linearity, step 14 |
-| SoapySDR | **Gain, dB** overall (blank leaves it as the device has it), then **Gain stages, dB** one by one (HackRF LNA / VGA / AMP, SDRplay IFGR / RFGR...), or **AGC** | AGC on |
+| bladeRF | **Gain, dB** overall (bladeRF 2.0: about −15 to 60), or **AGC** | 30 dB, AGC off |
+| SoapySDR | **Gain, dB** overall (blank leaves it as the device has it), then **Gain stages, dB** one by one (SDRplay IFGR / RFGR...), or **AGC** | AGC on |
 
 On an Airspy, **Linearity** is best near transmitters and **Sensitivity** for weak signals.
+
+A gain changed in Setup while recording applies at once on an RTL-SDR or an Airspy (AGC on or off
+too, and an Airspy's preset or stages), and on a USRP, bladeRF or SoapySDR device for the gain in
+dB with AGC off (AGC on or off there applies at the next start); the log says the gain each took.
+Anything else about a radio applies when recording starts next: Stop, then Start.
 
 How to set it:
 
@@ -182,7 +191,8 @@ There are three ways to find the number:
   error: +1.40 ppm* once a control channel on it has been measured, and offers **Set correction
   to N ppm** when the error is 0.3 ppm or more. The error is measured whether AutoTune is on or
   not. The **RF** page shows it too, and the dashboard warns when a source is more than 2 ppm off
-  with AutoTune off.
+  with AutoTune off. (The RF page also shows the *sample clock*, `clockPpm` in a source's status:
+  the radio's crystal measured against the computer's clock, which times the calls.)
 - **AutoTune** corrects for it automatically (see below).
 
 ### AutoTune
@@ -205,6 +215,10 @@ with: a control channel that is too far off to decode can't be measured. Set the
 my system set it), then turn on AutoTune to follow drift. While recording, the source card shows
 how much AutoTune is correcting by (*corrected by +0.40 ppm*).
 
+Conventional channels take up a source's correction too, between calls. A source with only
+conventional channels has no control channel to measure; digital rows you mark can measure it
+from their calls instead. See [Conventional channels: frequency correction](conventional.md#frequency-correction).
+
 ## Running several radios
 
 More radios cover more spectrum: a second dongle can catch the voice channels the first can't
@@ -217,9 +231,9 @@ the Radios tab, whose usable range covers it**. Control channels are the same: e
 the first source that covers it. Where two radios overlap, the one higher in the list gets the
 channels in the overlap.
 
-A call whose frequency no source covers isn't recorded; the **Calls** page says *outside tuned
+A call whose frequency no source covers isn't recorded; a system's page under **Radio system** says *outside tuned
 range*, and the **Radio system** page counts these as *Out of band* (*No source covers the
-frequency*). A system with no control channel inside any source can't start: *no control channel
+frequency*) and lists their frequencies, with the nearest source and how far past its usable edge each is. A system with no control channel inside any source can't start: *no control channel
 falls inside a source's bandwidth — move the center frequency*.
 
 ### Placing several radios
@@ -249,7 +263,7 @@ Pro can't tell those apart, and it has no way to change a dongle's serial. Use l
 `rtl_eeprom` tool to give each one its own serial (for example `rtl_eeprom -d 0 -s 00000200` for
 the first dongle), unplug and replug it, then pick it in Setup.
 
-Airspys are picked by serial the same way. USRPs and SoapySDR devices are picked by their device
+Airspys and bladeRFs are picked by serial the same way. USRPs and SoapySDR devices are picked by their device
 arguments (`serial=...`, `addr=192.168.10.2`, `driver=sdrplay,serial=...`); **Find** lists what's
 connected.
 

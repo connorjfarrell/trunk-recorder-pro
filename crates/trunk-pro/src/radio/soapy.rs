@@ -9,15 +9,14 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_long, c_longlong, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use libloading::Library;
 use num_complex::Complex32;
 
-use super::DriverInfo;
-use crate::sdr::{Control, SourceMsg};
+use super::{cstr, ppm_corrected, Caps, Deadline, DriverInfo, Handed, Rates};
+use crate::sdr::{Applied, Block, Control, Gain, Retuned, Sink, Tunable};
 
 type Dev = *mut c_void;
 type Stream = *mut c_void;
@@ -71,6 +70,8 @@ struct Api {
     set_sample_rate: unsafe extern "C" fn(Dev, c_int, usize, f64) -> c_int,
     get_sample_rate: unsafe extern "C" fn(Dev, c_int, usize) -> f64,
     list_sample_rates: unsafe extern "C" fn(Dev, c_int, usize, *mut usize) -> *mut f64,
+    /// SoapySDR 0.6 and later: ranges as well as rates (a module that takes any rate in a span).
+    get_sample_rate_range: Option<unsafe extern "C" fn(Dev, c_int, usize, *mut usize) -> *mut SoapyRange>,
     set_frequency: unsafe extern "C" fn(Dev, c_int, usize, f64, *const Kwargs) -> c_int,
     has_gain_mode: unsafe extern "C" fn(Dev, c_int, usize) -> bool,
     set_gain_mode: unsafe extern "C" fn(Dev, c_int, usize, bool) -> c_int,
@@ -78,6 +79,32 @@ struct Api {
     set_gain_element: unsafe extern "C" fn(Dev, c_int, usize, *const c_char, f64) -> c_int,
     set_antenna: unsafe extern "C" fn(Dev, c_int, usize, *const c_char) -> c_int,
     write_setting: unsafe extern "C" fn(Dev, *const c_char, *const c_char) -> c_int,
+}
+
+/// SoapySDRRange.
+#[repr(C)]
+struct SoapyRange {
+    minimum: f64,
+    maximum: f64,
+    step: f64,
+}
+
+/// A module's sample-rate ranges ((min, max), Hz) as [`Rates`]: single rates when each is one.
+fn rates_of(ranges: &[(f64, f64)]) -> Option<Rates> {
+    if ranges.is_empty() {
+        return None;
+    }
+    if ranges.iter().all(|(lo, hi)| (hi - lo).abs() < 1.0) {
+        return Some(Rates::List(ranges.iter().map(|(lo, _)| lo.round() as u32).collect()));
+    }
+    let min = ranges.iter().map(|r| r.0).fold(f64::INFINITY, f64::min);
+    let max = ranges.iter().map(|r| r.1).fold(0.0, f64::max);
+    Some(Rates::Range { min, max })
+}
+
+/// Its key among the radios [`super::known`]: its device arguments, as a source names it.
+fn key(args: &str) -> String {
+    format!("soapy:{}", args.trim())
 }
 
 // SAFETY: plain C entry points; each device is used from one thread.
@@ -134,6 +161,7 @@ fn api() -> Result<&'static Api, String> {
                 set_sample_rate: f!("SoapySDRDevice_setSampleRate"),
                 get_sample_rate: f!("SoapySDRDevice_getSampleRate"),
                 list_sample_rates: f!("SoapySDRDevice_listSampleRates"),
+                get_sample_rate_range: opt!("SoapySDRDevice_getSampleRateRange"),
                 set_frequency: f!("SoapySDRDevice_setFrequency"),
                 has_gain_mode: f!("SoapySDRDevice_hasGainMode"),
                 set_gain_mode: f!("SoapySDRDevice_setGainMode"),
@@ -164,16 +192,6 @@ pub fn info() -> DriverInfo {
             DriverInfo { loaded: true, detail: format!("SoapySDR {v} (ABI {abi})") }
         }
         Err(e) => DriverInfo { loaded: false, detail: format!("SoapySDR {e}") },
-    }
-}
-
-/// SAFETY: `p` null or a NUL-terminated string.
-unsafe fn cstr(p: *const c_char) -> String {
-    unsafe {
-        if p.is_null() {
-            return String::new();
-        }
-        CStr::from_ptr(p).to_string_lossy().into_owned()
     }
 }
 
@@ -295,16 +313,22 @@ pub fn search_paths() -> Vec<String> {
 }
 
 /// Drivers this recorder has its own source for: better used that way.
-const NATIVE: &[(&str, &str)] = &[("rtlsdr", "RTL-SDR"), ("airspy", "Airspy"), ("uhd", "USRP")];
+const NATIVE: &[(&str, &str)] = &[("rtlsdr", "RTL-SDR"), ("hackrf", "HackRF"), ("airspy", "Airspy"), ("bladerf", "bladeRF"), ("uhd", "USRP")];
 
 /// Devices the loaded modules can see: [{args, label, driver}]. A real
 /// search (USB, network): some modules take seconds, so it runs only when asked.
 pub fn find() -> Result<Vec<serde_json::Value>, String> {
     let a = api()?;
     modules();
-    let mut n = 0usize;
-    // SAFETY: an empty args string; the list is freed below.
-    let list = unsafe { (a.enumerate)(c"".as_ptr(), &mut n) };
+    // Not while a radio opens: modules open radios to list them (SoapyAirspy, SoapyHackRF), and
+    // the SDRplay module's search shares state with its open. (Some search the network for seconds.)
+    let found = super::open("SoapySDR search", Deadline::Loads, true, move || {
+        let mut n = 0usize;
+        // SAFETY: an empty args string; the list is freed below.
+        let list = unsafe { (a.enumerate)(c"".as_ptr(), &mut n) };
+        Ok((Handed(list), n))
+    })?;
+    let (list, n) = (found.0.0, found.1);
     if list.is_null() {
         return Ok(vec![]);
     }
@@ -322,7 +346,11 @@ pub fn find() -> Result<Vec<serde_json::Value>, String> {
         if let Some((_, native)) = NATIVE.iter().find(|(d, _)| *d == driver) {
             label.push_str(&format!(" — the {native} source is recommended"));
         }
-        out.push(serde_json::json!({ "args": args, "label": label, "driver": driver }));
+        let mut j = serde_json::json!({ "args": args, "label": label, "driver": driver });
+        if let Some(c) = super::known(&key(&args)) {
+            c.add_to(&mut j);
+        }
+        out.push(j);
     }
     // SAFETY: the list enumerate returned.
     unsafe { (a.kwargs_list_clear)(list, n) };
@@ -380,32 +408,43 @@ fn pairs(s: &str) -> Vec<(String, String)> {
     s.split(',').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).filter(|(k, _)| !k.is_empty()).collect()
 }
 
-pub fn run(source: usize, cfg: SoapyConfig, tx: SyncSender<SourceMsg>, stop: Arc<AtomicBool>) {
-    run_with(source, cfg, tx, stop, None)
+impl crate::sdr::Radio for SoapyConfig {
+    const BACKOFF: Duration = Duration::from_secs(3);
+    fn retune_to(&mut self, hz: f64) {
+        self.center_hz = hz;
+    }
+    fn gain_to(&mut self, g: Gain) {
+        if let Gain::Db(db) = g {
+            self.gain_db = Some(db as f64);
+        }
+    }
+    fn rate_hz(&self) -> f64 {
+        self.rate_hz
+    }
+    fn stream_once(&self, sink: &mut Sink, stop: &Arc<AtomicBool>, ctl: Option<&Control>) -> Result<(), String> {
+        stream_once(self, sink, stop, ctl)
+    }
 }
 
-/// [`run`], retuned on request.
-pub fn run_with(source: usize, mut cfg: SoapyConfig, tx: SyncSender<SourceMsg>, stop: Arc<AtomicBool>, ctl: Option<Arc<Control>>) {
-    while !stop.load(Ordering::Relaxed) {
-        if let Some(c) = ctl.as_ref().and_then(|c| *c.current_hz.lock().unwrap()) {
-            cfg.center_hz = c;
-        }
-        if let Err(e) = stream_once(source, &cfg, &tx, &stop, ctl.as_deref()) {
-            let _ = tx.send(SourceMsg::Error { source, error: e });
-            std::thread::sleep(Duration::from_secs(3));
-        }
+/// A USRP through SoapyUHD gets the bigger receive buffer a direct one does.
+fn device_args(args: &str) -> String {
+    if pairs(args).iter().any(|(k, v)| k == "driver" && v == "uhd") {
+        super::uhd::device_args(args)
+    } else {
+        args.to_string()
     }
 }
 
 /// Owns the device and stream so every exit path releases them.
-struct Device<'a> {
-    a: &'a Api,
+struct Device {
+    a: &'static Api,
     dev: Dev,
     stream: Stream,
     active: bool,
+    ppm: f64,
 }
 
-impl Drop for Device<'_> {
+impl Drop for Device {
     fn drop(&mut self) {
         // SAFETY: handles made by this struct (or null).
         unsafe {
@@ -422,13 +461,21 @@ impl Drop for Device<'_> {
     }
 }
 
-impl Device<'_> {
-    /// A reference off by `ppm` makes a requested f come out at f·(1+ppm).
-    unsafe fn tune(&self, hz: f64, ppm: f64) -> Result<(), String> {
-        unsafe {
-            check(self.a, "tune", (self.a.set_frequency)(self.dev, RX, 0, hz / (1.0 + ppm * 1e-6), std::ptr::null()))
-        }
+impl Tunable for Device {
+    fn tune(&mut self, hz: f64) -> Result<Retuned, String> {
+        // SAFETY: an open device.
+        check(self.a, "tune", unsafe { (self.a.set_frequency)(self.dev, RX, 0, ppm_corrected(hz, self.ppm), std::ptr::null()) })?;
+        Ok(Retuned { hz, gap: 0 })
     }
+    /// A manual gain (AGC on or off waits for the next start).
+    fn set_gain(&mut self, g: Gain) -> Result<u64, String> {
+        let Gain::Db(db) = g else { return Ok(0) };
+        // SAFETY: an open device.
+        unsafe { self.gain(db as f64) }.map(|()| 0)
+    }
+}
+
+impl Device {
     unsafe fn gain(&self, db: f64) -> Result<(), String> {
         unsafe {
             if (self.a.has_gain_mode)(self.dev, RX, 0) {
@@ -437,39 +484,74 @@ impl Device<'_> {
             check(self.a, "gain", (self.a.set_gain)(self.dev, RX, 0, db))
         }
     }
-    unsafe fn rates(&self) -> String {
+    /// The rates its module says it runs at: a span (min to max of its ranges) when one is a
+    /// span, else the rates themselves.
+    unsafe fn rates(&self) -> Option<Rates> {
         unsafe {
+            if let Some(f) = self.a.get_sample_rate_range {
+                let mut n = 0usize;
+                let p = f(self.dev, RX, 0, &mut n);
+                if !p.is_null() {
+                    let v = std::slice::from_raw_parts(p, n).iter().map(|r| (r.minimum, r.maximum)).collect::<Vec<_>>();
+                    if let Some(free) = self.a.free {
+                        free(p as *mut c_void);
+                    }
+                    if let Some(r) = rates_of(&v) {
+                        return Some(r);
+                    }
+                }
+            }
             let mut n = 0usize;
             let p = (self.a.list_sample_rates)(self.dev, RX, 0, &mut n);
             if p.is_null() {
-                return "?".into();
+                return None;
             }
-            let s: Vec<String> = std::slice::from_raw_parts(p, n).iter().map(|r| format!("{}", r / 1e6)).collect();
+            let v: Vec<u32> = std::slice::from_raw_parts(p, n).iter().map(|r| r.round() as u32).collect();
             if let Some(free) = self.a.free {
                 free(p as *mut c_void);
             }
-            s.join(" / ")
+            (!v.is_empty()).then_some(Rates::List(v))
         }
     }
 }
 
-fn stream_once(source: usize, cfg: &SoapyConfig, tx: &SyncSender<SourceMsg>, stop: &AtomicBool, ctl: Option<&Control>) -> Result<(), String> {
+fn stream_once(cfg: &SoapyConfig, sink: &mut Sink, stop: &AtomicBool, ctl: Option<&Control>) -> Result<(), String> {
     let a = api()?;
     // Modules load here rather than inside make, so a broken one is reported.
     modules();
-    let args = CString::new(cfg.args.as_str()).map_err(|e| e.to_string())?;
-    let mut d = Device { a, dev: std::ptr::null_mut(), stream: std::ptr::null_mut(), active: false };
+    let args = CString::new(device_args(&cfg.args)).map_err(|e| e.to_string())?;
+    let name = format!("SoapySDR {}", if cfg.args.is_empty() { "(first)" } else { &cfg.args });
+    let what = name.clone();
+    let sdrplay_args = cfg.args.clone();
+    // (Some modules load firmware as they open.) The SDRplay slot is held
+    // until the radio is released, and dropped after it.
+    let (d, _sdrplay) = super::open(&name, Deadline::Loads, true, move || {
+        let mut sdrplay = super::sdrplay::before_open(&sdrplay_args);
+        // SAFETY: SoapySDR makes the device; the Device releases it.
+        let dev = unsafe { (a.make)(args.as_ptr()) };
+        sdrplay.made(!dev.is_null());
+        if dev.is_null() {
+            let why = a.last_error.map(|f| unsafe { cstr(f()) }).filter(|s| !s.is_empty()).unwrap_or_else(|| "no matching device".into());
+            return Err(format!("{what} open: {why}"));
+        }
+        Ok((Handed(Device { a, dev, stream: std::ptr::null_mut(), active: false, ppm: 0.0 }), sdrplay))
+    })?;
+    let mut d = d.0;
+    d.ppm = cfg.ppm;
     // SAFETY: SoapySDR C API calls on the device and stream `d` owns.
     unsafe {
-        d.dev = (a.make)(args.as_ptr());
-        if d.dev.is_null() {
-            let why = a.last_error.map(|f| cstr(f())).filter(|s| !s.is_empty()).unwrap_or_else(|| "no matching device".into());
-            return Err(format!("SoapySDR open {}: {why}", if cfg.args.is_empty() { "(first)" } else { &cfg.args }));
+        // What it runs at, for the list of radios and the refusal.
+        let rates = d.rates();
+        if let Some(r) = &rates {
+            super::remember(&key(&cfg.args), Caps { model: String::new(), rates: r.clone() });
         }
         check(a, "sample rate", (a.set_sample_rate)(d.dev, RX, 0, cfg.rate_hz))?;
         let actual = (a.get_sample_rate)(d.dev, RX, 0);
         if (actual - cfg.rate_hz).abs() > 1.0 {
-            return Err(format!("this device runs at {} MSPS, not {} (it gave {})", d.rates(), cfg.rate_hz / 1e6, actual / 1e6));
+            return Err(match &rates {
+                Some(r) if !r.allows(cfg.rate_hz) => super::rate_refusal("device", r, cfg.rate_hz),
+                _ => format!("this device runs at {} MSPS, not {}: pick that in Setup → Radios", actual / 1e6, cfg.rate_hz / 1e6),
+            });
         }
         if !cfg.antenna.is_empty() {
             let ant = CString::new(cfg.antenna.as_str()).map_err(|e| e.to_string())?;
@@ -498,7 +580,7 @@ fn stream_once(source: usize, cfg: &SoapyConfig, tx: &SyncSender<SourceMsg>, sto
                 check(a, &format!("gain {k}"), (a.set_gain_element)(d.dev, RX, 0, ck.as_ptr(), *db))?;
             }
         }
-        d.tune(cfg.center_hz, cfg.ppm)?;
+        d.tune(cfg.center_hz)?;
 
         let chan = [0usize];
         d.stream = match a.setup_stream {
@@ -522,26 +604,16 @@ fn stream_once(source: usize, cfg: &SoapyConfig, tx: &SyncSender<SourceMsg>, sto
         let mut overflowed = false;
         let mut timeouts = 0;
         while !stop.load(Ordering::Relaxed) {
-            if let Some(c) = ctl {
-                let (freq, gain) = c.take();
-                if let Some(f) = freq {
-                    d.tune(f, cfg.ppm)?;
-                    *c.current_hz.lock().unwrap() = Some(f);
-                }
-                if let Some(g) = gain {
-                    d.gain(g as f64)?;
-                }
-                if freq.is_some() || gain.is_some() {
-                    let hz = c.current_hz.lock().unwrap().unwrap_or(cfg.center_hz);
-                    if tx.send(SourceMsg::Tuned { center_hz: hz }).is_err() {
-                        return Ok(());
-                    }
-                }
+            if let Some(c) = ctl
+                && c.apply(&mut d, cfg.center_hz, sink)? == Applied::Closed
+            {
+                return Ok(());
             }
-            let mut buf = vec![Complex32::default(); per];
+            let mut buf = sink.iq_buffer(per);
+            buf.vec().resize(per, Complex32::default());
             let (mut got, mut dropped) = (0usize, 0u64);
             while got < per {
-                let ptrs = [buf[got..].as_mut_ptr() as *mut c_void];
+                let ptrs = [buf.vec()[got..].as_mut_ptr() as *mut c_void];
                 let (mut flags, mut t) = (0 as c_int, 0 as c_longlong);
                 let n = (a.read_stream)(d.dev, d.stream, ptrs.as_ptr(), per - got, &mut flags, &mut t, 1_000_000);
                 if n > 0 {
@@ -579,8 +651,8 @@ fn stream_once(source: usize, cfg: &SoapyConfig, tx: &SyncSender<SourceMsg>, sto
             if got == 0 {
                 continue;
             }
-            buf.truncate(got);
-            if tx.send(SourceMsg::Iq { source, samples: buf, dropped, at: std::time::Instant::now() }).is_err() {
+            buf.vec().truncate(got);
+            if !sink.send(Block::Iq(buf), dropped, std::time::Instant::now()) {
                 return Ok(());
             }
         }
@@ -593,6 +665,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rates_from_ranges() {
+        assert_eq!(rates_of(&[(2e6, 2e6), (8e6, 8e6)]), Some(Rates::List(vec![2_000_000, 8_000_000])));
+        assert_eq!(rates_of(&[(1e6, 20e6), (2e6, 2e6)]), Some(Rates::Range { min: 1e6, max: 20e6 }));
+        assert_eq!(rates_of(&[]), None);
+    }
+
+    #[test]
     fn helpers() {
         assert!(abi_at_least_08("0.8"));
         assert!(abi_at_least_08("0.8-3"));
@@ -601,5 +680,7 @@ mod tests {
         assert_eq!(module_name("/opt/homebrew/lib/SoapySDR/modules0.8/librtlsdrSupport.so"), "rtlsdr");
         assert_eq!(module_name(r"C:\PothosSDR\lib\SoapySDR\modules0.8\sdrPlaySupport.dll"), "sdrPlay");
         assert_eq!(pairs("LNA=32, VGA = 20,,bad"), vec![("LNA".into(), "32".into()), ("VGA".into(), "20".into())]);
+        assert_eq!(device_args("driver=uhd,serial=31A"), "driver=uhd,serial=31A,num_recv_frames=1024");
+        assert_eq!(device_args("driver=hackrf"), "driver=hackrf");
     }
 }

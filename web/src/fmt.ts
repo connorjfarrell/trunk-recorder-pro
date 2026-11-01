@@ -51,6 +51,13 @@ export function dur(s: number | null | undefined): string {
   return h ? `${d} d ${h} h` : `${d} d`;
 }
 
+/** A time in milliseconds, its size alone: 35 ms · 1.8 s · 65 s (as the recorder's clock warnings write it). */
+export function ms(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  const a = Math.abs(v);
+  return a >= 10_000 ? `${Math.round(a / 1000)} s` : a >= 1000 ? `${num(a / 1000, 1)} s` : `${Math.round(a)} ms`;
+}
+
 /** h:mm for an amount of airtime. */
 export function hmm(s: number | null | undefined): string {
   if (s === null || s === undefined || !Number.isFinite(s)) return "—";
@@ -84,6 +91,13 @@ export function clockAt(t: number, withSeconds = false): string {
   const today = new Date().toDateString() === d.toDateString();
   const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", ...(withSeconds ? { second: "2-digit" } : {}) });
   return today ? time : `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
+}
+
+/** A time on a chart spanning `span` seconds: the clock (`clockAt`) within a week, else the date (12 Oct), with the hour for `withTime`. */
+export function axisAt(t: number, span: number, withTime = false): string {
+  if (span <= 8 * 86400) return clockAt(t);
+  const opts: Intl.DateTimeFormatOptions = { day: "numeric", month: "short", ...(span > 300 * 86400 ? { year: "2-digit" } : {}), ...(withTime ? { hour: "2-digit", minute: "2-digit" } : {}) };
+  return new Date(t * 1000).toLocaleString([], opts);
 }
 
 /** Round "nice" tick values covering [lo, hi]. */

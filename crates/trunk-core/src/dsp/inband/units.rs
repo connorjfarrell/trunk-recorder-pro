@@ -37,7 +37,8 @@
 
 use num_complex::Complex32;
 
-use super::fm::{AUDIO_RATE, DEEMPH_TAU};
+use super::{Chunk, Detector, Found};
+use crate::dsp::fm::{AUDIO_RATE, DEEMPH_TAU};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -307,9 +308,26 @@ pub struct Signalling {
 
 impl Default for Signalling {
     fn default() -> Self {
+        Self::with_deemphasis(DEEMPH_TAU)
+    }
+}
+
+/// Who is talking: each unit ID burst.
+impl Detector for Signalling {
+    fn push(&mut self, c: &Chunk, out: &mut Vec<Found>) {
+        let mut ids = Vec::new();
+        Signalling::push(self, c.audio, &mut ids);
+        out.extend(ids.into_iter().map(Found::Unit));
+    }
+}
+
+impl Signalling {
+    /// For audio de-emphasised with time constant `tau` s (0: none), which
+    /// the decoders undo.
+    pub fn with_deemphasis(tau: f64) -> Self {
         Signalling {
             last: 0.0,
-            pre: (-1.0 / (AUDIO_RATE * DEEMPH_TAU)).exp() as f32,
+            pre: if tau > 0.0 { (-1.0 / (AUDIO_RATE * tau)).exp() as f32 } else { 0.0 },
             msk1200: Msk::new(1200.0),
             msk2400: Msk::new(2400.0),
             mdc: Mdc::default(),
@@ -317,9 +335,7 @@ impl Default for Signalling {
             fs2400: FleetSync::default(),
         }
     }
-}
 
-impl Signalling {
     /// Decode 8 kHz audio, appending any unit IDs it carried.
     pub fn push(&mut self, audio: &[f32], out: &mut Vec<UnitId>) {
         let Signalling { last, pre, msk1200, msk2400, mdc, fs1200, fs2400 } = self;

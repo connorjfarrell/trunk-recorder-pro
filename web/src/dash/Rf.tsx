@@ -7,14 +7,14 @@
 import { useState } from "react";
 import { formatGain, formatMhz, systemColor, usableHalfWidth } from "../config.ts";
 import { setView, useApp, useTopic, type AppState, type StatsRange } from "../controller.ts";
-import { Card, Choice, Hint, LiveSpark, Meter, Stat, TimeSeries, type Line } from "../charts.tsx";
+import { BackBar, Card, Choice, Hint, LiveSpark, Meter, Stat, TimeSeries, useWidth, type Line } from "../charts.tsx";
 import { compact, mhz, num, signed } from "../fmt.ts";
 import type { ChannelSnapshot, Source, SourceStatus } from "../protocol.ts";
 import { Waterfall } from "../Waterfall.tsx";
-import { K, recentAvg, running, sourceGuard, sourceHealth, useHistory, val } from "./data.ts";
+import { K, recentAvg, running, runningSites, sourceGuard, sourceHealth, useHistory, useRanges, val } from "./data.ts";
 import { ccMarks } from "./Systems.tsx";
 import { systemChoices } from "./Calls.tsx";
-import { quality } from "./Decode.tsx";
+import { channelWhat, quality } from "./Decode.tsx";
 
 /** A source's gain setting, as configured. */
 function gainText(c: Source | undefined): string {
@@ -23,11 +23,15 @@ function gainText(c: Source | undefined): string {
     case "rtlsdr":
       return c.agc ? "AGC" : `${formatGain(c.gainDb)} dB`;
     case "usrp":
-      return c.agc ? "AGC" : `${c.gainDb} dB${c.antenna ? ` · ${c.antenna}` : ""}`;
+      return c.agc ? "AGC" : `${formatGain(c.gainDb)} dB${c.antenna ? ` · ${c.antenna}` : ""}`;
     case "airspy":
       return c.gainMode === "manual" ? (c.agc ? `AGC (VGA ${c.vgaStep})` : `LNA ${c.lnaStep} · mixer ${c.mixerStep} · VGA ${c.vgaStep}`) : `${c.gainMode} ${c.gainStep}`;
+    case "bladerf":
+      return c.agc ? "AGC" : `${c.gainDb} dB${c.biasTee ? " · bias-T" : ""}`;
+    case "hackrf":
+      return `LNA ${c.lnaDb} · VGA ${c.vgaDb}${c.amp ? " · amp" : ""}${c.biasTee ? " · bias-T" : ""}`;
     case "soapy":
-      return c.agc ? "AGC" : c.gainDb !== null ? `${c.gainDb} dB` : Object.entries(c.gains ?? {}).map(([k, v]) => `${k} ${v}`).join(" · ") || "default";
+      return c.agc ? "AGC" : c.gainDb !== null ? `${formatGain(c.gainDb)} dB` : Object.entries(c.gains ?? {}).map(([k, v]) => `${k} ${formatGain(v)}`).join(" · ") || "default";
     case "file":
       return "capture file";
   }
@@ -66,7 +70,12 @@ export function SourceCard({ s, src, i, compact: small }: { s: AppState; src: So
           label="Frequency error"
           value={src.errorPpm == null ? "—" : signed(src.errorPpm, 2)}
           unit="ppm"
-          sub={autoTuneOf(cfg) ? `AutoTune corrects ${signed(src.tunePpm ?? 0, 2)}${src.tuneSeeded ? " (last run's)" : ""}` : src.errorPpm == null ? "needs a digital call or control channel" : "not corrected (AutoTune off)"}
+          sub={
+            <>
+              {autoTuneOf(cfg) ? `AutoTune corrects ${signed(src.tunePpm ?? 0, 2)}${src.tuneSeeded ? " (last run's)" : ""}` : src.errorPpm == null ? "needs a digital call or control channel" : "not corrected (AutoTune off)"}
+              {src.clockPpm != null && <div>Sample clock {signed(src.clockPpm, 2)} ppm against this computer</div>}
+            </>
+          }
           spark={small ? undefined : <LiveSpark k={K.src(src.label, "ppm")} color="var(--series-2)" minSpan={1} title="Measured error, last 10 min" />}
           hint="The median of the last 20 measurements, on control channels and digital calls (P25, NXDN). Steady: set ppm; drifting: temperature."
         />
@@ -132,10 +141,11 @@ function BandRow({ s, label, sources, ccs, conv, calls }: {
   let lo = Math.min(...edges);
   let hi = Math.max(...edges);
   if (hi - lo < 200e3) [lo, hi] = [(lo + hi) / 2 - 100e3, (lo + hi) / 2 + 100e3];
-  const W = 1000;
+  // (Drawn in the width it's shown at: its labels keep their shape.)
+  const [measure, W] = useWidth(1000);
   const x = (hz: number) => ((hz - lo) / (hi - lo)) * W;
   return (
-    <svg viewBox={`0 0 ${W} 74`} className="band-svg" preserveAspectRatio="none" role="img" aria-label={`${label}: sources and channels by frequency`}>
+    <svg ref={measure} viewBox={`0 0 ${W} 74`} className="band-svg" role="img" aria-label={`${label}: sources and channels by frequency`}>
       <text x={2} y={10} className="axis">
         {label}
       </text>
@@ -185,7 +195,7 @@ function BandRow({ s, label, sources, ccs, conv, calls }: {
  */
 function BandOverview({ s }: { s: AppState }) {
   if (!s.sources.length) return null;
-  const ccs = s.status?.systems.flatMap((y) => (y.controlChannelHz ? [{ hz: y.controlChannelHz, name: y.shortName }] : [])) ?? [];
+  const ccs = s.status?.systems.flatMap((y) => y.sites.flatMap((x) => (x.controlChannelHz ? [{ hz: x.controlChannelHz, name: y.shortName }] : []))) ?? [];
   const conv = (s.config?.conventional ?? []).flatMap((c) => c.channels.filter((ch) => ch.enabled).map((ch) => ({ hz: ch.freqHz, name: c.shortName, label: ch.name })));
   // The bands in use, low to high; a source straddling two goes in the one its center's in.
   const lows = new Map<string, number>();
@@ -237,7 +247,7 @@ function BandOverview({ s }: { s: AppState }) {
 
 /** The floor across the band (bars) and each channel's power above it (stems). */
 function ChannelPlot({ profile, channels, src, color }: { profile: number[]; channels: ChannelSnapshot[]; src: SourceStatus; color: (sys: string) => string }) {
-  const W = 1000;
+  const [measure, W] = useWidth(1000);
   const H = 180;
   const all = [...profile, ...channels.map((c) => c.powerDb)];
   const lo = Math.floor(Math.min(...profile) - 3);
@@ -246,7 +256,7 @@ function ChannelPlot({ profile, channels, src, color }: { profile: number[]; cha
   const x = (hz: number) => ((hz - (src.centerHz - src.rateHz / 2)) / src.rateHz) * W;
   const bw = W / profile.length;
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="chplot" preserveAspectRatio="none" role="img" aria-label="noise floor and channel power">
+    <svg ref={measure} viewBox={`0 0 ${W} ${H}`} className="chplot" role="img" aria-label="noise floor and channel power">
       {profile.map((p, i) => (
         <rect key={i} x={i * bw + 1} width={bw - 2} y={y(p)} height={H - 18 - y(p)} className="floor-bar">
           <title>{`${mhz(src.centerHz - src.rateHz / 2 + (i + 0.5) * (src.rateHz / profile.length), 3)} MHz: floor ${num(p)} dBFS`}</title>
@@ -315,7 +325,7 @@ function SourceWaterfall({ s, i, title }: { s: AppState; i: number; title?: stri
     >
       {on &&
         (s.spectra[i] ? (
-          <Waterfall radio={s.spectra[i]} label={src.label} ccs={ccMarks(s.config, s.status?.systems ?? [])} calls={s.calls} multi={systemChoices(s).length > 1} colorOf={color} />
+          <Waterfall radio={s.spectra[i]} label={src.label} ccs={ccMarks(s.config, runningSites(s.status?.systems ?? []))} calls={s.calls} multi={systemChoices(s).length > 1} colorOf={color} />
         ) : (
           <div className="chart-empty">Waiting for the spectrum…</div>
         ))}
@@ -323,15 +333,10 @@ function SourceWaterfall({ s, i, title }: { s: AppState; i: number; title?: stri
   );
 }
 
-const RANGES: { v: StatsRange; label: string }[] = [
-  { v: "1h", label: "1 h" },
-  { v: "24h", label: "24 h" },
-  { v: "7d", label: "7 days" },
-];
-
 function SourceDetail({ s, i }: { s: AppState; i: number }) {
   const src = s.sources[i];
   const [range, setRange] = useState<StatsRange>("24h");
+  const ranges = useRanges();
   useTopic(`rf:${i}`);
   const k = (x: string) => K.src(src.label, x);
   const hist = useHistory([k("noise"), k("peak"), k("ppm"), k("tune"), k("dropped"), k("clipPct")], range, 360);
@@ -342,11 +347,7 @@ function SourceDetail({ s, i }: { s: AppState; i: number }) {
   const meanOffset = offsets.length ? offsets.reduce((a, c) => a + c.offsetHz! / c.freqHz, 0) / offsets.length : null;
   return (
     <div className="stack">
-      <div className="row">
-        <button className="btn ghost small" onClick={() => setView("rf")}>
-          ← All sources
-        </button>
-      </div>
+      <BackBar to="All sources" onBack={() => setView("rf")} />
       <SourceCard s={s} src={src} i={i} />
       <SourceWaterfall s={s} i={i} title="Waterfall" />
       <Card title="Across the band">
@@ -377,7 +378,7 @@ function SourceDetail({ s, i }: { s: AppState; i: number }) {
                       <span className="sys-dot" style={{ background: color(c.system) }} />
                       {c.system}
                     </td>
-                    <td>{c.kind}</td>
+                    <td>{channelWhat(c)}</td>
                     <td className="mono">{num(c.powerDb)}</td>
                     <td className="mono">{num(c.noiseDb)}</td>
                     <td className="mono">
@@ -398,7 +399,7 @@ function SourceDetail({ s, i }: { s: AppState; i: number }) {
       <div className="row">
         <h2 className="section-title">Over time</h2>
         <span className="spacer" />
-        <Choice value={range} options={RANGES} onChange={setRange} label="Span" />
+        <Choice value={range} options={ranges} onChange={setRange} label="Span" />
       </div>
       <div className="columns">
         <Card title="Noise floor and peaks, dBFS">
@@ -408,10 +409,11 @@ function SourceDetail({ s, i }: { s: AppState; i: number }) {
           <TimeSeries lines={[line(k("ppm"), "Measured", "var(--series-2)", { band: true }), line(k("tune"), "Corrected", "var(--series-1)", { dashed: true })]} fmt={(v) => v.toFixed(2)} />
         </Card>
         <Card title="Dropped samples">
-          <TimeSeries lines={[line(k("dropped"), "Dropped a second", "var(--critical)")]} zero fmt={(v) => compact(v)} empty="No drops recorded." />
+          {/* (Drops and clipping come in bursts: a band shows a step's worst, which its average hides.) */}
+          <TimeSeries lines={[line(k("dropped"), "Dropped a second", "var(--critical)", { band: true })]} zero fmt={(v) => compact(v)} empty="No drops recorded." />
         </Card>
         <Card title="Clipping">
-          <TimeSeries lines={[line(k("clipPct"), "Samples at full scale, %", "var(--serious)")]} zero fmt={(v) => v.toFixed(2)} empty="No clipping recorded." />
+          <TimeSeries lines={[line(k("clipPct"), "Samples at full scale, %", "var(--serious)", { band: true })]} zero fmt={(v) => v.toFixed(2)} empty="No clipping recorded." />
         </Card>
       </div>
     </div>

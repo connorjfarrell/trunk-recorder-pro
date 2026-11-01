@@ -3,17 +3,19 @@
 // health rules — plain functions returning a level and why, the why worded as
 // a hint (what it means, what to try).
 
-import { activeSystems } from "../config.ts";
-import { snapshot, statsQuery, usePolled, type AppState, type StatsRange } from "../controller.ts";
+import { activeSystems, siteActive, siteNameOf, usableHalfWidth } from "../config.ts";
+import { can, setView, snapshot, statsQuery, useApp, usePolled, type AppState, type StatsRange, type View } from "../controller.ts";
 import { keyPart, num, pct } from "../fmt.ts";
 import { seriesPoints } from "../series.ts";
 import type { Level } from "../charts.tsx";
-import type { PluginInfo, SeriesData, SourceStatus, SystemStatus } from "../protocol.ts";
+import type { PluginInfo, SeriesData, SiteDetail, SiteStatus, SourceStatus, StorageSettings, SystemStatus } from "../protocol.ts";
 
 // ── series names (crates/trunk-app/src/stats) ────────────────────────────────
 
 export const K = {
   sys: (short: string, k: string) => `sys/${keyPart(short)}/${k}`,
+  /** A site's control channel series (the recorder's SiteConfig::stats_key). */
+  cc: (site: DashSite, k: string) => `${site.key}/cc/${k}`,
   src: (label: string, k: string) => `src/${keyPart(label)}/${k}`,
   plg: (id: string, k: string) => `plg/${keyPart(id)}/${k}`,
 };
@@ -22,6 +24,18 @@ export const K = {
 export function val(s: AppState, key: string): number | null {
   const v = s.stats?.values[key] ?? s.host?.values[key];
   return v === undefined ? null : v;
+}
+
+/** One counter's rate over another's, live, over the last `sinceS` (a total of ms over a count of calls: their average). Null when the count didn't move. */
+export function perLive(sum: string, count: string, sinceS: number): number | null {
+  const n = recentAvg(count, sinceS) ?? 0;
+  return n > 0 ? (recentAvg(sum, sinceS) ?? 0) / n : null;
+}
+
+/** The same over a span of history (`useHistory`'s series). */
+export function perIn(hist: Record<string, SeriesData> | null | undefined, sum: string, count: string): number | null {
+  const n = total(hist?.[count]) ?? 0;
+  return n > 0 ? (total(hist?.[sum]) ?? 0) / n : null;
 }
 
 /** The average of a live series over the last `sinceS` seconds. */
@@ -34,24 +48,56 @@ export function recentAvg(key: string, sinceS: number): number | null {
 
 export interface DashSystem {
   name: string;
-  kind: "p25" | "smartnet" | "dmr" | "nxdn" | "conventional";
-  /** The running system's status (trunked, once its control channel is open). */
+  kind: "p25" | "smartnet" | "dmr" | "nxdn" | "edacs" | "conventional";
+  /** The running system's status (trunked, once a control channel is open). */
   status: SystemStatus | null;
+  /** Its sites being recorded (a conventional system: none). */
+  sites: DashSite[];
 }
 
-/** Every system set up (trunked, then conventional with channels), with its status while running. */
+/** One site of a dashboard system. */
+export interface DashSite {
+  name: string;
+  /** Where its control channel's series are: see [`K.cc`]. */
+  key: string;
+  /** Its status, once its control channel is open. */
+  status: SiteStatus | null;
+}
+
+/** A site's series key (the recorder's SiteKey::stats_key): a site named as its system is under the system's. */
+export const siteKey = (system: string, site: string) => (site === system ? `sys/${keyPart(system)}` : `sys/${keyPart(system)}/site/${keyPart(site)}`);
+
+/** Every system set up (trunked, then conventional with channels), with its sites and its status while running. */
 export function dashSystems(s: AppState): DashSystem[] {
   if (!s.config) return [];
-  const out: DashSystem[] = activeSystems(s.config).map((x) => ({
-    name: x.shortName,
-    kind: (x.type ?? "p25") as DashSystem["kind"],
-    status: s.status?.systems.find((y) => y.shortName === x.shortName) ?? null,
-  }));
-  for (const c of s.config.conventional) if (c.enabled !== false && c.channels.some((ch) => ch.enabled)) out.push({ name: c.shortName, kind: "conventional", status: null });
+  const out: DashSystem[] = activeSystems(s.config).map((x) => {
+    const status = s.status?.systems.find((y) => y.shortName === x.shortName) ?? null;
+    const sites = x.sites.filter(siteActive).map((site) => {
+      const name = siteNameOf(x, site);
+      return { name, key: siteKey(x.shortName, name), status: status?.sites.find((y) => y.name === name) ?? null };
+    });
+    return { name: x.shortName, kind: (x.type ?? "p25") as DashSystem["kind"], status, sites };
+  });
+  for (const c of s.config.conventional) {
+    if (c.enabled === false || !c.channels.some((ch) => ch.enabled)) continue;
+    const status = s.status?.systems.find((y) => y.shortName === c.shortName) ?? null;
+    out.push({ name: c.shortName, kind: "conventional", status, sites: [] });
+  }
   return out;
 }
 
-export const KIND_LABEL: Record<DashSystem["kind"], string> = { p25: "P25", smartnet: "SmartNet", dmr: "DMR", nxdn: "NXDN", conventional: "Conventional" };
+/** A running site, with its system's short name and how the dashboard names it: "dcfd", "dcfd/south". */
+export type RunningSite = SiteStatus & { shortName: string; label: string };
+
+/** A running site with its detail (decodeDetail: what its control channel announces). */
+export type DetailedSite = RunningSite & SiteDetail;
+
+/** Every running site, its system's in order. */
+export function runningSites(systems: SystemStatus[]): RunningSite[] {
+  return systems.flatMap((y) => y.sites.map((x) => ({ ...x, shortName: y.shortName, label: x.name === y.shortName ? y.shortName : `${y.shortName}/${x.name}` })));
+}
+
+export const KIND_LABEL: Record<DashSystem["kind"], string> = { p25: "P25", smartnet: "SmartNet", dmr: "DMR", nxdn: "NXDN", edacs: "EDACS", conventional: "Conventional" };
 
 export const running = (s: AppState) => s.phase === "running" || s.phase === "starting";
 
@@ -62,6 +108,27 @@ export function useHistory(series: string[], range: StatsRange, points?: number)
   const key = `${series.join("|")}@${range}@${points ?? ""}`;
   const r = usePolled(key, () => statsQuery(series, range, points), range === "10m" ? 20_000 : range === "1h" ? 60_000 : 300_000);
   return r?.series ?? null;
+}
+
+/** Days of history each span needs. */
+const RANGE_DAYS: { v: StatsRange; label: string; days: number }[] = [
+  { v: "1h", label: "1 h", days: 0 },
+  { v: "24h", label: "24 h", days: 1 },
+  { v: "7d", label: "7 days", days: 7 },
+  { v: "30d", label: "30 days", days: 30 },
+  { v: "90d", label: "90 days", days: 90 },
+  { v: "1y", label: "1 year", days: 365 },
+];
+
+/** The spans a chart can show: a week from memory; with a store (`history`), as far as it keeps (`storage.statsDays`; 0: all). */
+export function rangesFor(storage: StorageSettings | undefined, history: boolean): { v: StatsRange; label: string }[] {
+  const kept = !history ? 7 : (storage?.statsDays ?? 365) || Infinity;
+  return RANGE_DAYS.filter((r) => r.days <= Math.max(7, kept)).map(({ v, label }) => ({ v, label }));
+}
+
+/** `rangesFor` the recorder's settings. */
+export function useRanges(): { v: StatsRange; label: string }[] {
+  return rangesFor(useApp().config?.storage, can("history"));
 }
 
 /** The usual of each series: its average (and lowest and highest step) over the last day. */
@@ -117,9 +184,20 @@ export function change(now: number | null, usual: Usual | null | undefined): num
 
 // ── health ───────────────────────────────────────────────────────────────────
 
+/** A page, and what in it: what `setView` takes. */
+export type Place = [View, ...(string | number)[]];
+
 export interface Health {
   level: Level;
   why: string;
+  /** Where what it's about is listed (its warning links there). */
+  at?: Place;
+}
+
+/** Going to where a health's warning is about, if it says. */
+export function goTo(h: Health): (() => void) | undefined {
+  const at = h.at;
+  return at && (() => setView(...at));
 }
 
 const OK = (why: string): Health => ({ level: "ok", why });
@@ -132,17 +210,37 @@ const worst = (hs: Health[]): Health => {
   return { level: "idle", why: "" };
 };
 
-/** A trunked system's control channel, judged against its own usual rate. */
-export function systemHealth(s: AppState, x: DashSystem, usualRate?: Usual | null): Health {
+/**
+ * The worst of several things' health (sites, systems, sources, plugins), the
+ * one in trouble named when there are several: a light then says which.
+ */
+export function worstOf<T>(items: T[], name: (x: T) => string, health: (x: T) => Health): Health {
+  return worst(items.map((x) => {
+    const h = health(x);
+    return items.length > 1 && (h.level === "warn" || h.level === "bad") ? { ...h, why: `${name(x)}: ${h.why}` } : h;
+  }));
+}
+
+/**
+ * A trunked system's control channels, each judged against its own usual
+ * rate (`usual`, by series key): the worst site's, named when it has several.
+ */
+export function systemHealth(s: AppState, x: DashSystem, usual: Record<string, Usual | null> = {}): Health {
   if (!running(s)) return { level: "idle", why: "Not recording" };
   if (x.kind === "conventional") return OK("Listening on its channels");
-  const st = x.status;
+  if (!x.sites.length) return { level: "bad", why: "No site set up" };
+  return worstOf(x.sites, (site) => site.name, (site) => siteHealth(s, site, usual[K.cc(site, "good")]));
+}
+
+/** A site's control channel, judged against its own usual rate. */
+export function siteHealth(s: AppState, site: DashSite, usualRate?: Usual | null): Health {
+  const st = site.status;
   if (!st) return { level: "bad", why: "No control channel open — is one inside a source's band?" };
   if (st.mismatch) return { level: "bad", why: `The control channel is another system's: ${st.mismatch}` };
-  const locked = val(s, K.sys(x.name, "cc/locked"));
-  const rate = recentAvg(K.sys(x.name, "cc/good"), 30);
-  const bad = recentAvg(K.sys(x.name, "cc/bad"), 60) ?? 0;
-  const good = recentAvg(K.sys(x.name, "cc/good"), 60) ?? 0;
+  const locked = val(s, K.cc(site, "locked"));
+  const rate = recentAvg(K.cc(site, "good"), 30);
+  const bad = recentAvg(K.cc(site, "bad"), 60) ?? 0;
+  const good = recentAvg(K.cc(site, "good"), 60) ?? 0;
   const badPct = good + bad > 0 ? (100 * bad) / (good + bad) : 0;
   if (locked === 0) return { level: "bad", why: "Not decoding its control channel — hunting for another. Check the antenna, the gain, and that the frequency is right." };
   if (rate === null) return { level: "ok", why: "Starting…" };
@@ -157,6 +255,24 @@ export function systemHealth(s: AppState, x: DashSystem, usualRate?: Usual | nul
 /** A running source's guardHz, from the config (undefined = the default): its usable band is usableHalfWidth(rate, guard) each side. */
 export function sourceGuard(s: AppState, src: SourceStatus): number | undefined {
   return s.config?.sources[src.index]?.guardHz;
+}
+
+/**
+ * Where `hz` falls among the sources: the one it's deepest in, `depth` how
+ * far inside the usable part of its band (half the band less the source's
+ * guard) — 1 at the centre, 0 at the usable edge or past it — and `beyondHz`
+ * how far past that edge (0: inside). Outside every source: the nearest.
+ * Null: no sources.
+ */
+export function coverage(s: AppState, hz: number): { src: SourceStatus; depth: number; beyondHz: number } | null {
+  let best: { src: SourceStatus; d: number; beyondHz: number } | null = null;
+  for (const src of s.sources) {
+    const half = usableHalfWidth(src.rateHz, sourceGuard(s, src));
+    const off = Math.abs(hz - src.centerHz);
+    const d = 1 - off / half;
+    if (!best || d > best.d) best = { src, d, beyondHz: Math.max(0, off - half) };
+  }
+  return best && { src: best.src, depth: Math.max(0, best.d), beyondHz: best.beyondHz };
 }
 
 export function sourceHealth(s: AppState, src: SourceStatus, autoTune: boolean): Health {
@@ -189,6 +305,15 @@ export function pluginHealth(p: PluginInfo, on: boolean): Health {
   return OK(r.message || "Working");
 }
 
+/** What to do about a RAM spool that went while the app ran, by its kind. */
+export function spoolRemovedFix(kind?: string): string {
+  if (kind === "tmpfs")
+    return "systemd deletes a user's files in /dev/shm when they log out (RemoveIPC). Run `sudo loginctl enable-linger $USER` (and start trunk-pro as the user service), or set RemoveIPC=no in /etc/systemd/logind.conf; a system service of your own can give it RuntimeDirectory=trunk-pro (see Running it headless)";
+  if (kind === "service") return "Something deleted the service's runtime folder: systemd does when the service stops, unless it has RuntimeDirectoryPreserve=yes";
+  if (kind === "RAM disk") return "Something ejected the RAM disk (the Finder, or hdiutil detach)";
+  return "Something deleted the folder set in ramSpool.dir";
+}
+
 export function platformHealth(s: AppState): Health {
   const h = s.host;
   if (!h) return { level: "idle", why: "Waiting for the first sample" };
@@ -197,6 +322,10 @@ export function platformHealth(s: AppState): Health {
   for (const d of h.platform.disks) {
     const free = (100 * d.freeBytes) / Math.max(1, d.totalBytes);
     if (d.name === "spool") {
+      // Deleted while running (systemd at logout): made again, or calls go to the disk.
+      if (d.missing) hs.push({ level: "bad", why: `The RAM spool is gone, calls go to the recordings folder. ${spoolRemovedFix(d.kind)}` });
+      else if (d.removed) hs.push({ level: "warn", why: `The RAM spool was deleted ${d.removed === 1 ? "once" : `${d.removed} times`} while running (made again). ${spoolRemovedFix(d.kind)}` });
+      if (d.missing) continue;
       // It fills when uploads fall behind; full, calls go to the disk.
       if (free < 10) hs.push({ level: "bad", why: `The RAM spool is ${pct(100 - free)} full: calls will soon go to the disk` });
       else if (free < 25) hs.push({ level: "warn", why: `The RAM spool is ${pct(100 - free)} full: uploads aren't keeping up` });
@@ -211,6 +340,9 @@ export function platformHealth(s: AppState): Health {
   if ((v["plat/piThrottled"] ?? 0) > 0) hs.push({ level: "warn", why: "The Pi is throttled (under-voltage or heat)" });
   if (v["net/up"] !== undefined && v["net/up"] < 1) hs.push({ level: v["net/up"] === 0 ? "bad" : "warn", why: v["net/up"] === 0 ? "The internet isn't answering" : "Some connectivity checks fail" });
   if ((v["plat/temp"] ?? 0) > 80) hs.push({ level: "warn", why: `Running hot: ${num(v["plat/temp"], 0)} °C` });
+  // (The recorder decides what's wrong with the clock: the events go by the same.)
+  const clock = h.platform.clock?.problem;
+  if (clock) hs.push({ level: clock.level, why: clock.why });
   return hs.length ? worst(hs) : OK("All normal");
 }
 
@@ -220,27 +352,45 @@ export function rfHealth(s: AppState): Health {
     const c = s.config?.sources[i];
     return !!c && "autoTune" in c && !!c.autoTune;
   };
-  return worst(s.sources.map((x, i) => sourceHealth(s, x, auto(i))));
+  return worstOf(s.sources.map((x, i) => ({ x, i })), ({ x }) => x.label, ({ x, i }) => sourceHealth(s, x, auto(i)));
 }
 
 export function decodeHealth(s: AppState): Health {
   if (!running(s)) return { level: "idle", why: "Not recording" };
-  return worst(dashSystems(s).map((x) => systemHealth(s, x)));
+  return worstOf(dashSystems(s), (x) => x.name, (x) => systemHealth(s, x));
 }
 
 export function pluginsHealth(s: AppState): Health {
   const ps = s.plugins?.plugins ?? [];
   const on = (id: string) => !!s.config?.plugins?.[id]?.enabled;
-  const hs = ps.filter((p) => on(p.id)).map((p) => pluginHealth(p, true));
-  return hs.length ? worst(hs) : { level: "idle", why: "No plugins on" };
+  const ons = ps.filter((p) => on(p.id));
+  return ons.length ? worstOf(ons, (p) => p.manifest?.name ?? p.id, (p) => pluginHealth(p, true)) : { level: "idle", why: "No plugins on" };
 }
 
-/** Calls lost for want of a recorder or a source, last few minutes. */
+/** A system's Radio system page, at its frequencies out of band: `radio/<system>/outOfBand`. */
+export const OUT_OF_BAND = "outOfBand";
+
+/** A system's calls lost for want of a recorder or a source, last few minutes: which of the two. */
+export function systemRadioHealth(s: AppState, x: DashSystem): Health {
+  if (!running(s)) return { level: "idle", why: "Not recording" };
+  const busy = (recentAvg(K.sys(x.name, "why/no_recorder"), 300) ?? 0) > 0;
+  const outside = (recentAvg(K.sys(x.name, "why/no_source"), 300) ?? 0) > 0;
+  const at: Place = ["radio", x.name, OUT_OF_BAND];
+  if (busy && outside) return { level: "warn", why: "Calls are being missed: no free recorder for some, others outside every source's band", at };
+  if (busy) return { level: "warn", why: "Calls are being missed: no free recorder. Add recorders, or a source" };
+  if (outside) return { level: "warn", why: "Calls are being missed: their frequencies are outside every source's band (Out of band)", at };
+  return OK("Recording what it hears");
+}
+
+/** Calls lost, any system: the system that loses them named. */
 export function radioHealth(s: AppState): Health {
   if (!running(s)) return { level: "idle", why: "Not recording" };
-  const missed = dashSystems(s).reduce((a, x) => a + (recentAvg(K.sys(x.name, "why/no_recorder"), 300) ?? 0) + (recentAvg(K.sys(x.name, "why/no_source"), 300) ?? 0), 0);
-  if (missed > 0) return { level: "warn", why: "Calls are being missed: no free recorder, or outside every source's band" };
-  return OK("Recording what it hears");
+  return worstOf(dashSystems(s), (x) => x.name, (x) => systemRadioHealth(s, x));
+}
+
+/** A system all told, as the Overview shows it: its control channels, and whether it's missing calls. */
+export function systemOverallHealth(s: AppState, x: DashSystem, usual: Record<string, Usual | null> = {}): Health {
+  return worst([systemHealth(s, x, usual), systemRadioHealth(s, x)]);
 }
 
 /** The health of a page, for the navigation's lights. */

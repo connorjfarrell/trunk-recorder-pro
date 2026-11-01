@@ -3,6 +3,9 @@
 //! (`<captureDir>/<shortName>/<YYYY>/<M>/<D>/<tg>-<epoch>_<freq>.wav|json`, a folder per system) and
 //! publishes what happens to the browser interface through the [`Hub`].
 
+use crate::kept;
+use trunk_core::trunk::TalkgroupRow;
+use trunk_app::saving::Kind;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::Read;
@@ -14,29 +17,58 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, Offset, TimeZone};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::broadcast;
-use trunk_app::{Output, Session};
+use trunk_app::protocol::{body, Audience, ToClient};
+use trunk_app::saving::Saved;
+use trunk_app::{Feeder, Output, Session};
 
-use crate::config::{AirspyGain, Config, SampleFormat, Source};
+use crate::db::Change;
+use trunk_app::calls::{CallsPage, CallsQuery, StoredCall};
+use crate::config::{AirspyGain, Config, SampleFormat, Source, SourceKind};
 use crate::plugins::{self, FileRules, PluginHost};
-use crate::radio::{airspy, soapy, uhd};
-use crate::sdr::{self, RtlConfig, SourceMsg};
+use crate::radio::{airspy, bladerf, hackrf, rtl, soapy, uhd};
+use crate::sdr::{self, Block, Control, Gain, Inbox, Preset, SourceMsg, Stage, Stages};
 
-/// A message for every connected browser.
+/// A message for the connected browsers, serialized once for all of them.
 pub enum Out {
+    /// For every connection.
     Text(String),
+    /// Only for connections with control access ([`Audience::Control`]).
+    Control(String),
+    /// The config: as it is, and as a listen-only connection sees it.
+    Config { full: String, listen: String },
     /// Only for browsers that subscribed to `topic` (see [`trunk_app::stats::Topics`]).
     Topic { topic: String, text: String },
     /// Live audio (binary frame) for talkgroup `tg` of the system with short
     /// name `short_name` (the frame carries the system's number this run).
     Audio { short_name: String, tg: u32, frame: Vec<u8> },
+    /// The recorder is quitting: every connection is told, then closed.
+    Quit,
+}
+
+impl Out {
+    /// `m`, as each kind of connection may hear it.
+    pub fn of(m: &ToClient) -> Out {
+        match m {
+            ToClient::Quit => Out::Quit,
+            ToClient::Config { .. } => {
+                let mut listen = m.to_value();
+                listen["config"] = crate::access::redact_config(listen["config"].take());
+                Out::Config { full: m.to_json(), listen: listen.to_string() }
+            }
+            _ if m.audience() == Audience::Control => Out::Control(m.to_json()),
+            _ => Out::Text(m.to_json()),
+        }
+    }
 }
 
 pub type Hub = broadcast::Sender<Arc<Out>>;
 
-pub fn publish(hub: &Hub, v: Value) {
-    let _ = hub.send(Arc::new(Out::Text(v.to_string())));
+/// Send `m` to the browsers that may have it. Every message to all of them
+/// goes this way.
+pub fn publish(hub: &Hub, m: ToClient) {
+    let _ = hub.send(Arc::new(Out::of(&m)));
 }
 
 #[derive(Clone, Debug, Default)]
@@ -48,8 +80,8 @@ pub struct PhaseInfo {
 }
 
 impl PhaseInfo {
-    pub fn to_json(&self) -> Value {
-        json!({ "type": "state", "phase": self.phase, "error": self.error, "ended": self.ended })
+    pub fn message(&self) -> ToClient {
+        ToClient::State { phase: self.phase, error: self.error.clone(), ended: self.ended }
     }
 }
 
@@ -57,44 +89,71 @@ impl PhaseInfo {
 pub struct Ctx {
     pub config_path: PathBuf,
     pub config: Mutex<Config>,
+    /// The config's version: one more each time it changes ([`Ctx::config_changed`]).
+    pub config_version: AtomicU64,
+    /// Each system's talkgroup file, as kept ([`kept::load_talkgroups`]).
+    pub talkgroups: Mutex<trunk_app::config::TalkgroupLists>,
     pub hub: Hub,
-    pub runner: Mutex<Option<Runner>>,
-    /// Held through a start, stop, survey start or quit, so two never
-    /// interleave (two Starts at once would leave a recorder nothing stops);
-    /// true once quitting, when nothing may start any more.
-    pub lifecycle: Mutex<bool>,
+    /// What the radios are doing ([`Lifecycle`]): changed only through its
+    /// methods on `Ctx`, each holding the lock throughout, so two never
+    /// interleave (two Starts at once would leave a recorder nothing stops).
+    pub lifecycle: Mutex<Lifecycle>,
+    /// The phase the browsers are told (the engine thread reports it as it goes).
     pub phase: Mutex<PhaseInfo>,
-    /// Recently concluded calls (newest first), as sent to the browser.
-    pub history: Mutex<VecDeque<Value>>,
+    /// The calls concluded lately (newest first), as sent to the browser:
+    /// the live list (`history`, `callFiles`), kept whether or not the call
+    /// store is open. The store keeps the record; queries merge the two.
+    pub recent: Mutex<VecDeque<StoredCall>>,
+    /// The call store: every finished call, indexed (off when it can't be opened).
+    pub db: crate::db::Db,
     /// Signalled by a browser's `quit`.
     pub quit: tokio::sync::Notify,
-    /// The first-run survey, when one is running (never with recording).
-    pub survey: Mutex<Option<crate::survey::SurveyRunner>>,
-    /// Its latest snapshot, for browsers that connect meanwhile.
-    pub survey_last: Mutex<Option<Value>>,
+    /// The survey's latest snapshot, for browsers that connect meanwhile.
+    pub survey_last: Mutex<Option<ToClient>>,
     pub plugins: plugins::manage::Plugins,
-    /// `--ui <folder>`: the interface / shows, over `server.home`.
-    pub home_dir: Option<PathBuf>,
+    /// The address every interface listens on (`--bind`, else `server.bind`).
+    pub bind: std::net::IpAddr,
+    /// The interfaces besides the built-in one, and their listeners.
+    pub interfaces: crate::interfaces::Interfaces,
     /// The radio registry and the event monitor: outlive recordings.
     pub shared: Arc<trunk_app::stats::Shared>,
     /// The dashboard's minute history (a week), and where new minutes go.
     pub series: Arc<Mutex<trunk_app::stats::History>>,
     pub store: crate::statstore::Store,
-    /// How many connected browsers watch each topic; `topics_gen` changes with it.
+    /// The codes conventional frequencies carried, as last told: for browsers
+    /// that connect (the file is written only every so often).
+    pub heard_last: Mutex<Option<ToClient>>,
+    /// How many connected browsers watch each topic (the recording is told as it changes).
     pub topics: Mutex<std::collections::BTreeMap<String, usize>>,
-    pub topics_gen: AtomicU64,
-    /// For the engine thread, while recording.
-    pub engine_cmds: Mutex<Vec<EngineCmd>>,
+    /// The recording's engine thread, while there is one: everything it's told comes this way ([`Ctx::tell_engine`]).
+    pub engine: Mutex<Option<mpsc::Sender<EngineCmd>>>,
     /// The latest `host` message (the computer and plugins), for browsers that connect.
-    pub host_last: Mutex<Option<Value>>,
+    pub host_last: Mutex<Option<ToClient>>,
     /// The RAM spool (`recording.ramSpool`), as last opened.
     pub spool: Mutex<Option<Arc<crate::spool::Spool>>>,
+    /// The computer's clock, watched (#61): what calls' `clock_off` and the dashboard go by.
+    pub clock: Arc<crate::clock::Clock>,
+    /// Key containers unlocked from the interface ([`crate::unlock`]).
+    pub unlocked: crate::unlock::Unlocked,
 }
 
-/// Something for the running session to do.
+/// Something for the running session to do: the one way into the engine
+/// thread, which waits on it ([`Ctx::engine`]).
 pub enum EngineCmd {
-    /// A system's talkgroup file changed (an Ignore flag set from the dashboard).
-    Talkgroups { short_name: String, csv: String },
+    /// A source's error or end, by way of its decoding thread.
+    Source(SourceMsg),
+    /// What the connected browsers watch changed.
+    Topics(trunk_app::stats::Topics),
+    /// A system's talkgroups changed (loaded, pasted, edited in Setup).
+    Talkgroups { short_name: String, rows: Vec<TalkgroupRow> },
+    /// One talkgroup of a system's file changed (an Ignore flag set from the dashboard).
+    Talkgroup { short_name: String, number: u32, row: Option<trunk_core::trunk::Talkgroup> },
+    /// A system's keys changed (a key container unlocked or locked): calls in progress take them too.
+    Keys { short_name: String, ring: Option<Arc<trunk_core::p25::crypt::Keyring>> },
+    /// A system's config changed: what sharing uses of it, its switch, directory link and licenses ([`trunk_app::share::sync`]).
+    ShareSystem(trunk_app::config::System),
+    /// How a system's share went.
+    Shared { short_name: String, result: Result<Option<trunk_app::share::Linked>, String> },
 }
 
 impl Ctx {
@@ -117,30 +176,237 @@ impl Ctx {
         for a in add {
             *t.entry(a.clone()).or_default() += 1;
         }
-        self.topics_gen.fetch_add(1, Ordering::Relaxed);
+        // (The snapshot is taken under the lock: the engine hears the changes in their order.)
+        let topics = trunk_app::stats::Topics::new(t.keys().cloned());
+        crate::logging::log_watched(t.contains_key("log"));
+        drop(t);
+        self.tell_engine(EngineCmd::Topics(topics));
+    }
+
+    /// Tell the recording's engine thread, if there is one.
+    pub fn tell_engine(&self, c: EngineCmd) {
+        if let Some(tx) = &*self.engine.lock().unwrap() {
+            let _ = tx.send(c);
+        }
     }
 
     /// Hand an event to the monitor, and to the browsers when it's one for the feed.
     pub fn event(&self, e: trunk_app::stats::MonitorEvent) {
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let t = crate::clock::unix_s();
         if let Some(v) = self.shared.emit(t, e) {
-            publish(&self.hub, v);
+            publish(&self.hub, ToClient::MonitorEvent(body(v)));
         }
+    }
+
+    /// The config is now `c` (call with its lock held, so versions follow
+    /// the changes in order): a new version, told to every browser. Returns it.
+    pub fn config_changed(&self, c: &Config) -> u64 {
+        self.db.set_systems(c);
+        let files = self.talkgroups.lock().unwrap().clone();
+        self.shared.names.lock().unwrap().set_config(c, &files);
+        let version = self.config_version.fetch_add(1, Ordering::SeqCst) + 1;
+        publish(&self.hub, ToClient::Config { config: Box::new(c.clone()), version });
+        version
     }
 
     pub fn set_phase(&self, phase: &'static str, error: Option<String>, ended: bool) {
         let p = PhaseInfo { phase, error, ended };
-        publish(&self.hub, p.to_json());
+        publish(&self.hub, p.message());
         *self.phase.lock().unwrap() = p;
     }
+
+    /// Start recording with `cfg`, in place of whatever the radios were
+    /// doing (nothing once quitting). The engine thread reports the phase.
+    /// A survey goes on only on a spare radio the new config doesn't use.
+    pub fn begin_recording(self: &Arc<Self>, cfg: Config) -> Result<(), String> {
+        let mut l = self.lifecycle.lock().unwrap();
+        if l.quitting {
+            return Ok(());
+        }
+        if let Some(r) = l.recording.take() {
+            r.stop();
+        }
+        if l.survey.as_ref().is_some_and(|s| s.uses_any(&cfg.sources)) {
+            self.end_survey(&mut l);
+        }
+        self.set_phase("starting", None, false);
+        match start(self.clone(), cfg) {
+            Ok(r) => {
+                l.recording = Some(r);
+                crate::db::backfill::start(self.clone());
+                Ok(())
+            }
+            Err(e) => {
+                self.set_phase("idle", Some(e.clone()), false);
+                Err(e)
+            }
+        }
+    }
+
+    /// Start a survey, in place of one running: on a source once the radios
+    /// are free ([`Ctx::free_radios`]), on a spare radio (one no source
+    /// names) beside the recording.
+    pub fn begin_survey(self: &Arc<Self>, cfg: Config, mut req: trunk_app::survey::Request) -> Result<(), String> {
+        let mut l = self.lifecycle.lock().unwrap();
+        if l.quitting {
+            return Ok(());
+        }
+        self.end_survey(&mut l);
+        match &req.radio {
+            Some(r) => {
+                if let Some(i) = cfg.sources.iter().position(|s| s.may_be(r)) {
+                    return Err(format!("{} is source {} of the recorder: scan with that source, or pick a radio no source uses.", r.label(), i + 1));
+                }
+            }
+            None => self.free_radios(&mut l, "the scan")?,
+        }
+        // Half the computer's cores (the recorder needs the rest), 1–8.
+        req.threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
+        l.survey = Some(crate::survey::start(self.clone(), cfg, req)?);
+        Ok(())
+    }
+
+    /// `f` with the radios to itself (profiling a source): nothing starts
+    /// meanwhile. None once quitting; Err while recording.
+    pub fn with_radios<T>(&self, what: &str, f: impl FnOnce() -> T) -> Option<Result<T, String>> {
+        let mut l = self.lifecycle.lock().unwrap();
+        if l.quitting {
+            return None;
+        }
+        Some(self.free_radios(&mut l, what).map(|()| {
+            self.end_survey(&mut l);
+            f()
+        }))
+    }
+
+    /// The sources free for `what`: a survey on one ends, a recording whose
+    /// capture files ended too, but one still recording isn't stopped for it.
+    fn free_radios(&self, l: &mut Lifecycle, what: &str) -> Result<(), String> {
+        if l.recording.as_ref().is_some_and(|r| !r.finished()) {
+            return Err(format!("Stop recording first — {what} needs the radio to itself (or scan with a spare radio)."));
+        }
+        if let Some(r) = l.recording.take() {
+            r.stop();
+        }
+        if l.survey.as_ref().is_some_and(|s| !s.spare()) {
+            self.end_survey(l);
+        }
+        Ok(())
+    }
+
+    /// Stop recording, if it is (a survey on a spare radio goes on).
+    pub fn stop_recording(&self) {
+        if let Some(r) = self.lifecycle.lock().unwrap().recording.take() {
+            r.stop();
+        }
+    }
+
+    /// End a running survey (frees its radio) and tell the browsers.
+    pub fn stop_survey(&self) {
+        self.end_survey(&mut self.lifecycle.lock().unwrap());
+    }
+
+    /// Something for the running survey (a frequency to monitor, a rescan).
+    pub fn survey_send(&self, c: crate::survey::UserCmd) {
+        if let Some(r) = &self.lifecycle.lock().unwrap().survey {
+            r.send(c);
+        }
+    }
+
+    /// Stop everything, for good: nothing starts once quitting.
+    pub fn quit(&self) {
+        let mut l = self.lifecycle.lock().unwrap();
+        if let Some(r) = l.recording.take() {
+            r.stop();
+        }
+        self.end_survey(&mut l);
+        l.quitting = true;
+    }
+
+    /// The survey stops, if one is running (the lock held).
+    fn end_survey(&self, l: &mut Lifecycle) {
+        if let Some(r) = l.survey.take() {
+            r.stop();
+            *self.survey_last.lock().unwrap() = None;
+            publish(&self.hub, crate::survey::idle());
+        }
+    }
+}
+
+/// What the radios are doing: recording, a survey, or both (the survey on a
+/// spare radio no source uses).
+#[derive(Default)]
+pub struct Lifecycle {
+    pub recording: Option<Runner>,
+    pub survey: Option<crate::survey::SurveyRunner>,
+    /// The recorder is exiting: nothing starts any more.
+    quitting: bool,
 }
 
 pub struct Runner {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Each source's live controls (a gain changed in Setup goes through them).
+    controls: Vec<Arc<Control>>,
+}
+
+/// The gain to set on a source running with `old` now that it is `new`:
+/// when the gain is all that changed and the radio takes it while running.
+/// The gain in dB always; AGC on or off only on an RTL-SDR or an Airspy (the
+/// others take that at the next start).
+pub fn live_gain(old: &Source, new: &Source) -> Option<Gain> {
+    // `old` with `new`'s gain: equal to `new` when only the gain differs.
+    let mut o = old.clone();
+    let gain = match (&mut o.kind, &new.kind) {
+        (SourceKind::Rtlsdr { gain_db, agc, .. }, SourceKind::Rtlsdr { gain_db: g, agc: a, .. }) => {
+            (*gain_db, *agc) = (*g, *a);
+            if *a { Gain::Agc } else { Gain::Db(*g as f32) }
+        }
+        (
+            SourceKind::Airspy { gain_mode, gain_step, lna_step, mixer_step, vga_step, agc, .. },
+            SourceKind::Airspy { gain_mode: m, gain_step: g, lna_step: l, mixer_step: x, vga_step: v, agc: a, .. },
+        ) => {
+            (*gain_mode, *gain_step, *lna_step, *mixer_step, *vga_step, *agc) = (*m, *g, *l, *x, *v, *a);
+            airspy_gain(*m, *g, *l, *x, *v, *a)
+        }
+        (SourceKind::Usrp { gain_db, agc: false, .. }, SourceKind::Usrp { gain_db: g, agc: false, .. })
+        | (SourceKind::Bladerf { gain_db, agc: false, .. }, SourceKind::Bladerf { gain_db: g, agc: false, .. }) => {
+            *gain_db = *g;
+            Gain::Db(*g as f32)
+        }
+        (SourceKind::Hackrf { lna_db, vga_db, amp, .. }, SourceKind::Hackrf { lna_db: l, vga_db: v, amp: a, .. }) => {
+            (*lna_db, *vga_db, *amp) = (*l, *v, *a);
+            Gain::Stages(hackrf_gain(*l, *v, *a))
+        }
+        (SourceKind::Soapy { gain_db, agc: false, .. }, SourceKind::Soapy { gain_db: Some(g), agc: false, .. }) => {
+            *gain_db = Some(*g);
+            Gain::Db(*g as f32)
+        }
+        _ => return None,
+    };
+    (o == *new).then_some(gain)
 }
 
 impl Runner {
+    /// Source `i`'s settings went from `old` to `new` in Setup: its gain is
+    /// applied at once when that's all that changed and the radio can take it
+    /// live ([`live_gain`]): that gain, or None when the change waits for the next start.
+    pub fn live_source(&self, i: usize, old: &Source, new: &Source) -> Option<Gain> {
+        let (c, g) = (self.controls.get(i)?, live_gain(old, new)?);
+        *c.gain.lock().unwrap() = Some(g);
+        Some(g)
+    }
+
+    /// The sources went from `old` to `new` in Setup: each changed one, by its
+    /// place, with the gain it took at once ([`Runner::live_source`]) or None.
+    /// Sources added, removed or moved wait for the next start (all of them).
+    pub fn live_sources(&self, old: &[Source], new: &[Source]) -> Vec<(usize, Option<Gain>)> {
+        if old.len() != new.len() {
+            return vec![];
+        }
+        old.iter().zip(new).enumerate().filter(|(_, (o, n))| o != n).map(|(i, (o, n))| (i, self.live_source(i, o, n))).collect()
+    }
+
     /// The engine has stopped by itself (every capture file ended).
     pub fn finished(&self) -> bool {
         self.threads.last().is_some_and(|t| t.is_finished())
@@ -166,7 +432,7 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
                 mine.channel_file_status = read.channel_file_status.clone();
             }
         }
-        publish(&ctx.hub, serde_json::json!({ "type": "config", "config": &*shared }));
+        ctx.config_changed(&shared);
         if let Some(e) = errors.into_iter().next() {
             return Err(e);
         }
@@ -175,26 +441,50 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
         return Err(p);
     }
     // Encryption keys: a file that can't be read, or a bad key in it, stops the start.
-    let keys = cfg.load_keys(&ctx.config_path)?;
+    let keys = cfg.load_keys(&ctx.config_path, &|name| crate::unlock::held(&ctx, &cfg, name))?;
     warn_readable_keys(&ctx, &cfg);
     open_spool(&ctx, &cfg);
     // The wall clock now, and a monotonic clock from now: the session's
     // `now_ms` is the one plus the other (wall time that never jumps).
-    let epoch_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64);
+    let epoch_ms = crate::clock::unix_ms() as f64;
     let epoch_at = Instant::now();
-    let mut session = Session::new(cfg.clone(), epoch_ms, &|name| fs::read_to_string(bandplan_path(name)).ok(), local_offset)?;
+    let talkgroups = ctx.talkgroups.lock().unwrap().clone();
+    let mut session = Session::new(cfg.clone(), &talkgroups, epoch_ms, &|name| kept::read(&ctx.db, Kind::Bandplan, name), local_offset)?;
     session.attach(ctx.shared.clone());
-    for (name, ring) in keys {
-        log::info!("{name}: {} encryption key{} loaded", ring.keys().len(), if ring.keys().len() == 1 { "" } else { "s" });
-        session.set_keys(&name, Some(ring));
+    if cfg.systems.iter().any(|s| s.share) {
+        session.set_recorder(&crate::directory::recorder_id());
     }
-    session.load_units(&|name| fs::read_to_string(units_path(name)).ok());
-    session.load_heard(&fs::read_to_string(heard_path(&cfg)).unwrap_or_default());
-    session.load_tune(&fs::read_to_string(tune_path()).unwrap_or_default());
-    ctx.plugins.start(&cfg);
+    // (Testing sharing on a short capture: share after this many seconds of decoding, not 5 minutes.)
+    if let Some(s) = std::env::var("TRUNK_PRO_SHARE_AFTER_S").ok().and_then(|v| v.parse::<f64>().ok()) {
+        session.share_after(s * 1000.0);
+    }
+    for k in keys {
+        for s in &k.skipped {
+            log::warn!("Key source {}: key left out: {s}", k.name);
+        }
+        let Some(ring) = k.ring else {
+            log::warn!("Key source {} is locked: unlock it in Setup → Recording to decrypt {}", k.name, k.systems.join(", "));
+            continue;
+        };
+        for w in ring.warnings() {
+            log::warn!("Key source {}: {w}", k.name);
+        }
+        let n = ring.keys().len();
+        log::info!("Key source {}: {n} encryption key{} loaded, for {}", k.name, if n == 1 { "" } else { "s" }, k.systems.join(", "));
+        for s in &k.systems {
+            session.set_keys(s, Some(ring.clone()));
+        }
+    }
+    session.load_units(&|name| kept::read_units(&ctx.db, name));
+    session.load_heard(&kept::read(&ctx.db, Kind::Heard, "").unwrap_or_default());
+    session.load_sharing(&kept::read(&ctx.db, Kind::Sharing, "").unwrap_or_default());
+    session.load_tune(&kept::read(&ctx.db, Kind::Tune, "").unwrap_or_default());
+    ctx.plugins.start(&cfg, plugin_calls(&ctx));
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::sync_channel::<SourceMsg>(256);
+    // Each source's samples queue for its own decoding thread ([`feed_source`]).
+    let mut queues = Vec::new();
     let centers = cfg.resolved_centers();
+    let controls: Vec<Arc<Control>> = cfg.sources.iter().map(|_| Arc::default()).collect();
     let mut threads = Vec::new();
     // A thread that can't be made: what was started is stopped again.
     let undo = |threads: Vec<JoinHandle<()>>, e: std::io::Error| {
@@ -206,39 +496,28 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
         e.to_string()
     };
     for (i, (src, center)) in cfg.sources.iter().zip(&centers).enumerate() {
-        let (tx, stop) = (tx.clone(), stop.clone());
-        let src = src.clone();
-        let center = *center;
-        let spawned = std::thread::Builder::new().name(format!("source-{i}")).spawn(move || match src {
-            Source::Rtlsdr { serial, rate_hz, gain_db, agc, ppm, .. } => {
-                sdr::run(i, RtlConfig { serial, center_hz: center as u64, rate_hz: rate_hz as u32, gain_db: (!agc).then_some(gain_db), ppm }, tx, stop)
-            }
-            Source::Usrp { args, rate_hz, gain_db, agc, antenna, ppm, .. } => {
-                uhd::run(i, uhd::UsrpConfig { args, center_hz: center, rate_hz, gain_db, agc, antenna, ppm }, tx, stop)
-            }
-            Source::Airspy { serial, rate_hz, gain_mode, gain_step, lna_step, mixer_step, vga_step, agc, bias_tee, ppm, .. } => {
-                let gain = airspy_gain(gain_mode, gain_step, lna_step, mixer_step, vga_step, agc);
-                airspy::run(i, airspy::AirspyConfig { serial, center_hz: center, rate_hz, gain, bias_tee, ppm }, tx, stop)
-            }
-            Source::Soapy { args, rate_hz, agc, gain_db, gains, antenna, settings, ppm, .. } => {
-                let gains = gains.into_iter().collect();
-                soapy::run(i, soapy::SoapyConfig { args, center_hz: center, rate_hz, agc, gain_db, gains, antenna, settings, ppm }, tx, stop)
-            }
-            Source::File { path, rate_hz, realtime, format, .. } => run_file(i, &path, rate_hz, realtime, SampleFormat::of(format, &path), tx, stop),
-        });
+        let (tx, rx) = mpsc::sync_channel::<SourceMsg>(256);
+        queues.push(rx);
+        let (stop, center) = (stop.clone(), *center);
+        let spawned = spawn_source(&src, i, center, tx, stop, Some(controls[i].clone()), &format!("source-{i}"));
         match spawned {
             Ok(t) => threads.push(t),
             Err(e) => return Err(undo(threads, e)),
         }
     }
-    drop(tx);
     let (ctx2, stop2) = (ctx.clone(), stop.clone());
-    let spawned = std::thread::Builder::new().name("engine".into()).spawn(move || engine_thread(ctx2, cfg, session, rx, stop2, (epoch_ms, epoch_at)));
+    // The engine's commands: open before its thread is, so none sent meanwhile is lost.
+    let ctl = mpsc::channel::<EngineCmd>();
+    *ctx.engine.lock().unwrap() = Some(ctl.0.clone());
+    let spawned = std::thread::Builder::new().name("engine".into()).spawn(move || engine_thread(ctx2, cfg, session, queues, stop2, (epoch_ms, epoch_at), ctl));
     match spawned {
         Ok(t) => threads.push(t),
-        Err(e) => return Err(undo(threads, e)),
+        Err(e) => {
+            *ctx.engine.lock().unwrap() = None;
+            return Err(undo(threads, e));
+        }
     }
-    Ok(Runner { stop, threads })
+    Ok(Runner { stop, threads, controls })
 }
 
 /// Where a system's band plan is kept between runs.
@@ -247,12 +526,9 @@ fn warn_readable_keys(ctx: &Ctx, cfg: &Config) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let settings = cfg.systems.iter().filter(|s| s.active()).map(|s| &s.keys).chain(cfg.conventional.iter().filter(|c| c.enabled).map(|c| &c.keys));
-        for p in settings.filter_map(|k| trunk_app::keys::path(k, &ctx.config_path)) {
+        for p in cfg.key_files(&ctx.config_path) {
             if fs::metadata(&p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
-                let text = format!("Keys file {} can be read by other users (chmod 600 it)", p.display());
-                log::warn!("{text}");
-                publish(&ctx.hub, json!({ "type": "log", "lines": [{ "timeS": 0, "kind": "error", "text": text }] }));
+                log::warn!("Keys file {} can be read by other users (chmod 600 it)", p.display());
             }
         }
     }
@@ -260,94 +536,133 @@ fn warn_readable_keys(ctx: &Ctx, cfg: &Config) {
     let _ = (ctx, cfg);
 }
 
-fn bandplan_path(short_name: &str) -> PathBuf {
-    crate::paths::data_dir().join(format!("{short_name}.bandplan"))
-}
-
-/// Where a system's radios' talker aliases are kept (Trunk Recorder's unitTagsOTA CSV).
-pub(crate) fn units_path(short_name: &str) -> PathBuf {
-    crate::paths::data_dir().join(format!("{short_name}.units.csv"))
-}
-
-/// Save the band plans that changed since `saved` (what was last written).
-fn save_bandplans(session: &Session, saved: &mut std::collections::HashMap<String, String>) {
-    for (name, plan) in session.bandplans() {
-        if !plan.is_empty() && saved.get(&name) != Some(&plan) {
-            let _ = fs::create_dir_all(crate::paths::data_dir());
-            let _ = trunk_app::config::write_atomic(&bandplan_path(&name), &plan);
-            saved.insert(name, plan);
-        }
+/// System `system`'s talkgroups are now `rows` (none: it has none): kept,
+/// told to every browser, and taken by the recording at once; written in
+/// the background ([`kept::write_talkgroups`]). A talkgroup in two rows:
+/// the later one, where the first was.
+pub fn set_talkgroups(ctx: &Ctx, system: &str, rows: Vec<TalkgroupRow>) -> Result<(), String> {
+    if system.trim().is_empty() || system.contains(['/', '\\']) || system.starts_with('.') {
+        return Err(format!("bad short name {system:?}"));
     }
-}
-
-/// Where the radio registry (talkgroups, radios, frequencies heard) is kept, a file per system.
-fn radio_dir() -> PathBuf {
-    crate::paths::data_dir().join("radio")
-}
-
-/// Read the radio registry saved by earlier runs.
-pub fn load_registry(shared: &trunk_app::stats::Shared) {
-    let mut r = shared.radio.lock().unwrap();
-    for e in fs::read_dir(radio_dir()).into_iter().flatten().flatten() {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x == "json") {
-            if let (Some(name), Ok(text)) = (p.file_stem().and_then(|n| n.to_str()), fs::read_to_string(&p)) {
-                r.load(name, &text);
+    let mut at = std::collections::HashMap::new();
+    let mut once: Vec<TalkgroupRow> = Vec::with_capacity(rows.len());
+    for r in rows {
+        match at.get(&r.tg.number) {
+            Some(&i) => once[i] = r,
+            None => {
+                at.insert(r.tg.number, once.len());
+                once.push(r);
             }
         }
     }
+    let rows = once;
+    // (Handed to the writer with the lock held: two browsers' edits are written in the order they're kept.)
+    {
+        let mut lists = ctx.talkgroups.lock().unwrap();
+        if rows.is_empty() {
+            lists.remove(system);
+        } else {
+            lists.insert(system.to_string(), rows.clone());
+        }
+        kept::write_talkgroups(&ctx.db, system, rows.clone());
+    }
+    ctx.tell_engine(EngineCmd::Talkgroups { short_name: system.to_string(), rows: rows.clone() });
+    // (The config first, then the names: as config_changed takes them.)
+    let (cfg, lists) = (ctx.config.lock().unwrap().clone(), ctx.talkgroups.lock().unwrap().clone());
+    ctx.shared.names.lock().unwrap().set_config(&cfg, &lists);
+    publish(&ctx.hub, ToClient::Talkgroups { system: system.to_string(), talkgroups: rows });
+    Ok(())
 }
 
-/// Save the systems whose registry changed since the last save.
-pub fn save_registry(shared: &trunk_app::stats::Shared) {
-    let changed = shared.radio.lock().unwrap().take_dirty();
-    if changed.is_empty() {
-        return;
+/// One talkgroup of system `system`'s file edited: only the cells `edit`
+/// sets change. Kept, taken by the recording and told to every browser at
+/// once (the row alone, not the file); written in the background.
+pub fn set_talkgroup(ctx: &Ctx, system: &str, number: u32, edit: trunk_app::protocol::TalkgroupEdit) -> Result<(), String> {
+    if system.trim().is_empty() || system.contains(['/', '\\']) || system.starts_with('.') {
+        return Err(format!("bad short name {system:?}"));
     }
-    let _ = fs::create_dir_all(radio_dir());
-    for (name, json) in changed {
-        let file = radio_dir().join(format!("{}.json", trunk_core::metrics::key_part(&name)));
-        if let Err(e) = trunk_app::config::write_atomic(&file, &json) {
-            log::warn!("Couldn't save {}: {e}", file.display());
+    let row = {
+        // (Edited and handed to the writer with the lock held: edits are written in the order they're kept.)
+        let mut lists = ctx.talkgroups.lock().unwrap();
+        let rows = lists.entry(system.to_string()).or_default();
+        let edited = trunk_core::trunk::edit_rows(rows, number, &edit.cells());
+        let order = rows.iter().position(|r| r.tg.number == number).unwrap_or(rows.len());
+        if let Some(r) = &edited {
+            kept::write_talkgroup(&ctx.db, system, r.clone(), order);
+        }
+        if rows.is_empty() {
+            lists.remove(system);
+        }
+        edited.map(|r| r.tg)
+    };
+    ctx.shared.names.lock().unwrap().set_talkgroup(system, number, row.clone());
+    ctx.tell_engine(EngineCmd::Talkgroup { short_name: system.to_string(), number, row });
+    publish(&ctx.hub, ToClient::TalkgroupEdited { system: system.to_string(), talkgroup: number, edit });
+    Ok(())
+}
+
+/// Hand what's due to be kept between runs ([`Session::due`]: it says when
+/// each is) to the store's writer ([`kept`]); `all`:
+/// everything that changed (the recording's end).
+fn save_due(ctx: &Ctx, session: &mut Session, now_ms: f64, all: bool) {
+    for saved in session.due(now_ms, all) {
+        let (kind, key) = (saved.kind(), saved.key().to_string());
+        match saved {
+            Saved::Units { system, csv } => kept::write_units(&ctx.db, &system, &csv),
+            Saved::Registry { system, changes } => kept::write_registry(&ctx.db, &system, changes),
+            Saved::Sharing(text) | Saved::Bandplan { plan: text, .. } | Saved::Heard(text) | Saved::Tune(text) => kept::write(&ctx.db, kind, &key, text),
         }
     }
 }
 
-/// How often the radio registry is saved while recording (it's rewritten whole).
-const REGISTRY_EVERY: Duration = Duration::from_secs(15 * 60);
-
-/// Where the codes conventional frequencies carried are kept ([`trunk_app::heard`]).
-pub(crate) fn heard_path(cfg: &trunk_app::Config) -> PathBuf {
-    crate::paths::data_dir().join(Session::heard_file(cfg))
-}
-
-/// AutoTune's scores from earlier runs ([`Session::tune_unsaved`]).
-fn tune_path() -> PathBuf {
-    crate::paths::data_dir().join("tune.json")
-}
-
-/// Keep the sources' AutoTune scores for the next run, when they changed.
-fn save_tune(session: &mut Session) {
-    if let Some(json) = session.tune_unsaved() {
-        let _ = fs::create_dir_all(crate::paths::data_dir());
-        let _ = trunk_app::config::write_atomic(&tune_path(), &json);
-    }
-}
-
-/// Save the talker aliases systems learned, and the codes conventional
-/// frequencies carried, since the last save.
-fn save_units(session: &mut Session) {
-    for (name, csv) in session.units_changed() {
-        let _ = fs::create_dir_all(crate::paths::data_dir());
-        let _ = trunk_app::config::write_atomic(&units_path(&name), csv);
-    }
-    if let Some(json) = session.heard_unsaved() {
-        let _ = fs::create_dir_all(crate::paths::data_dir());
-        let _ = trunk_app::config::write_atomic(&heard_path(session.config()), json);
+/// The names the radio registry answers with, as saved: each system's
+/// talkgroups (`cfg` with its talkgroup files) and talker aliases. A
+/// recording keeps them current from then on.
+pub fn load_names(shared: &trunk_app::stats::Shared, cfg: &Config, talkgroups: &trunk_app::config::TalkgroupLists, db: &crate::db::Db) {
+    let mut book = shared.names.lock().unwrap();
+    book.set_config(cfg, talkgroups);
+    for n in cfg.systems.iter().map(|s| &s.short_name).chain(cfg.conventional.iter().map(|c| &c.short_name)) {
+        if let Some(csv) = kept::read_units(db, n) {
+            book.set_units(n, &csv);
+        }
     }
 }
 
 /// Replay a capture file as a source, paced to real time or as fast as possible.
+/// A thread named `name` streaming source `src` (number `i`) into `tx` at
+/// `center` until `stop`; `ctl`: retune and gain requests (the survey). A
+/// capture file plays at its own centre. Recording and the survey both
+/// start their sources this way.
+pub(crate) fn spawn_source(src: &Source, i: usize, center: f64, tx: SyncSender<SourceMsg>, stop: Arc<AtomicBool>, ctl: Option<Arc<sdr::Control>>, name: &str) -> std::io::Result<JoinHandle<()>> {
+    let src = src.clone();
+    std::thread::Builder::new().name(name.to_string()).spawn(move || {
+        let Source { kind, rate_hz, ppm, .. } = src;
+        match kind {
+            SourceKind::Rtlsdr { serial, gain_db, agc, buf_len, buffers } => {
+                sdr::run_with(i, rtl::RtlConfig { serial, center_hz: center as u64, rate_hz: rate_hz as u32, gain_db: (!agc).then_some(gain_db as f32), ppm, buf_len, buffers }, tx, stop, ctl)
+            }
+            SourceKind::Usrp { args, gain_db, agc, antenna, wire_format } => {
+                sdr::run_with(i, uhd::UsrpConfig { args, center_hz: center, rate_hz, gain_db, agc, antenna, ppm, wire_format }, tx, stop, ctl)
+            }
+            SourceKind::Hackrf { serial, lna_db, vga_db, amp, bias_tee } => {
+                sdr::run_with(i, hackrf::HackrfConfig { serial, center_hz: center, rate_hz, gain: hackrf_gain(lna_db, vga_db, amp), bias_tee, ppm }, tx, stop, ctl)
+            }
+            SourceKind::Airspy { serial, gain_mode, gain_step, lna_step, mixer_step, vga_step, agc, bias_tee, packing } => {
+                let gain = airspy_gain(gain_mode, gain_step, lna_step, mixer_step, vga_step, agc);
+                sdr::run_with(i, airspy::AirspyConfig { serial, center_hz: center, rate_hz, gain, bias_tee, packing, ppm }, tx, stop, ctl)
+            }
+            SourceKind::Bladerf { serial, bandwidth_hz, gain_db, agc, bias_tee } => {
+                sdr::run_with(i, bladerf::BladerfConfig { serial, center_hz: center, rate_hz, bandwidth_hz, gain_db, agc, bias_tee, ppm }, tx, stop, ctl)
+            }
+            SourceKind::Soapy { args, agc, gain_db, gains, antenna, settings } => {
+                let gains = gains.into_iter().collect();
+                sdr::run_with(i, soapy::SoapyConfig { args, center_hz: center, rate_hz, agc, gain_db, gains, antenna, settings, ppm }, tx, stop, ctl)
+            }
+            SourceKind::File { path, realtime, format } => run_file(i, &path, rate_hz, realtime, SampleFormat::of(format, &path), tx, stop),
+        }
+    })
+}
+
 pub(crate) fn run_file(source: usize, path: &str, rate_hz: f64, realtime: bool, format: SampleFormat, tx: SyncSender<SourceMsg>, stop: Arc<AtomicBool>) {
     let mut f = match fs::File::open(path) {
         Ok(f) => f,
@@ -361,19 +676,22 @@ pub(crate) fn run_file(source: usize, path: &str, rate_hz: f64, realtime: bool, 
     let chunk = 32768 * bps;
     let t0 = Instant::now();
     let mut sent = 0u64;
+    // (Waits for room: a capture loses nothing, whatever its pace.)
+    let mut sink = sdr::Sink::new(source, tx.clone(), rate_hz, false);
+    let mut buf = vec![0u8; chunk];
     while !stop.load(Ordering::Relaxed) {
-        let mut buf = vec![0u8; chunk];
+        buf.resize(chunk, 0);
         let n = read_full(&mut f, &mut buf);
         if n < bps {
             break;
         }
         buf.truncate(n - n % bps);
         sent += (buf.len() / bps) as u64;
-        let msg = match format {
-            SampleFormat::Cu8 => SourceMsg::Data { source, bytes: buf, dropped: 0, at: Instant::now() },
-            _ => SourceMsg::Iq { source, samples: trunk_app::samples::to_iq(format, &buf), dropped: 0, at: Instant::now() },
+        let open = match format {
+            SampleFormat::Cu8 => sink.bytes(sdr::Wire::Offset, &buf, 0, Instant::now()),
+            _ => sink.iq(&trunk_app::samples::to_iq(format, &buf), 0, Instant::now()),
         };
-        if tx.send(msg).is_err() {
+        if !open {
             return;
         }
         if realtime {
@@ -383,6 +701,7 @@ pub(crate) fn run_file(source: usize, path: &str, rate_hz: f64, realtime: bool, 
             }
         }
     }
+    drop(sink);
     let _ = tx.send(SourceMsg::End { source });
 }
 
@@ -399,16 +718,22 @@ fn read_full(f: &mut fs::File, buf: &mut [u8]) -> usize {
 }
 
 /// An Airspy's gain settings, as its driver takes them.
-pub fn airspy_gain(mode: AirspyGain, gain: u8, lna: u8, mixer: u8, vga: u8, agc: bool) -> airspy::AirspyGain {
+/// An Airspy source's gain: a step of one of libairspy's tables, or its stages (its AGC running the LNA and mixer).
+pub fn airspy_gain(mode: AirspyGain, gain: u8, lna: u8, mixer: u8, vga: u8, agc: bool) -> Gain {
     match mode {
-        AirspyGain::Manual if agc => airspy::AirspyGain::Agc { vga },
-        AirspyGain::Manual => airspy::AirspyGain::Manual { lna, mixer, vga },
-        AirspyGain::Sensitivity => airspy::AirspyGain::Sensitivity(gain),
-        AirspyGain::Linearity => airspy::AirspyGain::Linearity(gain),
+        AirspyGain::Manual if agc => Gain::Stages(Stages::default().agc().with(Stage::Vga, vga as f32)),
+        AirspyGain::Manual => Gain::Stages(Stages::default().with(Stage::Lna, lna as f32).with(Stage::Mixer, mixer as f32).with(Stage::Vga, vga as f32)),
+        AirspyGain::Sensitivity => Gain::Preset(Preset::Sensitivity, gain),
+        AirspyGain::Linearity => Gain::Preset(Preset::Linearity, gain),
     }
 }
 
-fn local_offset(t: i64) -> i32 {
+/// A HackRF source's stages: LNA and VGA dB, the amp's 14 dB or none.
+pub fn hackrf_gain(lna_db: u16, vga_db: u16, amp: bool) -> Stages {
+    Stages::default().with(Stage::Lna, lna_db as f32).with(Stage::Vga, vga_db as f32).with(Stage::Amp, if amp { 14.0 } else { 0.0 })
+}
+
+pub(crate) fn local_offset(t: i64) -> i32 {
     Local.timestamp_opt(t, 0).single().unwrap_or_else(Local::now).offset().fix().local_minus_utc()
 }
 
@@ -424,9 +749,7 @@ fn open_spool(ctx: &Ctx, cfg: &Config) {
         match crate::spool::Spool::open(want, &crate::paths::data_dir()) {
             Ok(s) => Some(Arc::new(s)),
             Err(e) => {
-                let text = format!("No RAM spool ({e}): calls go to the recordings folder");
-                log::warn!("{text}");
-                publish(&ctx.hub, json!({ "type": "log", "lines": [{ "timeS": 0, "kind": "error", "text": text }] }));
+                log::warn!("No RAM spool ({e}): calls go to the recordings folder");
                 None
             }
         }
@@ -436,126 +759,237 @@ fn open_spool(ctx: &Ctx, cfg: &Config) {
     *ctx.spool.lock().unwrap() = spool;
 }
 
-/// `epoch`: the wall clock (Unix ms) at an instant, for the session's clock.
-fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, rx: mpsc::Receiver<SourceMsg>, stop: Arc<AtomicBool>, epoch: (f64, Instant)) {
-    ctx.set_phase("running", None, false);
-    let dir = PathBuf::from(&cfg.recording.capture_dir);
-    // Each system's file rules, by a call's `system` (trunked or conventional).
-    let rules = {
-        let cfg = cfg.clone();
-        move |system: u16| FileRules::of(&cfg.recording_of(system))
-    };
-    let spool = ctx.spool.lock().unwrap().clone();
-    let (fin_tx, fin_rx) = mpsc::sync_channel::<Finish>(1024);
-    let finisher = {
-        let (ctx, dir, spool, m4a) = (ctx.clone(), dir.clone(), spool.clone(), cfg.recording.m4a.clone());
-        std::thread::Builder::new().name("finish".into()).spawn(move || finish_calls(&ctx, &dir, spool.as_deref(), fin_rx, &m4a)).expect("thread")
-    };
-    // Calls are written on the finish thread, so a slow disk doesn't hold up decoding.
-    let fin = |f: Finish, plugins: Option<&PluginHost>| {
-        if let Err(mpsc::TrySendError::Full(f)) = fin_tx.try_send(f) {
-            // (Behind on writing or encoding: this one is written here, without its M4A, rather than waiting.)
-            finish_one(&ctx, &dir, spool.as_deref(), Finish { rules: FileRules { compress_wav: false, ..f.rules }, ..f }, None, plugins);
-        }
-    };
+/// One source's decoding thread: its samples into the engine as they come
+/// (each source on a core of its own), anything else to the engine thread.
+/// On stop, what the source had already sent is decoded first (up to the
+/// queue's 256 blocks: about 2.5 s of 10 ms USRP / Soapy blocks, about 14 s
+/// of RTL-SDR's at 2.4 MSPS): calls in progress keep it.
+fn feed_source(feeder: Feeder, rx: mpsc::Receiver<SourceMsg>, ctl: mpsc::Sender<EngineCmd>, stop: Arc<AtomicBool>, epoch: (f64, Instant), air: Air) {
     let now_ms = || epoch.0 + epoch.1.elapsed().as_secs_f64() * 1000.0;
     // An instant on the same clock (when a driver handed samples over).
     let at_ms = |at: Instant| epoch.0 + at.saturating_duration_since(epoch.1).as_secs_f64() * 1000.0;
+    // (An Airspy's real samples become IQ here, on this thread.)
+    let mut rx = Inbox::new(rx);
+    let take = |m: SourceMsg| match m {
+        SourceMsg::Samples { source, block, dropped, at } => {
+            debug_assert_eq!(source, feeder.source());
+            air.keep_up(&stop);
+            match &block {
+                Block::U8(b) => feeder.push(b, dropped, at_ms(at)),
+                Block::Iq(b) => feeder.push_iq(b, dropped, at_ms(at)),
+                Block::Real16(_) => unreachable!("the inbox makes them I/Q"),
+            }
+            air.fed(block.len() as u64 + dropped);
+        }
+        // A change the radio halted for: quiet, not loss (recording ignores the retune itself).
+        SourceMsg::Tuned { gap, .. } => feeder.quiet(gap),
+        m => {
+            let _ = ctl.send(EngineCmd::Source(m));
+        }
+    };
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            while let Ok(m) = rx.try_recv() {
+                take(m);
+            }
+            return;
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(m) => take(m),
+            Err(RecvTimeoutError::Timeout) => feeder.idle(now_ms()),
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    air.done();
+}
+
+/// How far into its air each capture played as fast as it goes is, ms
+/// (`u64::MAX`: done, or a source that keeps time by itself). Such a capture
+/// has no clock to keep it in step with the others: it waits while it's
+/// more than [`Air::LEAD_MS`] ahead of the slowest of them, as sources on the
+/// air never are by much (a grant on one source opens a channel on another
+/// where that one is). Sources on the air never wait, nor are waited for.
+struct Air {
+    at_ms: Arc<Vec<AtomicU64>>,
+    me: usize,
+    rate_hz: f64,
+    samples: std::cell::Cell<u64>,
+    paced: bool,
+}
+
+impl Air {
+    const LEAD_MS: u64 = 100;
+
+    fn fed(&self, n: u64) {
+        if self.paced {
+            return;
+        }
+        self.samples.set(self.samples.get() + n);
+        self.at_ms[self.me].store((self.samples.get() as f64 / self.rate_hz * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    fn keep_up(&self, stop: &AtomicBool) {
+        if self.paced {
+            return;
+        }
+        let mine = self.at_ms[self.me].load(Ordering::Relaxed);
+        while !stop.load(Ordering::Relaxed) && self.at_ms.iter().enumerate().any(|(i, a)| i != self.me && a.load(Ordering::Relaxed).saturating_add(Self::LEAD_MS) < mine) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn done(&self) {
+        self.at_ms[self.me].store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+/// `queues`: each source's samples. `epoch`: the wall clock (Unix ms) at an
+/// instant, for the session's clock. `ctl`: everything for this thread — the
+/// sources' errors and ends (by way of their decoding threads), and the
+/// browsers' and the server's changes ([`Ctx::engine`] holds its sender).
+fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<mpsc::Receiver<SourceMsg>>, stop: Arc<AtomicBool>, epoch: (f64, Instant), ctl: (mpsc::Sender<EngineCmd>, mpsc::Receiver<EngineCmd>)) {
+    ctx.set_phase("running", None, false);
+    // Calls are stamped by this clock: the clock's health watches it against the wall clock.
+    ctx.clock.recording(Some(epoch));
+    let mut radio_at = Instant::now();
+    let (ctl_tx, rx) = ctl;
+    session.set_topics(ctx.topics());
+    let at_ms: Arc<Vec<AtomicU64>> = Arc::new(cfg.sources.iter().map(|_| AtomicU64::new(0)).collect());
+    let feeders: Vec<JoinHandle<()>> = queues
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let (f, ctl, stop) = (session.feeder(i), ctl_tx.clone(), stop.clone());
+            let src = &cfg.sources[i];
+            let paced = !matches!(src.kind, SourceKind::File { realtime: false, .. });
+            if paced {
+                at_ms[i].store(u64::MAX, Ordering::Relaxed);
+            }
+            let air = Air { at_ms: at_ms.clone(), me: i, rate_hz: src.rate_hz, samples: Default::default(), paced };
+            std::thread::Builder::new().name(format!("dsp-{i}")).spawn(move || feed_source(f, q, ctl, stop, epoch, air)).expect("thread")
+        })
+        .collect();
+    drop(ctl_tx);
+    let dir = PathBuf::from(&cfg.recording.capture_dir);
+    // Each system's file rules, by a call's `system` (trunked or conventional).
+    let rules = {
+        let (each, all) = (cfg.recordings().iter().map(FileRules::of).collect::<Vec<_>>(), FileRules::of(&cfg.recording));
+        move |system: u16| each.get(system as usize).copied().unwrap_or(all)
+    };
+    let spool = ctx.spool.lock().unwrap().clone();
+    let encoder = plugins::Encoder::find(cfg.recording.m4a.encoder).map(|e| (e, cfg.recording.m4a.bitrate_kbps.clamp(8, 320)));
+    if encoder.is_none() && cfg.recordings().iter().any(|r| r.archive_m4a) {
+        log::warn!("{}", if cfg.recording.m4a.encoder == crate::config::M4aEncoder::None { "M4A encoding is off: calls are kept as WAV only" } else { "No M4A encoder found (install ffmpeg): calls are kept as WAV only" });
+    }
+    // Calls are finished on threads of their own (each may be encoding an
+    // .m4a), so a slow disk or encoder doesn't hold up decoding.
+    let (fin_tx, fin_rx) = mpsc::sync_channel::<Finish>(1024);
+    let fin_rx = Arc::new(Mutex::new(fin_rx));
+    let finishers: Vec<JoinHandle<()>> = (0..finishers())
+        .map(|i| {
+            let (ctx, dir, spool, encoder, rx) = (ctx.clone(), dir.clone(), spool.clone(), encoder.clone(), fin_rx.clone());
+            std::thread::Builder::new().name(format!("finish-{i}")).spawn(move || finish_calls(&ctx, &dir, spool.as_deref(), &rx, encoder.as_ref())).expect("thread")
+        })
+        .collect();
+    let fin = |f: Finish| {
+        // Behind on writing or encoding: decoding is on the sources' own
+        // threads, so this waits a while; past that, it's finished here (by
+        // the same plan) rather than dropped.
+        let until = Instant::now() + FINISH_WAIT;
+        let mut f = f;
+        loop {
+            match fin_tx.try_send(f) {
+                Ok(()) => return,
+                Err(mpsc::TrySendError::Full(back)) if Instant::now() < until => {
+                    f = back;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(mpsc::TrySendError::Full(back)) => return finish_one(&ctx, &dir, spool.as_deref(), back, encoder.as_ref()),
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+            }
+        }
+    };
+    let now_ms = || epoch.0 + epoch.1.elapsed().as_secs_f64() * 1000.0;
     let mut out = Vec::new();
     let mut ended_all = false;
-    // Band plans (and DMR channel tables) as last saved: learned ones survive a crash or kill too.
-    let mut saved_plans: std::collections::HashMap<String, String> = Default::default();
-    let mut plans_at = Instant::now();
-    let mut tune_at = Instant::now();
-    let mut registry_at = Instant::now();
-    let mut topics_gen = u64::MAX;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(SourceMsg::Data { source, bytes, dropped, at }) => {
-                let t = Instant::now();
-                session.push(source, &bytes, dropped, at_ms(at));
-                session.add_busy_ms(t.elapsed().as_secs_f64() * 1000.0);
-            }
-            Ok(SourceMsg::Iq { source, samples, dropped, at }) => {
-                let t = Instant::now();
-                session.push_iq(source, &samples, dropped, at_ms(at));
-                session.add_busy_ms(t.elapsed().as_secs_f64() * 1000.0);
-            }
-            Ok(SourceMsg::Error { source, error }) => session.source_error(source, &error),
-            Ok(SourceMsg::Tuned { .. }) => {}
-            Ok(SourceMsg::End { source }) => {
-                if session.source_ended(source) {
-                    // (Not "ended" when the user stopped it: the file thread ends on stop too.)
-                    ended_all = !stop.load(Ordering::Relaxed);
-                    break;
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        // (The plugins can be swapped meanwhile: their settings changed.)
-        let plugins = ctx.plugins.host.read().unwrap();
-        session.plugin_topics = plugins.as_ref().map_or(Default::default(), |p| p.topics);
-        session.want_audio = ctx.hub.receiver_count() > 0 || plugins.as_ref().is_some_and(|p| p.audio);
-        let g = ctx.topics_gen.load(Ordering::Relaxed);
-        if g != topics_gen {
-            topics_gen = g;
-            session.set_topics(ctx.topics());
-        }
-        for c in std::mem::take(&mut *ctx.engine_cmds.lock().unwrap()) {
+        // (What the sources decoded meanwhile is collected below, every 20 ms at most.)
+        // (What the sources decoded meanwhile is collected below, every 20 ms at most.)
+        let mut next = rx.recv_timeout(Duration::from_millis(20)).ok();
+        while let Some(c) = next {
             match c {
-                EngineCmd::Talkgroups { short_name, csv } => {
-                    if session.set_talkgroups(&short_name, &csv) {
+                EngineCmd::Source(SourceMsg::Error { source, error }) => session.source_error(source, &error),
+                EngineCmd::Source(SourceMsg::End { source }) => {
+                    if session.source_ended(source) {
+                        // (Not "ended" when the user stopped it: the file thread ends on stop too.)
+                        ended_all = !stop.load(Ordering::Relaxed);
+                    }
+                }
+                EngineCmd::Source(_) => {}
+                EngineCmd::Topics(t) => session.set_topics(t),
+                EngineCmd::Talkgroups { short_name, rows } => {
+                    if session.set_talkgroups(&short_name, &rows) {
                         log::info!("[{short_name}] Talkgroups updated");
                     }
                 }
+                EngineCmd::Talkgroup { short_name, number, row } => {
+                    session.set_talkgroup(&short_name, number, row);
+                }
+                EngineCmd::Keys { short_name, ring } => {
+                    session.set_keys(&short_name, ring);
+                }
+                EngineCmd::ShareSystem(sys) => {
+                    if sys.share {
+                        session.set_recorder(&crate::directory::recorder_id());
+                    }
+                    session.set_share(&sys);
+                }
+                EngineCmd::Shared { short_name, result } => session.share_done(&short_name, now_ms(), result),
             }
+            next = rx.try_recv().ok();
         }
+        if ended_all {
+            break;
+        }
+        // (The plugins can be swapped meanwhile: their settings changed. This iteration's, held by no lock.)
+        let plugins = ctx.plugins.host();
+        session.plugin_topics = plugins.as_ref().map_or(Default::default(), |p| p.topics);
+        session.want_audio = ctx.hub.receiver_count() > 0 || plugins.as_ref().is_some_and(|p| p.audio);
         session.poll(now_ms(), &mut out);
-        deliver(&ctx, &mut out, plugins.as_ref(), &rules, &fin);
+        deliver(&ctx, &mut out, plugins.as_deref(), &rules, &fin);
         drop(plugins);
-        save_units(&mut session);
-        if tune_at.elapsed() >= Duration::from_secs(60) {
-            tune_at = Instant::now();
-            save_tune(&mut session);
-        }
-        if plans_at.elapsed() >= Duration::from_secs(10) {
-            plans_at = Instant::now();
-            save_bandplans(&session, &mut saved_plans);
-        }
-        if registry_at.elapsed() >= REGISTRY_EVERY {
-            registry_at = Instant::now();
-            save_registry(&ctx.shared);
+        // (Learned band plans and DMR channel tables, talker aliases, …: a crash or kill loses little.)
+        save_due(&ctx, &mut session, now_ms(), false);
+        if radio_at.elapsed() >= Duration::from_secs(5) {
+            radio_at = Instant::now();
+            ctx.clock.set_radio(session.radio_clocks());
         }
     }
+    *ctx.engine.lock().unwrap() = None;
     ctx.set_phase("stopping", None, false);
-    // What the sources had already sent (up to the queue's 256 blocks: about
-    // 2.5 s of 10 ms USRP / Soapy blocks, about 14 s of RTL-SDR's at
-    // 2.4 MSPS): calls in progress keep it.
-    for m in rx.try_iter() {
-        match m {
-            SourceMsg::Data { source, bytes, dropped, at } => session.push(source, &bytes, dropped, at_ms(at)),
-            SourceMsg::Iq { source, samples, dropped, at } => session.push_iq(source, &samples, dropped, at_ms(at)),
-            _ => {}
-        }
+    // The decoding threads finish what their sources had already sent
+    // ([`feed_source`]); once the sources are gone (stopped, or files at their end).
+    for f in feeders {
+        let _ = f.join();
     }
     session.poll(now_ms(), &mut out);
     session.finish(&mut out);
-    deliver(&ctx, &mut out, ctx.plugins.host.read().unwrap().as_ref(), &rules, &fin);
+    deliver(&ctx, &mut out, ctx.plugins.host().as_deref(), &rules, &fin);
     drop(fin_tx);
-    let _ = finisher.join();
+    for f in finishers {
+        let _ = f.join();
+    }
     // Uploads in flight get a moment to finish.
     ctx.plugins.stop(Duration::from_secs(10));
-    let _ = fs::create_dir_all(crate::paths::data_dir());
-    for (name, plan) in session.bandplans() {
-        let _ = trunk_app::config::write_atomic(&bandplan_path(&name), plan);
+    save_due(&ctx, &mut session, now_ms(), true);
+    // (All of it in the store before recording is said to have stopped.)
+    if let Err(e) = ctx.db.flush() {
+        log::warn!("Call store: {e}");
     }
-    save_units(&mut session);
-    save_tune(&mut session);
-    save_registry(&ctx.shared);
+    ctx.clock.recording(None);
     stop.store(true, Ordering::Relaxed);
     ctx.set_phase("idle", None, ended_all);
 }
@@ -565,103 +999,128 @@ struct Finish {
     rel: String,
     system: u16,
     wav: Vec<u8>,
-    json: String,
+    record: trunk_recorder_plugin::CallRecord,
     frames: Option<trunk_core::trunk::Capture>,
-    /// Its history entry (`{path, record}`).
-    entry: Value,
     rules: FileRules,
+    /// Some of it was decrypted with our keys: only plugins with `shareDecrypted` take it.
+    decrypted: bool,
 }
 
-/// Each call: its files, then (once they're on disk) the `concluded`
-/// message and history, its .m4a (compressWav), and the plugins, whose
-/// results settle what's kept ([`crate::plugins::Archive`]).
-fn finish_calls(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, rx: mpsc::Receiver<Finish>, m4a: &crate::config::M4a) {
-    let encoder = plugins::Encoder::find(&m4a.encoder).map(|e| (e, m4a.bitrate_kbps.clamp(8, 320)));
-    let mut warned = false;
-    for f in rx {
-        if f.rules.compress_wav && encoder.is_none() && !std::mem::replace(&mut warned, true) {
-            let text = if m4a.encoder == "none" { "M4A encoding is off: calls are kept as WAV only" } else { "No M4A encoder found (install ffmpeg): calls are kept as WAV only" };
-            log::warn!("{text}");
-            publish(&ctx.hub, json!({ "type": "log", "lines": [{ "timeS": 0, "kind": "error", "text": text }] }));
-        }
-        let host = ctx.plugins.host.read().unwrap();
-        finish_one(ctx, dir, spool, f, encoder.as_ref(), host.as_ref());
+/// How many calls are finished at once (each may be encoding an .m4a).
+fn finishers() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 3)
+}
+
+/// How long decoding waits for a place in the finish queue before finishing a call itself.
+const FINISH_WAIT: Duration = Duration::from_secs(5);
+
+/// A finish thread: each call it's given, until the recording ends.
+fn finish_calls(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, rx: &Mutex<mpsc::Receiver<Finish>>, encoder: Option<&(plugins::Encoder, u32)>) {
+    loop {
+        let Ok(f) = rx.lock().unwrap().recv() else { return };
+        finish_one(ctx, dir, spool, f, encoder);
     }
 }
 
-/// `host`: the plugins, as the caller already holds them (taking the lock
-/// again on the engine thread could deadlock with a plugin reload waiting).
-///
-/// What's kept once the plugins are done goes to the recordings folder, and
-/// what only they need to the spool, when there is one with room. The WAV is
-/// written only when it's kept or a plugin takes it: an .m4a is encoded
-/// from memory.
-fn finish_one(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, f: Finish, encoder: Option<&(plugins::Encoder, u32)>, host: Option<&PluginHost>) {
+/// A call's files, all of them, as its [`plugins::plan`] says: what's kept
+/// goes to the recordings folder, what only the plugins need to the spool
+/// when there is one with room. Then the `concluded` message and history,
+/// the .m4a (to keep, or for a plugin; its WAV instead should that fail),
+/// and the plugins, handed the files as they are; their results settle
+/// what's kept ([`crate::plugins::Archive`]).
+fn finish_one(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, mut f: Finish, encoder: Option<&(plugins::Encoder, u32)>) {
+    let host = ctx.plugins.host();
     let r = f.rules;
-    let takers = host.map_or(0, |h| h.call_takers());
-    let p = plugins::plan(r, takers, host.is_some_and(|h| h.needs_wav()), encoder.is_some());
-    let (keep_audio, keep_json, keep_m4a, write_wav) = (p.keep_audio, p.keep_json, p.keep_m4a, p.write_wav);
+    let to_plugins = host.as_ref().map_or(Default::default(), |h| h.plugin_audio(f.decrypted));
+    let p = plugins::plan(r, to_plugins, encoder.is_some());
+    let (keep_wav, keep_m4a, keep_json, keep_audio) = (p.keep_wav, p.keep_m4a, p.keep_json, p.keep_audio);
     let base = dir.join(&f.rel);
-    let need = f.json.len() + f.wav.len() / 4 + if write_wav && !keep_audio { f.wav.len() } else { 0 };
+    // Stamped while the clock was off: said with it, for whoever matches it with others' calls.
+    f.record.clock_off = ctx.clock.off();
+    // (The record written once, as the .json file has it.)
+    let json = f.record.to_json();
+    let need = json.len() + f.wav.len() / 4 + if p.write_wav && !keep_wav { f.wav.len() } else { 0 };
     let spooled = spool.filter(|s| p.spool && s.room_for(need as u64)).map(|s| s.dir.join(&f.rel));
     let at = |kept: bool, ext: &str| PathBuf::from(format!("{}.{ext}", if kept { &base } else { spooled.as_ref().unwrap_or(&base) }.display()));
-    let (wav_at, json_at, frames_at, m4a_at) = (at(keep_audio, "wav"), at(keep_json, "json"), at(keep_audio, f.frames.as_ref().map_or("sdr", |c| c.ext)), at(keep_m4a, "m4a"));
+    let (wav_at, json_at, frames_at, m4a_at) = (at(keep_wav, "wav"), at(keep_json, "json"), at(keep_audio, f.frames.as_ref().map_or("sdr", |c| c.ext)), at(keep_m4a, "m4a"));
     for d in [&wav_at, &json_at, &m4a_at].into_iter().filter_map(|p| p.parent()) {
         let _ = fs::create_dir_all(d);
     }
-    let ok = (!write_wav || fs::write(&wav_at, &f.wav).is_ok())
-        && (!p.write_json || fs::write(&json_at, &f.json).is_ok())
+    let ok = (!p.write_wav || fs::write(&wav_at, &f.wav).is_ok())
+        && (!p.write_json || fs::write(&json_at, &json).is_ok())
         && f.frames.as_ref().filter(|_| p.write_frames).is_none_or(|c| fs::write(&frames_at, &c.bytes).is_ok());
     if !ok {
-        log::error!("Couldn't write {}", base.display());
-        publish(&ctx.hub, json!({ "type": "log", "lines": [{ "timeS": 0, "kind": "error", "text": format!("couldn't write {}", base.display()) }] }));
+        log::warn!("Couldn't write {}", base.display());
         return;
     }
     // Whether its audio and JSON stay once the plugins are done (a plugin's failure may keep them after all: archive::settle).
-    let mut entry = f.entry;
-    entry["audio"] = json!(keep_audio);
-    entry["json"] = json!(keep_json);
-    publish(&ctx.hub, json!({ "type": "concluded", "entry": &entry }));
-    {
-        let mut h = ctx.history.lock().unwrap();
-        h.push_front(entry);
-        h.truncate(HISTORY_KEPT);
-    }
-    let mut audio = plugins::CallAudio {
-        wav: Arc::new(f.wav),
-        wav_written: write_wav,
-        files: trunk_recorder_plugin::CallFiles { json: json_at, wav: wav_at, m4a: None },
-        m4a_to: m4a_at,
-    };
+    let call = index_call(ctx, &f.rel, &f.record, keep_audio, keep_json);
+    publish(&ctx.hub, ToClient::Concluded { entry: serde_json::to_value(&call).unwrap_or_default() });
+    let mut wav_written = p.write_wav;
+    let mut m4a = None;
     if let Some((e, kbps)) = encoder.filter(|_| p.make_m4a) {
-        match e.m4a(&audio.wav, &audio.m4a_to, *kbps) {
-            Ok(()) => audio.files.m4a = Some(audio.m4a_to.clone()),
+        match e.m4a(&f.wav, &m4a_at, *kbps) {
+            Ok(()) => m4a = Some(m4a_at),
             Err(err) => {
-                log::error!("M4A of {}: {err}", f.rel);
-                publish(&ctx.hub, json!({ "type": "log", "lines": [{ "timeS": 0, "kind": "error", "text": format!("M4A of {}: {err}", f.rel) }] }));
+                m4a_failed(&f.rel, &err);
                 // The call's audio is then the WAV.
-                if !audio.wav_written {
-                    audio.wav_written = fs::write(&audio.files.wav, &*audio.wav).is_ok();
+                if !wav_written {
+                    wav_written = fs::write(&wav_at, &f.wav).is_ok();
                 }
             }
         }
     }
-    ctx.plugins.archive.expect(&f.rel, takers, r, &base, spooled.as_deref());
+    ctx.plugins.archive.expect(&f.rel, to_plugins.takers, r, &base, spooled.as_deref(), Some(wav_written), Some(f.record.stop_time_ms.max(0) as u64));
     if let Some(h) = host {
-        h.concluded(f.system, &f.rel, &f.json, audio);
+        h.concluded(f.system, &f.rel, f.record, trunk_recorder_plugin::CallFiles { json: json_at, wav: wav_at, m4a }, f.decrypted);
     }
 }
 
+/// An .m4a couldn't be made: said, at most once a minute.
+fn m4a_failed(rel: &str, err: &str) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+        *last = Some(Instant::now());
+        log::warn!("M4A of {rel}: {err} (its audio is the WAV)");
+    }
+}
+
+/// Share a system with the directory; tell the engine how it went.
+fn share(ctx: &Arc<Ctx>, short_name: String, observation: serde_json::Value, site_names: Vec<String>) {
+    let base = ctx.config.lock().unwrap().server.trp_api_base().to_string();
+    // The config gets the link only when it's new (a first share, a site new to
+    // the directory): edit_config leaves it alone when nothing changed.
+    let result = crate::directory::share(&base, &observation).and_then(|d| {
+        if d.system.is_empty() {
+            return Ok(None);
+        }
+        crate::server::edit_config(ctx, |c| {
+            c.link_shared(&short_name, &d.system, &site_names, &d.sites);
+        })
+        .map_err(|e| format!("Shared, but the directory link couldn't be kept: {e}"))?;
+        Ok(Some(trunk_app::share::Linked { id: d.system, rev: d.rev }))
+    });
+    match &result {
+        Ok(_) => log::info!("{short_name}: shared with the directory"),
+        Err(e) => log::warn!("{short_name}: not shared with the directory: {e}"),
+    }
+    ctx.tell_engine(EngineCmd::Shared { short_name, result });
+}
+
 /// Forward everything to the browsers and plugins; calls go to be stored.
-fn deliver(ctx: &Ctx, out: &mut Vec<Output>, plugins: Option<&PluginHost>, rules: &dyn Fn(u16) -> FileRules, finish: &dyn Fn(Finish, Option<&PluginHost>)) {
+fn deliver(ctx: &Arc<Ctx>, out: &mut Vec<Output>, plugins: Option<&PluginHost>, rules: &dyn Fn(u16) -> FileRules, finish: &dyn Fn(Finish)) {
     for o in out.drain(..) {
         match o {
-            Output::Text(t) => {
-                let _ = ctx.hub.send(Arc::new(Out::Text(t)));
+            Output::Message(m) => {
+                if matches!(m, ToClient::Heard { .. }) {
+                    *ctx.heard_last.lock().unwrap() = Some(m.clone());
+                }
+                publish(&ctx.hub, m)
             }
-            Output::Audio { short_name, tg, frame, .. } => {
+            Output::Audio { short_name, tg, frame, decrypted, .. } => {
                 if let Some(p) = plugins {
-                    p.audio_frame(&frame);
+                    p.audio_frame(&frame, decrypted);
                 }
                 let _ = ctx.hub.send(Arc::new(Out::Audio { short_name, tg, frame }));
             }
@@ -671,119 +1130,83 @@ fn deliver(ctx: &Ctx, out: &mut Vec<Output>, plugins: Option<&PluginHost>, rules
                 }
             }
             Output::Log(r) => crate::logging::record(&r),
-            Output::Topic { topic, text } => {
-                let _ = ctx.hub.send(Arc::new(Out::Topic { topic, text }));
+            Output::Topic { topic, msg } => {
+                let _ = ctx.hub.send(Arc::new(Out::Topic { topic, text: msg.to_json() }));
             }
             Output::Rollup(r) => ctx.store.add(r),
-            Output::File { rel, system, wav, json, frames, entry } => finish(Finish { rel, system, wav, json, frames, entry, rules: rules(system) }, plugins),
+            // Into the config where it has none, saved and sent to the browsers.
+            Output::CallSign { short_name, freq_hz, call_sign } => {
+                let mut learned = false;
+                let saved = crate::server::edit_config(ctx, |c| learned = c.learn_call_sign(&short_name, freq_hz, &call_sign));
+                let mhz = freq_hz / 1e6;
+                match saved {
+                    Err(e) => log::warn!("{short_name}: heard call sign {call_sign} on {mhz:.4} MHz, but {e}"),
+                    Ok(()) if learned => log::info!("{short_name}: FCC call sign {call_sign} for {mhz:.4} MHz, from the air"),
+                    Ok(()) => {}
+                }
+            }
+            // To the directory, on a thread of its own; its answer links the system in the config.
+            Output::Share { short_name, observation, site_names } => {
+                let ctx = ctx.clone();
+                let _ = std::thread::Builder::new().name("share".into()).spawn(move || share(&ctx, short_name, observation, site_names));
+            }
+            Output::File { rel, system, wav, record, frames, decrypted } => finish(Finish { rel, system, wav, record, frames, rules: rules(system), decrypted }),
         }
     }
 }
 
-/// A call's plugins are done: what of it was kept (`audio`, `json`). Its
-/// history entry follows, and the interface is told when that's not what
-/// the entry said (an upload failed and the files were kept after all).
-pub fn call_files(ctx: &Ctx, rel: &str, audio: bool, json: bool) {
-    let mut h = ctx.history.lock().unwrap();
-    let Some(e) = h.iter_mut().find(|e| e["path"] == rel) else { return };
-    if e["audio"] == json!(audio) && e["json"] == json!(json) {
-        return;
+/// A finished call: put at the front of the live list and handed to the
+/// store (`audio` and `json` say what of it is kept so far). Gives the call.
+pub fn index_call(ctx: &Ctx, rel: &str, record: &trunk_recorder_plugin::CallRecord, audio: bool, json: bool) -> StoredCall {
+    let call = StoredCall { path: rel.replace('\\', "/"), record: record.clone(), audio, json };
+    {
+        let mut r = ctx.recent.lock().unwrap();
+        r.push_front(call.clone());
+        r.truncate(RECENT_KEPT);
     }
-    e["audio"] = json!(audio);
-    e["json"] = json!(json);
-    drop(h);
-    publish(&ctx.hub, json!({ "type": "callFiles", "path": rel, "audio": audio, "json": json }));
+    let row = crate::db::row::call_row(rel, record, audio, json, ctx.db.recorder(), crate::clock::unix_ms() as i64);
+    ctx.db.send(Change::Call { row, live: true });
+    call
 }
 
-/// Fill the history list with the newest calls already on disk, in the
-/// background: a capture folder with years of calls takes a while to walk.
-/// Calls concluded meanwhile stay in front.
-pub fn load_history(ctx: Arc<Ctx>) {
-    let dir = PathBuf::from(&ctx.config.lock().unwrap().recording.capture_dir);
-    let _ = std::thread::Builder::new().name("history".into()).spawn(move || {
-        let found = scan_history(&dir, HISTORY);
-        let mut h = ctx.history.lock().unwrap();
-        let known: std::collections::HashSet<String> = h.iter().filter_map(|e| e["path"].as_str().map(String::from)).collect();
-        h.extend(found.into_iter().filter(|e| e["path"].as_str().is_none_or(|p| !known.contains(p))));
-        h.truncate(HISTORY_KEPT);
-    });
+/// A call's plugins are done: what of it was kept (`audio`, `json`). The
+/// live list follows, and the interface is told at once when that's not what
+/// the entry said (an upload failed and the files were kept after all); the
+/// store's row follows with its next commit.
+pub fn call_files(ctx: &Ctx, rel: &str, audio: bool, json: bool) {
+    let rel = rel.replace('\\', "/");
+    ctx.db.send(Change::CallFiles { path: rel.clone(), audio, json });
+    let mut r = ctx.recent.lock().unwrap();
+    let Some(c) = r.iter_mut().find(|c| c.path == rel) else { return };
+    if (c.audio, c.json) == (audio, json) {
+        return;
+    }
+    (c.audio, c.json) = (audio, json);
+    drop(r);
+    publish(&ctx.hub, ToClient::CallFiles { path: rel, audio, json });
 }
 
 /// Calls the interface's history list is given.
 pub const HISTORY: usize = 300;
-/// Calls kept in memory for it.
-const HISTORY_KEPT: usize = 500;
+/// Calls kept in the live list.
+const RECENT_KEPT: usize = 500;
 
-/// How far back `olderCalls` looks.
-const OLDER_WINDOW_MS: i64 = 24 * 3600 * 1000;
-
-/// `olderCalls` (the Listen page's "Load older"): up to `limit` calls that
-/// started before `before_ms`, newest first, from the last 24 hours. Only the
-/// day folders of Trunk Recorder's layout are read (a system with its own
-/// filename format isn't searched), so this stays cheap without an index.
-pub fn older_calls(ctx: &Ctx, before_ms: i64, limit: usize) -> Value {
-    let (dir, names) = {
-        let c = ctx.config.lock().unwrap();
-        let names: Vec<String> = c.systems.iter().map(|s| s.short_name.clone()).chain(c.conventional.iter().map(|v| v.short_name.clone())).collect();
-        (PathBuf::from(&c.recording.capture_dir), names)
-    };
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-    let floor_ms = now_ms - OLDER_WINDOW_MS;
-    let before_ms = before_ms.min(now_ms + 60_000);
-    // Each system's day folders from `before` back to the window's start.
-    let mut folders = std::collections::BTreeSet::new();
-    let mut t = before_ms.div_euclid(1000);
-    while t * 1000 >= floor_ms - 86_400_000 {
-        for n in &names {
-            folders.insert(dir.join(trunk_app::filename::default_path(n, "", t, local_offset(t))));
-        }
-        t -= 86_400;
-    }
-    // A call's start from its name (<talkgroup>-<start>_<freq>), else when the file was written.
-    let start_of = |p: &Path, e: &fs::DirEntry| -> i64 {
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let from_name = stem.split_once('-').and_then(|(_, r)| r.split(['_', '.', '-']).next()).and_then(|s| s.parse::<i64>().ok());
-        from_name.unwrap_or_else(|| e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64))
-    };
-    let mut found: Vec<(i64, PathBuf)> = Vec::new();
-    for f in &folders {
-        let Ok(rd) = fs::read_dir(f) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "json") {
-                let s = start_of(&p, &e);
-                if s * 1000 <= before_ms && (s + 1) * 1000 > floor_ms {
-                    found.push((s, p));
-                }
-            }
-        }
-    }
-    found.sort_by(|a, b| b.0.cmp(&a.0));
-    // (Names give the second: the last second taken is taken whole, so the
-    // next page, before the oldest call's millisecond, misses none.)
-    let mut entries: Vec<(i64, Value)> = Vec::new();
-    let mut read = 0;
-    for (s, p) in &found {
-        if entries.len() >= limit && found[read - 1].0 != *s {
-            break;
-        }
-        read += 1;
-        let Some(record) = fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
-        let start = record["start_time_ms"].as_i64().or_else(|| record["start_time"].as_i64().map(|s| s * 1000)).unwrap_or(0);
-        if start >= before_ms || start < floor_ms {
-            continue;
-        }
-        let Ok(rel) = p.strip_prefix(&dir) else { continue };
-        let audio = ["wav", "m4a"].iter().any(|x| p.with_extension(x).exists());
-        entries.push((start, json!({ "path": rel.with_extension("").to_string_lossy().replace('\\', "/"), "record": record, "audio": audio, "json": true })));
-    }
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
-    let entries: Vec<Value> = entries.into_iter().map(|(_, e)| e).collect();
-    json!({ "type": "olderCalls", "before": before_ms, "entries": entries, "more": read < found.len() })
+/// With the call store off: fill the live list with the newest calls already
+/// on disk, in the background (a capture folder with years of calls takes a
+/// while to walk). Calls concluded meanwhile stay in front.
+pub fn load_recent(ctx: Arc<Ctx>) {
+    let dir = PathBuf::from(&ctx.config.lock().unwrap().recording.capture_dir);
+    let _ = std::thread::Builder::new().name("recent".into()).spawn(move || {
+        let found = scan_recent(&dir, HISTORY);
+        let mut r = ctx.recent.lock().unwrap();
+        let known: std::collections::HashSet<String> = r.iter().map(|c| c.path.clone()).collect();
+        r.extend(found.into_iter().filter(|c| !known.contains(&c.path)));
+        r.truncate(RECENT_KEPT);
+    });
 }
 
-/// The newest `limit` calls already on disk (for the history list at startup).
-pub fn scan_history(dir: &Path, limit: usize) -> VecDeque<Value> {
+/// The newest `limit` calls already on disk, by when their records were written.
+fn scan_recent(dir: &Path, limit: usize) -> VecDeque<StoredCall> {
     let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -793,8 +1216,7 @@ pub fn scan_history(dir: &Path, limit: usize) -> VecDeque<Value> {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "json") {
-                let t = e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
-                found.push((t, p));
+                found.push((e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH), p));
             }
         }
     }
@@ -803,10 +1225,358 @@ pub fn scan_history(dir: &Path, limit: usize) -> VecDeque<Value> {
         .into_iter()
         .take(limit)
         .filter_map(|(_, p)| {
-            let record: Value = serde_json::from_str(&fs::read_to_string(&p).ok()?).ok()?;
+            let record = serde_json::from_str(&fs::read_to_string(&p).ok()?).ok()?;
             let rel = p.strip_prefix(dir).ok()?.with_extension("");
             let audio = ["wav", "m4a"].iter().any(|x| p.with_extension(x).exists());
-            Some(json!({ "path": rel.to_string_lossy().replace('\\', "/"), "record": record, "audio": audio, "json": true }))
+            Some(StoredCall { path: rel.to_string_lossy().replace('\\', "/"), record, audio, json: true })
         })
         .collect()
+}
+
+/// A read of the call store failed: a warning, but only a debug line when
+/// the store is off (said once, at open), since every connection asks.
+fn store_error(ctx: &Ctx, what: &str, e: &str) {
+    if ctx.db.is_disabled() {
+        log::debug!("{what}: {e}");
+    } else {
+        log::warn!("{what}: {e}");
+    }
+}
+
+/// The `history` message: the newest calls ([`calls`]).
+pub fn history(ctx: &Ctx) -> ToClient {
+    let page = calls(ctx, &CallsQuery { limit: Some(HISTORY), ..Default::default() });
+    ToClient::History { entries: page.entries, next: page.next }
+}
+
+/// Calls by `q` (system, talkgroup, radio, time; paged by its cursor),
+/// newest first: the one query behind `callsQuery`, the greeting's history,
+/// `/api/v1/calls` and the plugins'. From the store, with the live list's
+/// calls it hasn't committed yet merged in; with the store off (or
+/// failing), from the live list alone, and the page's `error` says why.
+pub fn calls(ctx: &Ctx, q: &CallsQuery) -> CallsPage {
+    use trunk_app::calls::{page_of, with_live};
+    let (systems, names) = match q.system.as_deref() {
+        // (A name not the config's: no calls, rather than every system's.)
+        Some(name) => (vec![ctx.db.system_id(name).unwrap_or(-1)], systems_for(&ctx.config.lock().unwrap(), name)),
+        // (Talkgroup and radio numbers are a system's own: asked without one, each system's.)
+        None if q.talkgroup.is_some() || q.unit.is_some() => (ctx.db.system_ids(), Vec::new()),
+        None => (Vec::new(), Vec::new()),
+    };
+    // (The live list first: a call committed meanwhile is then in one or the other.)
+    let live: Vec<StoredCall> = ctx.recent.lock().unwrap().iter().cloned().collect();
+    if !ctx.db.indexes_calls() {
+        let why = if ctx.db.is_disabled() { "the call store is off: only the recent calls" } else { "low-write mode keeps no call index: only the recent calls" };
+        return CallsPage { error: Some(why.into()), ..page_of(&live, q, &names) };
+    }
+    // (A page walks one index: a radio's, or else a talkgroup's. Without it,
+    // the recent calls rather than a walk through all of a system's.)
+    if q.unit.is_some() && !ctx.db.indexes_radios() {
+        return CallsPage { error: Some("the store doesn't index calls by radio (Setup → Data): only the recent calls".into()), ..page_of(&live, q, &names) };
+    }
+    if q.unit.is_none() && q.talkgroup.is_some() && !ctx.db.indexes_talkgroups() {
+        return CallsPage { error: Some("the store doesn't index calls by talkgroup (Setup → Data): only the recent calls".into()), ..page_of(&live, q, &names) };
+    }
+    match ctx.db.calls(q, &systems) {
+        Ok(stored) => with_live(stored, &live, q, &names),
+        Err(e) => {
+            store_error(ctx, "calls", &e);
+            CallsPage { error: Some(format!("{e}: only the recent calls")), ..page_of(&live, q, &names) }
+        }
+    }
+}
+
+/// The plugins' `calls.query`: [`calls`]. (A weak hold on the context: the
+/// plugins are part of it.)
+fn plugin_calls(ctx: &Arc<Ctx>) -> crate::plugins::Calls {
+    let ctx = Arc::downgrade(ctx);
+    Arc::new(move |q| match ctx.upgrade() {
+        Some(ctx) => calls(&ctx, q),
+        None => CallsPage { error: Some("the recorder is stopping".into()), ..Default::default() },
+    })
+}
+
+/// `callsQuery`: [`calls`].
+pub fn calls_query(ctx: &Ctx, id: Value, q: &CallsQuery) -> ToClient {
+    ToClient::CallsResult { id, page: calls(ctx, q) }
+}
+
+/// System `name` and the names its sites had as systems of their own, which
+/// older calls are recorded under.
+pub fn systems_for(cfg: &Config, name: &str) -> Vec<String> {
+    let old = cfg.systems.iter().find(|s| s.short_name == name).map(trunk_app::migrate::old_names).unwrap_or_default();
+    std::iter::once(name.to_string()).chain(old).collect()
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A source of kind `kind` with the keys in `v`.
+    fn src(kind: &str, mut v: serde_json::Value) -> Source {
+        v["type"] = kind.into();
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_gain_change_goes_live_when_the_radio_can_take_it() {
+        let rtl = |gain: f64, agc: bool| src("rtlsdr", json!({ "serial": "1000", "centerHz": 453e6, "rateHz": 2.4e6, "gainDb": gain, "agc": agc, "ppm": 0 }));
+        assert_eq!(live_gain(&rtl(33.8, false), &rtl(22.9, false)), Some(Gain::Db(22.9)));
+        assert_eq!(live_gain(&rtl(33.8, false), &rtl(33.8, true)), Some(Gain::Agc), "an RTL-SDR's AGC, live");
+        let usrp = |gain: f64, agc: bool| src("usrp", json!({ "args": "", "antenna": "", "centerHz": 853e6, "rateHz": 8e6, "gainDb": gain, "agc": agc, "ppm": 0 }));
+        assert_eq!(live_gain(&usrp(40.0, false), &usrp(30.0, false)), Some(Gain::Db(30.0)));
+        assert_eq!(live_gain(&usrp(40.0, false), &usrp(40.0, true)), None, "USRP AGC waits for the start");
+        let blade = |gain: f64, agc: bool| src("bladerf", json!({ "serial": "f12ce103", "centerHz": 857e6, "rateHz": 8e6, "gainDb": gain, "agc": agc }));
+        assert_eq!(live_gain(&blade(30.0, false), &blade(42.0, false)), Some(Gain::Db(42.0)), "a bladeRF's gain, live");
+        assert_eq!(live_gain(&blade(30.0, false), &blade(30.0, true)), None, "bladeRF AGC waits for the start");
+        let air = |lna: u8| src("airspy", json!({ "serial": "", "centerHz": 852e6, "rateHz": 6e6, "gainMode": "manual", "lnaStep": lna, "ppm": 0 }));
+        assert_eq!(live_gain(&air(10), &air(12)), Some(airspy_gain(AirspyGain::Manual, 0, 12, 10, 10, false)), "an Airspy's LNA, live");
+        let hackrf = |lna: u16, amp: bool| src("hackrf", json!({ "serial": "", "centerHz": 852e6, "rateHz": 8e6, "lnaDb": lna, "vgaDb": 20, "amp": amp }));
+        let g = live_gain(&hackrf(16, false), &hackrf(24, true));
+        assert_eq!(g, Some(Gain::Stages(hackrf_gain(24, 20, true))), "a HackRF's stages, live");
+        assert_eq!(g.unwrap().to_string(), "AMP on · LNA 24 · VGA 20");
+        assert_eq!(airspy_gain(AirspyGain::Manual, 0, 0, 0, 7, true).to_string(), "AGC · VGA 7");
+    }
+
+    #[test]
+    fn anything_besides_the_gain_waits_for_the_start() {
+        let rtl_at = |center: f64, gain: f64| src("rtlsdr", json!({ "serial": "1000", "centerHz": center, "rateHz": 2.4e6, "gainDb": gain, "ppm": 0 }));
+        assert_eq!(live_gain(&rtl_at(453e6, 33.8), &rtl_at(460e6, 22.9)), None, "a retune with it");
+        let air_at = |center: f64| src("airspy", json!({ "serial": "", "centerHz": center, "rateHz": 6e6, "gainMode": "manual", "lnaStep": 10, "ppm": 0 }));
+        assert_eq!(live_gain(&air_at(852e6), &air_at(853e6)), None, "an Airspy retune waits");
+        let rtl = src("rtlsdr", json!({ "serial": "", "centerHz": 453e6, "rateHz": 2.4e6, "gainDb": 30, "ppm": 0 }));
+        assert_eq!(live_gain(&rtl, &air_at(852e6)), None, "another kind of radio");
+    }
+
+    #[test]
+    fn several_airspys_each_take_their_own_gain() {
+        let air = |serial: &str, lna: u8| src("airspy", json!({ "serial": serial, "centerHz": 852e6, "rateHz": 6e6, "gainMode": "manual", "lnaStep": lna, "ppm": 0 }));
+        let lin = |serial: &str, step: u8| src("airspy", json!({ "serial": serial, "centerHz": 852e6, "rateHz": 6e6, "gainMode": "linearity", "gainStep": step, "ppm": 0 }));
+        let r = Runner { stop: Arc::default(), threads: vec![], controls: (0..3).map(|_| Arc::default()).collect() };
+        let pending = |i: usize| *r.controls[i].gain.lock().unwrap();
+        let old = [air("A1", 10), air("B2", 10), air("C3", 10)];
+        // The second's LNA: only it.
+        let one = r.live_sources(&old, &[air("A1", 10), air("B2", 14), air("C3", 10)]);
+        assert_eq!(one, vec![(1, Some(airspy_gain(AirspyGain::Manual, 0, 14, 10, 10, false)))]);
+        assert_eq!((pending(0), pending(2)), (None, None), "the others are left alone");
+        r.controls[1].take();
+        // Two in one save, one of them to another mode: each its own.
+        let two = r.live_sources(&old, &[lin("A1", 18), air("B2", 10), air("C3", 6)]);
+        assert_eq!(two.len(), 2);
+        assert_eq!(pending(0), Some(Gain::Preset(Preset::Linearity, 18)));
+        assert_eq!(pending(1), None);
+        assert_eq!(pending(2), Some(airspy_gain(AirspyGain::Manual, 0, 6, 10, 10, false)));
+        (r.controls[0].take(), r.controls[2].take());
+        // Two swapped in Setup: another radio in each place, not a gain change.
+        assert_eq!(r.live_sources(&old, &[air("B2", 10), air("A1", 10), air("C3", 10)]), vec![(0, None), (1, None)]);
+        assert!((0..3).all(|i| pending(i).is_none()));
+        // One added: everything waits for the start.
+        assert!(r.live_sources(&old, &[air("A1", 12), air("B2", 10), air("C3", 10), air("D4", 10)]).is_empty());
+        assert!(pending(0).is_none());
+    }
+}
+
+/// A recorder context for tests: one system, `ohmarcs`, with one site named
+/// `ohmarcs-butler`, recording under `capture_dir`.
+#[cfg(test)]
+pub fn test_ctx(capture_dir: &Path) -> Arc<Ctx> {
+    crate::protocol_tests::ctx(test_config(capture_dir), capture_dir)
+}
+
+/// As [`test_ctx`], with the call store at `store`, opened as the app opens
+/// it: off if it cannot be opened.
+#[cfg(test)]
+pub fn test_ctx_with_store(capture_dir: &Path, store: &Path) -> Arc<Ctx> {
+    crate::protocol_tests::ctx_with(test_config(capture_dir), capture_dir, |_| crate::db::Db::open_or_off(store, std::time::Duration::from_secs(1), 0))
+}
+
+/// As [`test_ctx`], committing the call store every `batch`.
+#[cfg(test)]
+pub fn test_ctx_with_batch(capture_dir: &Path, batch: std::time::Duration) -> Arc<Ctx> {
+    let name = format!("ctx-batch-{}", capture_dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()));
+    crate::protocol_tests::ctx_with(test_config(capture_dir), capture_dir, |_| crate::db::Db::for_test_with_batch(&name, batch).0)
+}
+
+#[cfg(test)]
+fn test_config(capture_dir: &Path) -> Config {
+    let mut cfg = Config::default();
+    cfg.recording.capture_dir = capture_dir.display().to_string();
+    cfg.systems = vec![trunk_app::config::System::one_site(
+        "ohmarcs",
+        trunk_app::config::Site { name: "ohmarcs-butler".into(), ..Default::default() },
+    )];
+    cfg
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_call_is_in_history_and_pages() {
+        let dir = crate::db::TestDir::new("finish");
+        let ctx = test_ctx(&dir);
+        let names = trunk_app::migrate::old_names(&ctx.config.lock().unwrap().systems[0]);
+        assert_eq!(names, ["ohmarcs-butler"]);
+        let r = crate::db::row::tests::record(9179, 1_700_000_000_000);
+        let rel = "ohmarcs/2026/10/26/9179-1700000000_851350000";
+        let entry = index_call(&ctx, rel, &r, true, true);
+        ctx.db.flush().unwrap();
+        let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], entry, "the entry on the wire is the entry in the store");
+        let page = calls(&ctx, &CallsQuery::default());
+        assert_eq!((page.entries.len(), page.next), (1, None));
+        // The writer tells the interface when the files kept are not what the entry said.
+        let mut heard = ctx.hub.subscribe();
+        call_files(&ctx, rel, false, true);
+        ctx.db.flush().unwrap();
+        let out = heard.try_recv().expect("a callFiles message");
+        let text = crate::server::text_for(&out, true).expect("text");
+        let m: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((m["type"].as_str(), m["path"].as_str(), m["audio"].as_bool()), (Some("callFiles"), Some(rel), Some(false)));
+    }
+}
+
+#[cfg(test)]
+mod live_list_tests {
+    use super::*;
+
+    /// With the call store off, the live list still answers `history`, and a
+    /// call's kept files are told at once (not at the store's next commit).
+    #[test]
+    fn the_live_list_answers_without_the_store() {
+        let dir = crate::db::TestDir::new("live-off");
+        let store = dir.join("trunk-pro.sqlite");
+        crate::db::seed_unopenable(&store);
+        let ctx = test_ctx_with_store(&dir.join("capture"), &store);
+        assert!(ctx.db.is_disabled());
+        let r = crate::db::row::tests::record(9179, 1_700_000_000_000);
+        let rel = "ohmarcs/2026/10/26/9179-1700000000_851350000";
+        let entry = index_call(&ctx, rel, &r, true, true);
+        let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
+        assert_eq!(entries, [entry]);
+        let mut heard = ctx.hub.subscribe();
+        call_files(&ctx, rel, false, true);
+        assert!(heard.try_recv().is_ok(), "callFiles is sent at once");
+        call_files(&ctx, rel, false, true);
+        assert!(heard.try_recv().is_err(), "and not again when nothing changed");
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    #[test]
+    fn history_shows_a_call_before_its_batch_commits() {
+        let dir = crate::db::TestDir::new("hist-pending");
+        let ctx = test_ctx_with_batch(&dir, std::time::Duration::from_secs(60));
+        let r = crate::db::row::tests::record(9179, 1_700_000_000_000);
+        ctx.db.send(crate::db::Change::Meta { key: "warm".into(), value: "1".into() });
+        ctx.db.flush().unwrap();
+        let entry = index_call(&ctx, "ohmarcs/pending", &r, true, true);
+        let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], entry);
+        ctx.db.flush().unwrap();
+        let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
+        assert_eq!(entries.len(), 1, "no duplicate once committed");
+    }
+
+    #[test]
+    fn history_is_newest_first_across_pending_and_committed() {
+        let dir = crate::db::TestDir::new("hist-merge");
+        let ctx = test_ctx_with_batch(&dir, std::time::Duration::from_secs(60));
+        let old = crate::db::row::tests::record(1, 1000);
+        let new = crate::db::row::tests::record(1, 2000);
+        index_call(&ctx, "ohmarcs/old", &old, true, true);
+        ctx.db.flush().unwrap();
+        index_call(&ctx, "ohmarcs/new", &new, true, true);
+        let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
+        let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["ohmarcs/new", "ohmarcs/old"]);
+    }
+}
+
+#[cfg(test)]
+mod calls_query_tests {
+    use super::*;
+
+    #[test]
+    fn calls_query_honours_old_system_names() {
+        let dir = crate::db::TestDir::new("cq");
+        let ctx = test_ctx(&dir);
+        let mut r = crate::db::row::tests::record(1, 1000);
+        r.short_name = "ohmarcs-butler".into();
+        index_call(&ctx, "ohmarcs-butler/x", &r, true, true);
+        ctx.db.flush().unwrap();
+        let q = CallsQuery { system: Some("ohmarcs".into()), ..Default::default() };
+        assert_eq!(calls(&ctx, &q).entries.len(), 1);
+    }
+
+    #[test]
+    fn calls_query_clamps_the_limit() {
+        let dir = crate::db::TestDir::new("cq2");
+        let ctx = test_ctx(&dir);
+        for i in 0..501 {
+            let r = crate::db::row::tests::record(1, 1000 + i);
+            index_call(&ctx, &format!("ohmarcs/{i}"), &r, true, true);
+        }
+        ctx.db.flush().unwrap();
+        let page = calls(&ctx, &CallsQuery { limit: Some(9999), ..Default::default() });
+        assert_eq!((page.entries.len(), page.next.is_some()), (500, true));
+        let page = calls(&ctx, &CallsQuery { limit: Some(0), ..Default::default() });
+        assert_eq!((page.entries.len(), page.next.is_some()), (1, true));
+        let ToClient::CallsResult { id, page } = calls_query(&ctx, serde_json::json!(3), &CallsQuery::default()) else { panic!() };
+        assert_eq!((id, page.entries.len()), (serde_json::json!(3), 100));
+    }
+
+    /// Without the radio or talkgroup index, a radio's or talkgroup's list
+    /// is its recent calls, and says so; with them, the store's.
+    #[test]
+    fn without_an_index_a_list_is_the_recent_calls() {
+        let dir = crate::db::TestDir::new("cq-indexes");
+        let storage = trunk_app::config::StorageSettings { radio_index: false, talkgroup_index: false, ..Default::default() };
+        let ctx = crate::protocol_tests::ctx_with(test_config(&dir), &dir, |_| crate::db::Db::from_settings(&storage, &dir));
+        let r = crate::db::row::tests::record(7, 1000);
+        index_call(&ctx, "ohmarcs/a", &r, true, true);
+        ctx.db.flush().unwrap();
+        let by_tg = calls(&ctx, &CallsQuery { talkgroup: Some(7), ..Default::default() });
+        assert!(by_tg.error.as_deref().is_some_and(|e| e.contains("by talkgroup")), "{:?}", by_tg.error);
+        assert_eq!(by_tg.entries.len(), 1, "the recent call");
+        let by_unit = calls(&ctx, &CallsQuery { unit: Some(r.src_list[0].src), ..Default::default() });
+        assert!(by_unit.error.as_deref().is_some_and(|e| e.contains("by radio")), "{:?}", by_unit.error);
+        assert_eq!(calls(&ctx, &CallsQuery::default()).error, None, "every call: by time, always indexed");
+    }
+
+    #[test]
+    fn an_empty_answer_has_no_next() {
+        let dir = crate::db::TestDir::new("cq3");
+        let ctx = test_ctx(&dir);
+        let page = calls(&ctx, &CallsQuery::default());
+        assert_eq!((page.entries.len(), page.next, page.error), (0, None, None));
+    }
+
+    /// A store from a newer build is refused: the recorder starts with the
+    /// store off, and every call-store message answers from the live list.
+    #[test]
+    fn a_store_that_cannot_be_opened_leaves_the_recorder_running() {
+        let dir = crate::db::TestDir::new("store-off");
+        let store = dir.join("trunk-pro.sqlite");
+        crate::db::seed_unopenable(&store);
+        let ctx = test_ctx_with_store(&dir.join("capture"), &store);
+        assert!(ctx.db.is_disabled());
+        let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
+        assert!(entries.is_empty());
+        let r = crate::db::row::tests::record(1, 1000);
+        index_call(&ctx, "ohmarcs/x", &r, true, true);
+        call_files(&ctx, "ohmarcs/x", false, true);
+        ctx.db.flush().unwrap();
+        // (The live list answers: the calls since the recorder started.)
+        let page = calls(&ctx, &CallsQuery::default());
+        assert_eq!((page.entries.len(), page.next), (1, None));
+        assert!(page.error.is_some_and(|e| e.contains("only the recent calls")), "and says why it's only those");
+    }
 }

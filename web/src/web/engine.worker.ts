@@ -2,28 +2,14 @@
 // RTL-SDR driver (WebUSB), speaking the same protocol as the desktop app's
 // server, so the interface is identical. Calls are stored in OPFS.
 
-import init, { survey_bands, WebProfiler, WebRtl, WebSession, WebSurvey } from "./pkg/trunk_web.js";
-import type { Config, FromRecorder, HeardCode } from "../protocol.ts";
-import { activeSystems, resolvedCenters } from "../config.ts";
+import { withEdit } from "../talkgroups.ts";
+import init, { calls_page, directory_recorder_id, learn_call_sign, link_shared, survey_bands, WebProfiler, WebRtl, WebSession, WebSurvey } from "./pkg/trunk_web.js";
+import type { CallEntry, Config, FromRecorder, HeardCode, Talkgroup, ToRecorder } from "../protocol.ts";
+import { activeSystems, needsDriver, resolvedCenters, SOURCE_KINDS, trpBase } from "../config.ts";
 import { listCalls, readText, saveCall, writeText } from "./opfs.ts";
 
-export type ToWorker =
-  | { type: "init"; config: Config }
-  | { type: "setConfig"; config: Config }
-  | { type: "files"; files: (File | null)[] }
-  | { type: "start" }
-  | { type: "stop" }
-  | { type: "devices" }
-  | { type: "listen"; on: boolean; system: string | null; talkgroup: number | null }
-  | { type: "surveyStart"; source: number; bands: string[]; findGain: boolean }
-  | { type: "surveyListen"; freqHz: number }
-  | { type: "surveyRescan" }
-  | { type: "surveyStop" }
-  | { type: "profileSource"; source: number; centerHz: number }
-  | { type: "olderCalls"; before: number; limit: number }
-  | { type: "subscribe"; topics: string[] }
-  | { type: "statsQuery"; id: number; series: string[]; range?: string; from?: number; to?: number; points?: number }
-  | { type: "radioQuery"; id: number; what: string; system?: string; key?: number; hours?: number; limit?: number };
+/** Page → worker: the protocol's commands (those it can't do get an `error`), and its own setup. */
+export type ToWorker = ToRecorder | { type: "init"; config: Config; talkgroups: Record<string, Talkgroup[]> } | { type: "files"; files: (File | null)[] };
 
 /** Worker → page: a protocol message, or a live audio frame. */
 export type FromWorker = { msg: FromRecorder } | { audio: ArrayBuffer; tg: number };
@@ -33,6 +19,10 @@ const post = (msg: FromRecorder) => postMessage({ msg } satisfies FromWorker);
 const wallMs = () => performance.timeOrigin + performance.now();
 
 let config: Config | null = null;
+/** The config's version (one page edits it: every edit is taken). */
+let configVersion = 1;
+/** Each system's talkgroups, by short name (the page keeps them). */
+let talkgroups: Record<string, Talkgroup[]> = {};
 let files: (File | null)[] = [];
 let session: WebSession | null = null;
 let rtls: WebRtl[] = [];
@@ -43,22 +33,15 @@ let listen: { on: boolean; system: string | null; talkgroup: number | null } = {
 let phase: FromRecorder & { type: "state" } = { type: "state", phase: "idle", error: null, ended: false };
 /** What the page watches (applied to each new session). */
 let topics: string[] = [];
-/** The radio registry, saved between runs. */
+/** The radio registry, saved between runs: one file, `{shortName: registry}`. */
 const REGISTRY_FILE = "radio-registry.json";
-let registrySaved = 0;
-
-async function saveRegistry(s: WebSession): Promise<void> {
-  const changed = JSON.parse(s.registry_unsaved()) as Record<string, string>;
-  if (!Object.keys(changed).length) return;
-  let all: Record<string, string> = {};
-  try {
-    all = JSON.parse((await readText(REGISTRY_FILE)) ?? "{}");
-  } catch {
-    // Start afresh.
-  }
-  await writeText(REGISTRY_FILE, JSON.stringify({ ...all, ...changed })).catch(() => {});
-}
 const ready = init();
+
+/** A page of `calls` (newest first, by the recorder's own order and cursor: trunk-app's `calls`, through wasm). */
+type CallsPage = { entries: CallEntry[]; next?: string };
+function callsPage(calls: CallEntry[], q: Omit<Extract<ToRecorder, { type: "callsQuery" }>, "type" | "id">): CallsPage {
+  return JSON.parse(calls_page(JSON.stringify(calls), JSON.stringify(q))) as CallsPage;
+}
 
 function setPhase(p: "idle" | "starting" | "running" | "stopping", error: string | null = null, ended = false): void {
   phase = { type: "state", phase: p, error, ended };
@@ -75,9 +58,18 @@ async function devices() {
 }
 
 /** Hand the session's outputs to the page / storage. */
-function deliver(outs: { t: string; json?: string; system?: number; shortName?: string; tg?: number; frame?: Uint8Array; rel?: string; wav?: Uint8Array; entry?: string }[]): void {
+function deliver(outs: { t: string; json?: string; system?: number; shortName?: string; tg?: number; frame?: Uint8Array; rel?: string; wav?: Uint8Array; entry?: string; freqHz?: number; callSign?: string; siteNames?: string }[]): void {
   for (const o of outs) {
     if (o.t === "text") post(JSON.parse(o.json!) as FromRecorder);
+    else if (o.t === "callSign") {
+      // A frequency's FCC call sign, heard on the air: into its system's licenses (the page stores the config).
+      const learned = config && learn_call_sign(JSON.stringify(config), o.shortName!, o.freqHz!, o.callSign!);
+      if (learned) {
+        config = JSON.parse(learned) as Config;
+        post({ type: "config", config, version: ++configVersion });
+      }
+    }
+    else if (o.t === "share") void share(o.shortName!, o.json!, o.siteNames!);
     else if (o.t === "audio") {
       if (listen.on && (listen.system === null || listen.system === o.shortName) && (listen.talkgroup === null || listen.talkgroup === o.tg)) {
         const buf = o.frame!.slice().buffer;
@@ -105,7 +97,7 @@ async function profileSource(req: { source: number; centerHz: number }): Promise
   let rtl: WebRtl | null = null;
   try {
     await ready;
-    if (src.type === "usrp" || src.type === "airspy" || src.type === "soapy") throw new Error("USRP, Airspy and SoapySDR need the desktop app.");
+    if (needsDriver(src)) throw new Error(`${SOURCE_KINDS[src.type].label} needs the desktop app.`);
     if (src.type === "rtlsdr") {
       if (!(req.centerHz > 0)) throw new Error("Choose a frequency to look at.");
       const p = new WebProfiler(req.source, req.centerHz, src.rateHz);
@@ -153,7 +145,7 @@ async function surveyStart(req: { source: number; bands: string[]; findGain: boo
     await ready;
     const src = config.sources[req.source];
     if (!src) throw new Error("No such source.");
-    if (src.type === "usrp" || src.type === "airspy" || src.type === "soapy") throw new Error("USRP, Airspy and SoapySDR need the desktop app.");
+    if (needsDriver(src)) throw new Error(`${SOURCE_KINDS[src.type].label} needs the desktop app.`);
     const s = new WebSurvey(JSON.stringify(config), JSON.stringify(req));
     survey = s;
     surveying = true;
@@ -173,6 +165,76 @@ async function surveyStart(req: { source: number; bands: string[]; findGain: boo
   } catch (e) {
     await surveyStop();
     post({ type: "error", message: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+/** Who is licensed on some frequencies near the location the user gave:
+ *  asked of the trunkrecorder.pro API (as the desktop app does). */
+async function licenseQuery(m: Extract<ToRecorder, { type: "licenseQuery" }>): Promise<void> {
+  const base = trpBase(config);
+  const answer = (results: unknown[], error: string | null) => post({ type: "licenseResult", id: m.id, results: results as never, error });
+  const body = JSON.stringify({ lat: m.lat, lon: m.lon, radiusM: m.radiusM, signals: m.signals.slice(0, 64) });
+  try {
+    const r = await fetch(`${base}/api/v1/fcc/identify`, { method: "POST", headers: { "content-type": "application/json" }, body });
+    const v = await r.json().catch(() => null);
+    if (r.ok && Array.isArray(v?.results)) answer(v.results, null);
+    else if (r.status === 429) answer([], "Too many license lookups for now: try again in a minute.");
+    else answer([], `The license lookup failed: ${v?.error ?? `HTTP ${r.status}`}`);
+  } catch (e) {
+    answer([], `Couldn't reach ${base} to look up licenses (${e instanceof Error ? e.message : String(e)}).`);
+  }
+}
+
+/** Who holds some call signs heard on the air (no location): asked of the trunkrecorder.pro API. */
+const RECORDER_ID_FILE = "directory-recorder-id";
+
+/** This browser's directory recorder ID, made the first time (crates/trunk-pro directory.rs). */
+async function recorderId(): Promise<string> {
+  const kept = (await readText(RECORDER_ID_FILE).catch(() => null))?.trim();
+  if (kept?.startsWith("r_")) return kept;
+  const id = directory_recorder_id(crypto.getRandomValues(new Uint8Array(16)));
+  await writeText(RECORDER_ID_FILE, id).catch(() => {});
+  return id;
+}
+
+/** A system's share, to the directory: its answer links the system in the config (the page stores it). */
+async function share(shortName: string, observation: string, siteNames: string): Promise<void> {
+  const base = trpBase(config);
+  let error: string | null = null;
+  let id: string | undefined;
+  let rev = 0;
+  try {
+    const r = await fetch(`${base}/directory/api/v1/observations`, { method: "POST", headers: { "content-type": "application/json" }, body: observation });
+    const v = (await r.json().catch(() => null)) as { system?: string; rev?: number; sites?: string[]; error?: string } | null;
+    if (r.status === 429) error = "Too many shares from this address for now: it tries again later.";
+    else if (r.status !== 201 && r.status !== 202) error = `The directory didn't take it: ${v?.error ?? `HTTP ${r.status}`}`;
+    else if (v?.system && config) {
+      // The config gets the link only when it's new (a first share, a new site); the version and time are kept apart.
+      const linked = link_shared(JSON.stringify(config), shortName, v.system, siteNames, JSON.stringify(v.sites ?? []));
+      if (linked) {
+        config = JSON.parse(linked) as Config;
+        post({ type: "config", config, version: ++configVersion });
+      }
+      id = v.system;
+      rev = v.rev ?? 0;
+    }
+  } catch (e) {
+    error = `Couldn't reach ${base} (${e instanceof Error ? e.message : String(e)}).`;
+  }
+  // (Kept with the rest of what's due: saveDue.)
+  session?.share_done(shortName, wallMs(), id, rev, error ?? undefined);
+}
+
+async function callSignQuery(m: Extract<ToRecorder, { type: "callSignQuery" }>): Promise<void> {
+  const base = trpBase(config);
+  const answer = (results: unknown[], error: string | null) => post({ type: "callSignResult", id: m.id, results: results as never, error });
+  try {
+    const r = await fetch(`${base}/api/v1/fcc/callsigns`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ callSigns: m.callSigns.slice(0, 64) }) });
+    const v = await r.json().catch(() => null);
+    if (r.ok && Array.isArray(v?.results)) answer(v.results, null);
+    else answer([], r.status === 429 ? "Too many license lookups for now: try again in a minute." : `The license lookup failed: ${v?.error ?? `HTTP ${r.status}`}`);
+  } catch (e) {
+    answer([], `Couldn't reach ${base} to look up licenses (${e instanceof Error ? e.message : String(e)}).`);
   }
 }
 
@@ -242,28 +304,45 @@ async function savedHeard(cfg: Config): Promise<Record<string, HeardCode[]>> {
   }
 }
 
-async function saveHeard(s: WebSession, cfg: Config): Promise<void> {
-  const json = s.heard_unsaved();
-  if (json) await writeText(heardFile(cfg), json).catch(() => {});
-}
+/** What sharing with the directory did (each record's version, the last share): kept apart from the config. */
+const SHARING_FILE = "sharing.json";
 
 /** AutoTune's scores, for the next run. */
 const TUNE_FILE = "tune.json";
 
-async function saveTune(s: WebSession): Promise<void> {
-  const json = s.tune_unsaved();
-  if (json) await writeText(TUNE_FILE, json).catch(() => {});
+/**
+ * Write what the session says is due to be kept between runs (trunk-app's
+ * saving.rs says when each is); `all`: everything that changed (the end).
+ */
+async function saveDue(s: WebSession, cfg: Config, all: boolean): Promise<void> {
+  const due = JSON.parse(s.due(wallMs(), all)) as { kind: string; name: string; text: string }[];
+  const registry: Record<string, string> = {};
+  for (const d of due) {
+    const file = { units: `units-${d.name}.csv`, sharing: SHARING_FILE, bandplan: `bandplan-${d.name}.txt`, heard: heardFile(cfg), tune: TUNE_FILE }[d.kind];
+    if (file) await writeText(file, d.text).catch(() => {});
+    else if (d.kind === "registry") registry[d.name] = d.text;
+  }
+  if (!Object.keys(registry).length) return;
+  let kept: Record<string, string> = {};
+  try {
+    kept = JSON.parse((await readText(REGISTRY_FILE)) ?? "{}");
+  } catch {
+    // Start afresh.
+  }
+  await writeText(REGISTRY_FILE, JSON.stringify({ ...kept, ...registry })).catch(() => {});
 }
 
-async function saveUnits(changed: string): Promise<void> {
-  if (changed === "{}") return;
-  for (const [name, csv] of Object.entries(JSON.parse(changed) as Record<string, string>)) {
-    await writeText(`units-${name}.csv`, csv).catch(() => {});
-  }
+/** Start and stop requests run one at a time: a Restart (or a double click) waits for the whole of the one before it. */
+let lifecycle: Promise<void> = Promise.resolve();
+function serialized(f: () => Promise<void>): Promise<void> {
+  lifecycle = lifecycle.then(f, f);
+  return lifecycle;
 }
 
 async function start(): Promise<void> {
-  if (running || !config) return;
+  // A Restart while running: end the session first, so the new one reads the current config.
+  if (running) await stop();
+  if (!config) return;
   await surveyStop();
   setPhase("starting");
   try {
@@ -276,12 +355,16 @@ async function start(): Promise<void> {
       if (p) plans[x.shortName] = p;
     }
     // The session's clock: Unix ms that never jump (performance.now() from the page's start).
-    session = new WebSession(JSON.stringify(cfg), wallMs(), JSON.stringify(plans));
+    session = new WebSession(JSON.stringify(cfg), JSON.stringify(talkgroups), wallMs(), JSON.stringify(plans));
     session.load_units(JSON.stringify(await savedUnits(cfg)));
     session.load_heard((await readText(heardFile(cfg))) ?? "");
+    session.load_sharing((await readText(SHARING_FILE)) ?? "");
     session.load_tune((await readText(TUNE_FILE)) ?? "");
     session.load_registry((await readText(REGISTRY_FILE)) ?? "{}");
+    // (A tab can be closed without the recording's end: the registry more often than the desktop's.)
+    session.save_registry_every(60_000);
     session.set_topics(JSON.stringify(topics));
+    if (cfg.systems.some((x) => x.share)) session.set_recorder(await recorderId());
     session.set_want_audio(listen.on);
     const centers = resolvedCenters(cfg);
     running = true;
@@ -292,8 +375,8 @@ async function start(): Promise<void> {
         const rtl = await WebRtl.open(s.serial, centers[i] ?? s.centerHz, s.rateHz, s.agc ? undefined : s.gainDb, s.ppm);
         rtls.push(rtl);
         void pumpRtl(i, rtl);
-      } else if (s.type === "usrp" || s.type === "airspy" || s.type === "soapy") {
-        throw new Error(`Source ${i + 1}: USRP, Airspy and SoapySDR need the desktop app.`);
+      } else if (needsDriver(s)) {
+        throw new Error(`Source ${i + 1}: ${SOURCE_KINDS[s.type].label} needs the desktop app.`);
       } else {
         if (s.format && s.format !== "cu8") throw new Error(`Source ${i + 1}: the browser version reads rtl_sdr (cu8) captures only.`);
         const f = files[i];
@@ -304,14 +387,7 @@ async function start(): Promise<void> {
     timer = setInterval(() => {
       if (!session) return;
       deliver(session.poll(wallMs()));
-      void saveUnits(session.units_changed());
-      void saveHeard(session, cfg);
-      // The registry is rewritten whole: once a minute at most (AutoTune's scores with it).
-      if (performance.now() - registrySaved > 60_000) {
-        registrySaved = performance.now();
-        void saveTune(session);
-        void saveRegistry(session);
-      }
+      void saveDue(session, cfg, false);
     }, 50);
     setPhase("running");
   } catch (e) {
@@ -339,9 +415,11 @@ async function pumpRtl(source: number, rtl: WebRtl): Promise<void> {
 async function pumpFile(source: number, f: File, rateHz: number, realtime: boolean): Promise<void> {
   const chunk = 1 << 17; // 64 k samples
   const t0 = performance.now();
-  for (let off = 0; running && off < f.size; off += chunk) {
+  const mine = session;
+  for (let off = 0; running && session === mine && off < f.size; off += chunk) {
     const bytes = new Uint8Array(await f.slice(off, Math.min(f.size, off + chunk)).arrayBuffer());
-    if (!running || !session) return;
+    // (A restart during the read: these bytes are the old run's.)
+    if (!running || !session || session !== mine) return;
     const t = performance.now();
     session.push(source, bytes, 0, wallMs());
     session.add_busy_ms(performance.now() - t);
@@ -349,7 +427,10 @@ async function pumpFile(source: number, f: File, rateHz: number, realtime: boole
     const wait = realtime ? due - (performance.now() - t0) : 0;
     await new Promise((r) => setTimeout(r, Math.max(0, wait)));
   }
-  if (running && session?.source_ended(source)) await stop(true);
+  // In line with Stop and Restart; and only this run's: a restart may have begun a new one meanwhile.
+  await serialized(async () => {
+    if (running && session === mine && session?.source_ended(source)) await stop(true);
+  });
 }
 
 async function teardown(): Promise<void> {
@@ -367,13 +448,7 @@ async function stop(ended = false): Promise<void> {
   const s = session;
   session = null;
   deliver(s.finish());
-  await saveUnits(s.units_changed());
-  await saveRegistry(s);
-  if (config) await saveHeard(s, config);
-  await saveTune(s);
-  for (const [name, plan] of Object.entries(JSON.parse(s.bandplans()) as Record<string, string>)) {
-    await writeText(`bandplan-${name}.txt`, plan).catch(() => {});
-  }
+  if (config) await saveDue(s, config, true);
   s.free();
   setPhase("idle", null, ended);
 }
@@ -383,31 +458,58 @@ onmessage = async (ev: MessageEvent<ToWorker>) => {
   switch (m.type) {
     case "init":
       config = m.config;
+      talkgroups = m.talkgroups;
+      // The greeting, as the desktop app's (crates/trunk-pro server.rs): how things are, then hello.
+      post(phase);
+      post({ type: "config", config: m.config, version: configVersion });
+      for (const [system, rows] of Object.entries(m.talkgroups)) post({ type: "talkgroups", system, talkgroups: rows });
+      for (const [system, csv] of Object.entries(await savedUnits(m.config))) post({ type: "units", system, csv });
+      post({ type: "heard", heard: await savedHeard(m.config) });
+      post({ type: "history", ...callsPage(await listCalls(Number.MAX_SAFE_INTEGER), { limit: 300 }) });
+      post({ type: "survey", stage: "idle" });
+      post({ type: "devices", devices: await devices() });
       post({
         type: "hello",
         version: __APP_VERSION__,
         platform: "web",
-        config: m.config,
+        api: 1,
         configPath: "this browser",
-        devices: await devices(),
-        phase,
-        history: await listCalls(300),
-        units: await savedUnits(m.config),
-        heard: await savedHeard(m.config),
         surveyBands: await ready.then(() => JSON.parse(survey_bands())).catch(() => []),
-        survey: { type: "survey", stage: "idle" },
+        // The page is the recorder: no program of its own, no drivers but WebUSB's RTL-SDR, no plugins.
+        capabilities: [],
       });
       break;
     case "setConfig": {
-      // A talkgroup file changed while recording (an Ignore flag): the session takes it now.
-      const old = config;
+      const before = config;
       config = m.config;
-      if (session && old) {
-        for (const x of m.config.systems) {
-          const was = old.systems.find((o) => o.shortName === x.shortName);
-          if (was && was.talkgroupsCsv !== x.talkgroupsCsv) session.set_talkgroups(x.shortName, x.talkgroupsCsv);
+      post({ type: "configSaved", version: ++configVersion });
+      // Sharing switched on or off (or what it uses changed, like licenses): at once, as on the desktop.
+      for (const x of m.config.systems) {
+        const was = before?.systems.find((y) => y.shortName === x.shortName);
+        if (session && JSON.stringify(was) !== JSON.stringify(x)) {
+          if (x.share) session.set_recorder(await recorderId());
+          session?.set_share(JSON.stringify(x));
         }
       }
+      break;
+    }
+    case "setTalkgroups": {
+      // (A recording takes it at once: an Ignore flag set, a tag fixed.)
+      // (A number twice: the later row, in the first's place, as the desktop recorder keeps them.)
+      const rows = [...new Map(m.talkgroups.map((t) => [t.number, t])).values()];
+      if (rows.length) talkgroups[m.system] = rows;
+      else delete talkgroups[m.system];
+      session?.set_talkgroups(m.system, JSON.stringify(rows));
+      post({ type: "talkgroups", system: m.system, talkgroups: rows });
+      break;
+    }
+    case "setTalkgroup": {
+      // One row, edited as the desktop recorder edits it (talkgroups.ts withEdit).
+      await ready;
+      const rows = withEdit(talkgroups[m.system] ?? [], m.talkgroup, m.edit);
+      talkgroups[m.system] = rows;
+      session?.set_talkgroups(m.system, JSON.stringify(rows));
+      post({ type: "talkgroupEdited", system: m.system, talkgroup: m.talkgroup, edit: m.edit });
       break;
     }
     case "subscribe":
@@ -423,21 +525,20 @@ onmessage = async (ev: MessageEvent<ToWorker>) => {
     case "radioQuery":
       post(session ? (JSON.parse(session.radio_query(JSON.stringify(m))) as FromRecorder) : ({ type: "radioResult", id: m.id, what: m.what as "summary", error: "Start recording to see the radio system." } as FromRecorder));
       break;
-    case "olderCalls": {
-      // The whole index is small (one line a call): read it, as the recorder reads its day folders.
-      const floor = Date.now() - 24 * 3600 * 1000;
-      const older = (await listCalls(Number.MAX_SAFE_INTEGER)).filter((e) => e.record.start_time_ms < m.before && e.record.start_time_ms >= floor);
-      post({ type: "olderCalls", before: m.before, entries: older.slice(0, m.limit), more: older.length > m.limit });
+    // The whole index is small (one line a call): read it, and page it as the recorder's call store does.
+    case "callsQuery": {
+      const { type: _, id, ...q } = m;
+      post({ type: "callsResult", id, ...callsPage(await listCalls(Number.MAX_SAFE_INTEGER), q) });
       break;
     }
     case "files":
       files = m.files;
       break;
     case "start":
-      await start();
+      await serialized(start);
       break;
     case "stop":
-      await stop();
+      await serialized(() => stop());
       break;
     case "devices":
       post({ type: "devices", devices: await devices() });
@@ -455,12 +556,21 @@ onmessage = async (ev: MessageEvent<ToWorker>) => {
     case "surveyRescan":
       survey?.rescan();
       break;
+    case "licenseQuery":
+      void licenseQuery(m);
+      break;
+    case "callSignQuery":
+      void callSignQuery(m);
+      break;
     case "surveyStop":
       await surveyStop();
       break;
     case "profileSource":
       await profileSource(m);
       break;
+    default:
+      // What hello's capabilities said this recorder can't do (the desktop app's commands).
+      post({ type: "error", message: `The browser version can't do "${m.type}": that needs the desktop app.` });
   }
 };
 

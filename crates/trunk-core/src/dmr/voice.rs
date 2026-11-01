@@ -3,6 +3,7 @@
 //! as the P25 trackers, tagged with the slot, so a call can be recorded on
 //! each slot independently.
 
+use crate::trunk::Flags;
 use super::burst::{Burst, Framer};
 use super::slot::{Channel, LcFrom, SlotEvent};
 use crate::dsp::Symbol;
@@ -118,13 +119,13 @@ impl DmrVoice {
                     s.emergency |= lc.emergency();
                 }
                 if fresh {
-                    push(TrackerOut::Info { source: (src != 0).then_some(src), emergency: s.emergency, encrypted: s.encrypted });
+                    push(TrackerOut::Info { source: (src != 0).then_some(src), flags: Flags { emergency: s.emergency, encrypted: s.encrypted, ..Default::default() } });
                 }
             }
             SlotEvent::Privacy { .. } => {
                 if !s.encrypted {
                     s.encrypted = true;
-                    push(TrackerOut::Info { source: None, emergency: s.emergency, encrypted: true });
+                    push(TrackerOut::Info { source: None, flags: Flags { emergency: s.emergency, encrypted: true, ..Default::default() } });
                 }
             }
             SlotEvent::Voice { frame, pos } => {
@@ -138,11 +139,11 @@ impl DmrVoice {
                 }
                 let mut buf = [0f32; FRAME_SAMPLES];
                 let kind = s.dec.ambe(&frame.bits, frame.errs, &mut buf);
-                if kind != Kind::Voice {
+                if !matches!(kind, Kind::Voice | Kind::Tone) {
                     self.bad_frames += 1;
                 }
                 mbe::to_limited(&mut buf);
-                let vf = VoiceFrame { codec: Codec::Ambe, bits: frame.bits.to_vec(), e0: 0, errs: frame.errs, erased: false, kind };
+                let vf = VoiceFrame { codec: Codec::Ambe, bits: frame.bits.to_vec(), e0: 0, errs: frame.errs, erased: false, kind, tone: s.dec.tone_played(kind) };
                 push(TrackerOut::Audio(buf.to_vec(), vf));
             }
             _ => {}

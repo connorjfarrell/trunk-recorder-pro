@@ -2,14 +2,17 @@
 //! a path under the recordings folder made of `{token}`s, with `/` making
 //! folders; `-call_<call number>` is added to the name, as Trunk Recorder does.
 //!
-//! Tokens: `{talkgroup}`, `{talkgroup_tag}` (the tag, "Fire Dispatch"),
+//! Tokens: `{talkgroup}`, `{talkgroup_ota}` (a conventional digital call's
+//! talkgroup as the air named it; empty for others), `{talkgroup_tag}` (the tag, "Fire Dispatch"),
 //! `{talkgroup_alpha_tag}`, `{talkgroup_description}`, `{talkgroup_group}`,
 //! `{talkgroup_display}`, `{short_name}`, `{freq}` (Hz), `{freq_mhz}`,
 //! `{call_num}`, `{tdma_slot}` (empty when it has none), `{sys_num}`,
 //! `{epoch}`, `{source_num}`, `{recorder_num}`, `{audio_type}`,
 //! `{emergency}`, `{encrypted}`, `{priority}`, `{signal}`, `{noise}` (dBFS,
 //! whole dB cut toward zero as Trunk Recorder does; 0 when unmeasured),
-//! `{color_code}`, `{ran}`; and the start time, `{time:FORMAT}` in local time or
+//! `{nac}` (P25's, three hex digits; empty for others), `{color_code}`, `{ran}`,
+//! `{system_type}` (`p25`, `smartnet`, `dmr`, `nxdn`, `edacs`, `conventional`),
+//! `{voice_mode}` (`p25`, `p25_phase2`, `dmr`, `nxdn48`, `nxdn96`, `provoice`, `fm`, `am`); and the start time, `{time:FORMAT}` in local time or
 //! `{ztime:FORMAT}` in UTC, FORMAT being strftime's (`%Y %m %d %H %M %S`,
 //! `%f` for milliseconds, `%-m` for no padding, …) or `iso` / `iso_ms`. Text from the talkgroup
 //! file has `\ / : * ? " < > |` and spaces made `_`.
@@ -41,8 +44,14 @@ pub fn render(format: &str, record: &Value, sys_num: u16, utc_offset_s: i32) -> 
     out.push_str(rest);
     // Folders: none empty, none climbing out of the recordings folder.
     let path: Vec<&str> = out.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty() && *p != "." && *p != "..").collect();
-    let num = record["call_num"].as_u64().unwrap_or(0);
-    format!("{}-call_{num}", if path.is_empty() { "call".to_string() } else { path.join("/") })
+    numbered(&if path.is_empty() { "call".to_string() } else { path.join("/") }, record["call_num"].as_u64().unwrap_or(0))
+}
+
+/// `path` with the call's number added (`-call_<num>`), as Trunk Recorder
+/// does to a format's: two calls of one talkgroup and channel begun in the
+/// same second (a call per transmission) are named apart.
+pub fn numbered(path: &str, call_num: u64) -> String {
+    format!("{path}-call_{call_num}")
 }
 
 /// Why a format can't be used, or None. Unknown tokens are named.
@@ -63,12 +72,14 @@ pub fn problem(format: &str) -> Option<String> {
 
 const TOKENS: &[&str] = &[
     "talkgroup",
+    "talkgroup_ota",
     "talkgroup_tag",
     "talkgroup_alpha_tag",
     "talkgroup_description",
     "talkgroup_group",
     "talkgroup_display",
     "short_name",
+    "site",
     "freq",
     "freq_mhz",
     "call_num",
@@ -83,8 +94,11 @@ const TOKENS: &[&str] = &[
     "priority",
     "signal",
     "noise",
+    "nac",
     "color_code",
     "ran",
+    "system_type",
+    "voice_mode",
 ];
 
 fn token(t: &str, r: &Value, sys_num: u16, utc_offset_s: i32) -> String {
@@ -99,12 +113,15 @@ fn token(t: &str, r: &Value, sys_num: u16, utc_offset_s: i32) -> String {
     }
     match t {
         "talkgroup" | "talkgroup_display" => num("talkgroup"),
+        "talkgroup_ota" => r["talkgroup_ota"].as_u64().map_or(String::new(), |t| t.to_string()),
         // Trunk Recorder's JSON names the alpha tag talkgroup_tag, and the tag talkgroup_group_tag.
         "talkgroup_tag" => text("talkgroup_group_tag"),
         "talkgroup_alpha_tag" => text("talkgroup_tag"),
         "talkgroup_description" => text("talkgroup_description"),
         "talkgroup_group" => text("talkgroup_group"),
         "short_name" => text("short_name"),
+        // The site its copy was kept from (a conventional call has none).
+        "site" => text("site"),
         "freq" => num("freq"),
         "freq_mhz" => format!("{:.4}", r["freq"].as_f64().unwrap_or(0.0) / 1e6),
         "call_num" => num("call_num"),
@@ -121,7 +138,9 @@ fn token(t: &str, r: &Value, sys_num: u16, utc_offset_s: i32) -> String {
         // Decimal dBFS (or null) in the JSON; Trunk Recorder casts to int.
         "signal" | "noise" => (r[t].as_f64().unwrap_or(0.0) as i64).to_string(),
         "source_num" | "recorder_num" | "emergency" | "encrypted" | "priority" | "color_code" | "ran" => num(t),
-        "audio_type" => text("audio_type"),
+        "audio_type" | "system_type" | "voice_mode" => text(t),
+        // Hex in the JSON already ("293").
+        "nac" => text("nac"),
         _ => format!("{{{t}}}"),
     }
 }
@@ -252,6 +271,12 @@ mod tests {
                 "start_time_ms": 1763759979250i64, "tdma_slot": 0, "phase2_tdma": 0, "color_code": -1, "audio_type": "digital", "emergency": 0 })
     }
 
+    /// A call's number names apart two begun in the same second.
+    #[test]
+    fn a_number_names_calls_apart() {
+        assert_eq!(numbered("dc/2026/10/25/101-1792900000_851012500", 42), "dc/2026/10/25/101-1792900000_851012500-call_42");
+    }
+
     #[test]
     fn trunk_recorders_examples() {
         let c = call();
@@ -283,6 +308,24 @@ mod tests {
         let f = "{short_name}/{time:%Y}/{time:%-m}/{time:%-d}/{talkgroup}-{epoch}_{freq}";
         assert_eq!(render(f, &c, 0, 0), format!("{}-call_7", default_path("x", "101-1709164800_851012500", 1709164800, 0)));
         assert_eq!(render("{time:%-H}{time:%-M}{time:%-S}{time:%-q}", &c, 0, 0), "000%-q-call_7");
+    }
+
+    #[test]
+    fn a_calls_site() {
+        let c = json!({ "call_num": 1, "short_name": "dcfd", "site": "south" });
+        assert_eq!(render("{short_name}/{site}", &c, 0, 0), "dcfd/south-call_1");
+        assert_eq!(render("{short_name}/{site}", &json!({ "call_num": 2, "short_name": "fire" }), 0, 0), "fire-call_2", "a conventional call has none: no folder");
+    }
+
+    #[test]
+    fn a_calls_air_talkgroup() {
+        let c = json!({ "call_num": 3, "talkgroup": 46012, "talkgroup_ota": 1 });
+        assert_eq!(render("{talkgroup}/{talkgroup_ota}", &c, 0, 0), "46012/1-call_3");
+        assert_eq!(render("{talkgroup}_{talkgroup_ota}", &json!({ "call_num": 4, "talkgroup": 5 }), 0, 0), "5_-call_4", "none named: empty");
+        assert_eq!(problem("{talkgroup_ota}"), None);
+        let c = json!({ "call_num": 5, "nac": "293", "system_type": "conventional", "voice_mode": "p25" });
+        assert_eq!(render("{system_type}/{voice_mode}/{nac}", &c, 0, 0), "conventional/p25/293-call_5");
+        assert_eq!(render("{nac}x", &json!({ "call_num": 6, "nac": "" }), 0, 0), "x-call_6", "none: empty");
     }
 
     #[test]

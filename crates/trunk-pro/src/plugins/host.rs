@@ -3,10 +3,13 @@
 //!
 //! Nothing here blocks the engine: each event is serialized once and offered
 //! to each subscriber's queue, and a plugin that falls behind loses events
-//! (counted and reported) rather than holding up the recorder. Calls that
-//! need M4A are encoded on worker threads first.
+//! (counted and reported) rather than holding up the recorder. A call reaches
+//! the plugins once the finish threads have written its files (an .m4a made
+//! for them too, [`super::plan`]). What a plugin is to have
+//! late (its delays) goes to the [`Hold`] instead, which gives it to the
+//! plugin when it's due.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -19,10 +22,12 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use trunk_app::PluginTopics;
 use trunk_recorder_plugin::{
-    format, topic, AudioChunk, CallFiles, CallRecord, ConcludedCall, Hello, HostInfo, HostMessage, Level, Manifest, Metrics, Outcome, PluginMessage, Shutdown, State,
+    format, topic, Action, AudioChunk, CallFiles, CallRecord, CallsPage, CallsQuery, ConcludedCall, Hello, HostInfo, HostMessage, Level, Manifest, Metrics, Outcome, PluginMessage, Shutdown, State,
     SystemInfo, API_VERSION, EXIT_CONFIG,
 };
 
+use super::delay::About;
+use super::hold::{Hold, Offer, Outlet};
 use super::{describe, executable, Encoder};
 
 /// What the plugins are up to, for the interface (or the terminal).
@@ -30,7 +35,8 @@ use super::{describe, executable, Encoder};
 pub enum Note {
     Log { plugin: String, level: Level, text: String },
     State { plugin: String, state: State, message: String },
-    Result { plugin: String, path: String, outcome: Outcome, message: String, url: String },
+    /// `took_ms`: the plugin's own time on it, when it said (SDK 0.6 and later).
+    Result { plugin: String, path: String, outcome: Outcome, message: String, url: String, took_ms: Option<u64> },
     /// Its figures (queue, timing, the services it talks to).
     Metrics { plugin: String, metrics: Metrics },
 }
@@ -49,17 +55,19 @@ pub struct ProcessStats {
 
 pub type Notes = Arc<dyn Fn(Note) + Send + Sync>;
 
+/// Answers a plugin's `calls.query` (the recorder's [`crate::runtime::calls`]).
+pub type Calls = Arc<dyn Fn(&CallsQuery) -> CallsPage + Send + Sync>;
+
 /// Messages waiting for a plugin; beyond this it's behind, and loses them.
 const QUEUE: usize = 1024;
-/// Calls waiting to be encoded.
-const ENCODE_QUEUE: usize = 256;
 
 struct Plugin {
     id: String,
     manifest: Manifest,
     exe: PathBuf,
     data_dir: PathBuf,
-    hello: Arc<str>,
+    /// What it starts with (changed by new settings it took live).
+    hello: Mutex<Hello>,
     tx: Mutex<Option<SyncSender<Arc<str>>>>,
     child: Mutex<Option<Child>>,
     dropped: AtomicU64,
@@ -68,6 +76,11 @@ struct Plugin {
     started: Mutex<Option<Instant>>,
     /// When everything queued for it, `shutdown` last, was written to it.
     drained_at: Arc<Mutex<Option<Instant>>>,
+    /// It may be given calls decrypted with our keys (`shareDecrypted`); whether it was said when one was withheld.
+    share_decrypted: bool,
+    withheld_said: AtomicBool,
+    /// Whether it was said that it isn't streamed the live audio of calls it's delayed for.
+    audio_held_said: AtomicBool,
 }
 
 struct Shared {
@@ -76,55 +89,24 @@ struct Shared {
     /// Plugins may start (false: wait for the ones they replace to exit).
     go: Arc<AtomicBool>,
     notes: Notes,
+    /// Where what's delayed waits (None: nothing is).
+    hold: Option<Arc<Hold>>,
+    /// Buttons pressed ([`PluginHost::action`]) waiting for the plugin's
+    /// answer, by the request number it was given.
+    answers: Mutex<HashMap<u64, mpsc::Sender<(bool, String)>>>,
+    requests: AtomicU64,
+    /// Answers `calls.query` (None: no recorder to ask, as in `plugin test`).
+    calls: Option<Calls>,
 }
 
 /// How long `shutdown` waits for a plugin to read what was queued before
 /// `shutdown` (its grace counts from then).
 const DRAIN_MAX: Duration = Duration::from_secs(30);
 
-struct EncodeJob {
-    call: ConcludedCall,
-    audio: CallAudio,
-}
-
-/// A concluded call's audio, for the plugins.
-pub struct CallAudio {
-    /// Its WAV, to encode from (and to write, should that fail).
-    pub wav: Arc<Vec<u8>>,
-    /// The WAV is at `files.wav` (otherwise only in `wav`).
-    pub wav_written: bool,
-    /// Where its files are: the .json, the .wav (written or not), the .m4a once made.
-    pub files: CallFiles,
-    /// Where an .m4a for the plugins goes.
-    pub m4a_to: PathBuf,
-}
-
-impl CallAudio {
-    /// A call already on disk at `base` (its path without the extension).
-    pub fn on_disk(base: &Path) -> CallAudio {
-        let wav = with_ext(base, "wav");
-        let m4a = Some(with_ext(base, "m4a")).filter(|p| p.exists());
-        CallAudio {
-            wav: Arc::new(std::fs::read(&wav).unwrap_or_default()),
-            wav_written: true,
-            files: CallFiles { json: with_ext(base, "json"), wav, m4a },
-            m4a_to: with_ext(base, "m4a"),
-        }
-    }
-
-    /// Write the WAV, when it wasn't (the plugins get that instead of an .m4a).
-    fn write_wav(&mut self) {
-        if !self.wav_written {
-            self.wav_written = std::fs::write(&self.files.wav, &*self.wav).is_ok();
-        }
-    }
-}
-
 pub struct PluginHost {
     shared: Arc<Shared>,
+    /// The M4A encoder this host's plugins are told of (the finish threads encode).
     encoder: Option<(Encoder, u32)>,
-    encode_tx: Option<SyncSender<EncodeJob>>,
-    encoders: Vec<JoinHandle<()>>,
     supervisors: Vec<JoinHandle<()>>,
     /// What the session should build for plugins.
     pub topics: PluginTopics,
@@ -147,6 +129,8 @@ pub struct Spec {
     pub systems: BTreeMap<String, Value>,
     /// Its data folder (None: the usual, in the config folder).
     pub data_dir: Option<PathBuf>,
+    /// It may be given calls decrypted with our keys (`shareDecrypted`, when a system has keys).
+    pub share_decrypted: bool,
 }
 
 impl Spec {
@@ -163,6 +147,7 @@ impl Spec {
                     config: p.settings.clone(),
                     systems: super::system_settings(cfg, id, copy),
                     data_dir: None,
+                    share_decrypted: p.share_decrypted && cfg.has_keys(),
                 })
             })
             .collect()
@@ -173,12 +158,24 @@ impl PluginHost {
     /// Start `specs`. `systems`: every system calls come from (their `config` is filled in here).
     /// A plugin that can't start is reported and left out.
     pub fn start(specs: Vec<Spec>, audio: &super::AudioSettings, systems: &[SystemInfo], capture_dir: &Path, notes: Notes) -> PluginHost {
-        Self::start_when(specs, audio, systems, capture_dir, notes, Arc::new(AtomicBool::new(true)))
+        Self::start_when(specs, audio, systems, capture_dir, notes, Arc::new(AtomicBool::new(true)), None, None)
     }
 
     /// `start`, with the processes held back until `go` is set (events queue
-    /// meanwhile): the plugins they replace share their data folders.
-    pub fn start_when(specs: Vec<Spec>, audio: &super::AudioSettings, systems: &[SystemInfo], capture_dir: &Path, notes: Notes, go: Arc<AtomicBool>) -> PluginHost {
+    /// meanwhile): the plugins they replace share their data folders. What
+    /// a plugin is to have late goes to `hold` (None: everything goes now).
+    /// `calls` answers the plugins' `calls.query`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_when(
+        specs: Vec<Spec>,
+        audio: &super::AudioSettings,
+        systems: &[SystemInfo],
+        capture_dir: &Path,
+        notes: Notes,
+        go: Arc<AtomicBool>,
+        hold: Option<Arc<Hold>>,
+        calls: Option<Calls>,
+    ) -> PluginHost {
         let mut ready = Vec::new();
         for mut s in specs {
             // (It runs in its data folder: a relative path would be from there.)
@@ -190,6 +187,10 @@ impl PluginHost {
                     }
                     // From here on a copy goes by its label: its notes, its data folder.
                     s.id = super::copy_label(&s.id, s.copy);
+                    // Said every time it starts.
+                    if s.share_decrypted {
+                        notes(Note::Log { plugin: s.id.clone(), level: Level::Warn, text: "is given calls decrypted with your keys (shareDecrypted)".into() });
+                    }
                     // Each system's settings, and the plugin's as they are for it.
                     let mut settings = BTreeMap::new();
                     // Required settings left empty, and for which systems ("": for none).
@@ -237,10 +238,10 @@ impl PluginHost {
             }
         }
         let wants_m4a = ready.iter().any(|(_, m, _)| m.subscribes(topic::CALL_CONCLUDED) && m.wants_format(format::M4A));
-        let encoder = if wants_m4a { Encoder::find(&audio.encoder) } else { None };
+        let encoder = if wants_m4a { Encoder::find(audio.encoder) } else { None };
         if wants_m4a && encoder.is_none() {
             let who: Vec<&str> = ready.iter().filter(|(_, m, _)| m.wants_format(format::M4A)).map(|(s, _, _)| s.id.as_str()).collect();
-            let text = if audio.encoder == "none" {
+            let text = if audio.encoder == crate::config::M4aEncoder::None {
                 format!("M4A encoding is off: {} get WAV only", who.join(", "))
             } else {
                 format!("No M4A encoder found (install ffmpeg): {} get WAV only", who.join(", "))
@@ -255,6 +256,7 @@ impl PluginHost {
             topics.calls |= m.subscribes(topic::CALL_START) || m.subscribes(topic::CALL_END);
             topics.units |= m.subscribes(topic::UNIT);
             topics.status |= m.subscribes(topic::STATUS);
+            topics.tone_patterns |= m.subscribes(topic::TONE_PATTERN);
             live_audio |= m.subscribes(topic::AUDIO);
             let data_dir = s.data_dir.clone().unwrap_or_else(|| super::data_dir(&s.id));
             let _ = std::fs::create_dir_all(&data_dir);
@@ -286,7 +288,7 @@ impl PluginHost {
                 manifest: m,
                 exe: s.exe,
                 data_dir,
-                hello: line(&HostMessage::Hello(hello)),
+                hello: Mutex::new(hello),
                 tx: Mutex::new(Some(tx)),
                 child: Mutex::new(None),
                 dropped: AtomicU64::new(0),
@@ -294,9 +296,12 @@ impl PluginHost {
                 restarts: AtomicU64::new(0),
                 started: Mutex::new(None),
                 drained_at: Arc::new(Mutex::new(None)),
+                share_decrypted: s.share_decrypted,
+                withheld_said: AtomicBool::new(false),
+                audio_held_said: AtomicBool::new(false),
             });
         }
-        let shared = Arc::new(Shared { plugins, stopping: AtomicBool::new(false), go, notes });
+        let shared = Arc::new(Shared { plugins, stopping: AtomicBool::new(false), go, notes, hold, answers: Default::default(), requests: AtomicU64::new(0), calls });
         let supervisors = queues
             .into_iter()
             .enumerate()
@@ -306,23 +311,8 @@ impl PluginHost {
             })
             .collect();
         let encoder = encoder.map(|e| (e, audio.bitrate_kbps.clamp(8, 320)));
-        let (encode_tx, encoders) = match &encoder {
-            Some((e, kbps)) => {
-                let (tx, rx) = mpsc::sync_channel::<EncodeJob>(ENCODE_QUEUE);
-                let rx = Arc::new(Mutex::new(rx));
-                let n = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 3);
-                let workers = (0..n)
-                    .map(|i| {
-                        let (rx, sh, e, kbps) = (rx.clone(), shared.clone(), e.clone(), *kbps);
-                        std::thread::Builder::new().name(format!("encode-{i}")).spawn(move || encode_worker(&rx, &sh, &e, kbps)).expect("thread")
-                    })
-                    .collect();
-                (Some(tx), workers)
-            }
-            None => (None, Vec::new()),
-        };
         let names = systems.iter().map(|y| (y.index, y.short_name.clone())).collect();
-        PluginHost { shared, encoder, encode_tx, encoders, supervisors, topics, audio: live_audio, names, done: false }
+        PluginHost { shared, encoder, supervisors, topics, audio: live_audio, names, done: false }
     }
 
     /// Each plugin's process: drops, restarts, uptime.
@@ -343,6 +333,11 @@ impl PluginHost {
         self.shared.plugins.is_empty()
     }
 
+    /// Its plugins, for the hold to give what's due to.
+    pub fn outlet(&self) -> Arc<dyn Outlet> {
+        self.shared.clone()
+    }
+
     /// The M4A encoder in use (its name).
     pub fn encoder(&self) -> Option<&'static str> {
         self.encoder.as_ref().map(|(e, _)| e.name())
@@ -350,22 +345,68 @@ impl PluginHost {
 
     /// An event from the session.
     pub fn event(&self, m: &HostMessage) {
-        let t = match m {
-            HostMessage::CallStart(_) => topic::CALL_START,
-            HostMessage::CallEnd(_) => topic::CALL_END,
-            HostMessage::Unit(_) => topic::UNIT,
-            HostMessage::Status(_) => topic::STATUS,
-            HostMessage::Audio(_) => topic::AUDIO,
-            HostMessage::CallConcluded(_) => topic::CALL_CONCLUDED,
+        let on = |system: &str, talkgroup: Option<u32>| About { system: system.to_string(), talkgroup, decrypted: false };
+        let (t, about) = match m {
+            HostMessage::CallStart(c) => (topic::CALL_START, on(&c.short_name, Some(c.talkgroup))),
+            HostMessage::CallEnd(c) => (topic::CALL_END, on(&c.short_name, Some(c.talkgroup))),
+            HostMessage::Unit(u) => (topic::UNIT, on(&u.short_name, u.talkgroup)),
+            // (Its tones may have been heard in decrypted voice: only plugins allowed that get it.)
+            HostMessage::TonePattern(t) => (topic::TONE_PATTERN, About { decrypted: t.decrypted, ..on(&t.short_name, Some(t.talkgroup)) }),
+            // (No one system's: never delayed.)
+            HostMessage::Status(_) => (topic::STATUS, About::default()),
+            // (Audio and concluded calls may be decrypted ones: they go only by `audio_frame` and
+            // `concluded`, which know.)
             _ => return,
         };
         if self.shared.plugins.iter().any(|p| p.manifest.subscribes(t)) {
-            self.shared.dispatch(t, &line(m));
+            self.shared.dispatch(t, &line(m), &about, None);
         }
     }
 
+    /// Plugin `id` takes `config` as its settings while it runs, if it can
+    /// (`live_settings`, one copy, no system's overrides of them, every
+    /// setting it needs set). False: it has to be restarted for them, as one
+    /// that stopped over its settings (exit 78) waits to be.
+    pub fn settle(&self, id: &str, config: &Value) -> bool {
+        let copies: Vec<&Plugin> = self.shared.plugins.iter().filter(|p| super::parse_label(&p.id).0 == id).collect();
+        let [p] = copies[..] else { return false };
+        if !p.manifest.live_settings || !unset_required(p.manifest.config.as_ref(), config).is_empty() {
+            return false;
+        }
+        let mut hello = p.hello.lock().unwrap();
+        if hello.systems.iter().any(|s| !s.settings.is_null() || !s.config.is_null()) {
+            return false;
+        }
+        let h = Hello { config: config.clone(), ..hello.clone() };
+        if self.shared.give(p, &line(&HostMessage::Settings(h.clone()))) != Offer::Sent {
+            return false;
+        }
+        // (Restarted after a crash, it starts with them.)
+        *hello = h;
+        true
+    }
+
+    /// Someone pressed one of plugin `id`'s buttons (its first copy's):
+    /// hand it `action` on `value`, and wait (`wait` at most) for its
+    /// answer, ok or not and what it said. Err: there's none to give.
+    pub fn action(&self, id: &str, action: String, value: Value, wait: Duration) -> Result<(bool, String), String> {
+        let sh = &self.shared;
+        let p = sh.plugins.iter().find(|p| p.id == id).ok_or("It isn't running: plugins run while recording")?;
+        let request = sh.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = mpsc::channel();
+        sh.answers.lock().unwrap().insert(request, tx);
+        let answer = match sh.give(p, &line(&HostMessage::Action(Action { request, action, value }))) {
+            Offer::Sent => rx.recv_timeout(wait).map_err(|_| "No answer from the plugin".to_string()),
+            Offer::Full => Err("It's too far behind to take that now".into()),
+            Offer::Gone => Err("It isn't running".into()),
+        };
+        sh.answers.lock().unwrap().remove(&request);
+        answer
+    }
+
     /// A live audio frame (the session's `[2][u16 system][u32 call][u32 tg][i16…]`).
-    pub fn audio_frame(&self, frame: &[u8]) {
+    /// `decrypted`: of a call decrypted with our keys (only plugins with `shareDecrypted` are given it).
+    pub fn audio_frame(&self, frame: &[u8], decrypted: bool) {
         if !self.audio || frame.len() < 11 {
             return;
         }
@@ -374,60 +415,55 @@ impl PluginHost {
         let talkgroup = u32::from_le_bytes([frame[7], frame[8], frame[9], frame[10]]);
         let pcm = trunk_recorder_plugin::base64::encode(&frame[11..]);
         let short_name = self.names.get(&system).cloned().unwrap_or_default();
+        let about = About { system: short_name.clone(), talkgroup: Some(talkgroup), decrypted };
         let chunk = AudioChunk { call_id, system, short_name, talkgroup, sample_rate: 8000, pcm };
-        self.shared.dispatch(topic::AUDIO, &line(&HostMessage::Audio(chunk)));
+        self.shared.dispatch(topic::AUDIO, &line(&HostMessage::Audio(chunk)), &about, None);
     }
 
     /// The plugins that take concluded calls (each reports on every one);
     /// not one that gave up (a config error).
-    pub fn call_takers(&self) -> usize {
-        self.shared.plugins.iter().filter(|p| p.manifest.subscribes(topic::CALL_CONCLUDED) && p.tx.lock().unwrap().is_some()).count()
+    /// (`decrypted`: a call decrypted with our keys, which only plugins with `shareDecrypted` take.)
+    pub fn call_takers(&self, decrypted: bool) -> usize {
+        self.shared.plugins.iter().filter(|p| p.manifest.subscribes(topic::CALL_CONCLUDED) && p.tx.lock().unwrap().is_some() && (!decrypted || p.share_decrypted)).count()
     }
 
-    /// Some plugin takes the WAV file: one that doesn't ask for M4A, does
-    /// with no encoder to make it, or asks for the WAV too. (Otherwise the
-    /// WAV needn't be written.)
-    pub fn needs_wav(&self) -> bool {
-        self.shared.plugins.iter().any(|p| p.manifest.subscribes(topic::CALL_CONCLUDED) && (self.encoder.is_none() || takes_wav(&p.manifest)))
+    /// What the plugins take of a finished call (`decrypted`: one decrypted
+    /// with our keys, which only plugins with `shareDecrypted` take): how
+    /// many, and whether one takes the WAV, one wants an .m4a
+    /// ([`super::archive::plan`] says what's written for them).
+    pub fn plugin_audio(&self, decrypted: bool) -> super::archive::PluginAudio {
+        let takers: Vec<&Plugin> = self.shared.plugins.iter().filter(|p| p.manifest.subscribes(topic::CALL_CONCLUDED) && p.tx.lock().unwrap().is_some() && (!decrypted || p.share_decrypted)).collect();
+        super::archive::PluginAudio { takers: takers.len(), wav: takers.iter().any(|p| takes_wav(&p.manifest)), m4a: takers.iter().any(|p| p.manifest.wants_format(format::M4A)) }
     }
 
-    /// A concluded call (`rel`: relative to the capture folder, no extension;
-    /// `json`: its call JSON) whose JSON is written, and its audio as
-    /// `audio` says. An .m4a is made here when there isn't one and a plugin
-    /// wants it.
-    pub fn concluded(&self, system: u16, rel: &str, json: &str, mut audio: CallAudio) {
-        if self.call_takers() == 0 {
+    /// The encoder and bitrate this host's plugins get .m4a files from, if any.
+    pub fn encoder_settings(&self) -> Option<&(Encoder, u32)> {
+        self.encoder.as_ref()
+    }
+
+    /// A concluded call (`rel`: relative to the capture folder, no
+    /// extension), its record and its files as they are on disk now (the
+    /// finish thread wrote what [`super::archive::plan`] said): to the
+    /// plugins that take it. `decrypted`: some of it was decrypted with our keys.
+    pub fn concluded(&self, system: u16, rel: &str, record: CallRecord, files: CallFiles, decrypted: bool) {
+        if self.call_takers(decrypted) == 0 {
+            if decrypted {
+                self.shared.say_all_withheld(topic::CALL_CONCLUDED);
+            }
             return;
         }
-        let record: CallRecord = serde_json::from_str(json).unwrap_or_default();
-        let call = |files: &CallFiles| ConcludedCall { path: rel.to_string(), system, call: record.clone(), files: files.clone() };
-        match &self.encode_tx {
-            Some(tx) if audio.files.m4a.is_none() => {
-                if let Err(TrySendError::Full(mut job) | TrySendError::Disconnected(mut job)) = tx.try_send(EncodeJob { call: call(&audio.files), audio }) {
-                    self.shared.note_log("", Level::Warn, "M4A encoding is behind: a call goes out as WAV only");
-                    job.audio.write_wav();
-                    self.shared.dispatch(topic::CALL_CONCLUDED, &line(&HostMessage::CallConcluded(job.call)));
-                }
-            }
-            _ => {
-                if audio.files.m4a.is_none() {
-                    audio.write_wav();
-                }
-                self.shared.dispatch(topic::CALL_CONCLUDED, &line(&HostMessage::CallConcluded(call(&audio.files))));
-            }
-        }
+        let short_name = self.names.get(&system).cloned().unwrap_or_else(|| record.short_name.clone());
+        let about = About { system: short_name, talkgroup: Some(record.talkgroup), decrypted };
+        let call = ConcludedCall { path: rel.to_string(), system, call: record, files };
+        self.shared.dispatch(topic::CALL_CONCLUDED, &line(&HostMessage::CallConcluded(call)), &about, Some(rel));
     }
 
-    /// Finish encoding, tell every plugin to stop, and give each `grace` to
+    /// Tell every plugin to stop, and give each `grace` to
     /// exit from when it has read `shutdown` (behind what was queued, for up
     /// to `DRAIN_MAX`).
     pub fn shutdown(&mut self, grace: Duration) {
         if std::mem::replace(&mut self.done, true) {
             return;
-        }
-        drop(self.encode_tx.take());
-        for w in self.encoders.drain(..) {
-            let _ = w.join();
         }
         let sh = &self.shared;
         sh.stopping.store(true, Ordering::Relaxed);
@@ -530,6 +566,12 @@ fn takes_wav(m: &Manifest) -> bool {
     !m.wants_format(format::M4A) || m.wants_format(format::WAV) || m.id == "upload-script"
 }
 
+/// The files of a call already on disk at `base` (its path without the extension).
+pub fn files_on_disk(base: &Path) -> CallFiles {
+    let m4a = Some(with_ext(base, "m4a")).filter(|p| p.exists());
+    CallFiles { json: with_ext(base, "json"), wav: with_ext(base, "wav"), m4a }
+}
+
 fn with_ext(base: &Path, ext: &str) -> PathBuf {
     PathBuf::from(format!("{}.{ext}", base.display()))
 }
@@ -545,41 +587,77 @@ impl Shared {
         (self.notes)(Note::Log { plugin: plugin.to_string(), level, text: text.into() });
     }
 
-    fn dispatch(&self, t: &str, l: &Arc<str>) {
+    /// Say, once a run, that `p` is not given decrypted calls, and how to allow it.
+    fn say_withheld(&self, p: &Plugin) {
+        if !p.share_decrypted && !p.withheld_said.swap(true, Ordering::Relaxed) {
+            self.note_log(&p.id, Level::Info, "is not given calls decrypted with your keys (Share decrypted calls, on its card in Setup → Plugins, allows it)");
+        }
+    }
+
+    /// A decrypted call came and no plugin that takes calls may have it: say so for each (they are
+    /// otherwise passed over without a word, as nothing is sent to them at all).
+    fn say_all_withheld(&self, t: &str) {
         for p in self.plugins.iter().filter(|p| p.manifest.subscribes(t)) {
-            let Some(tx) = p.tx.lock().unwrap().clone() else {
+            self.say_withheld(p);
+        }
+    }
+
+    /// Send `l` (of topic `t`) to each plugin that subscribed to it, now or,
+    /// when its delays say so, later (by the hold). `about`: what it's about —
+    /// a call decrypted with our keys (or its audio) goes only to plugins with
+    /// `shareDecrypted`; `call`: it's that finished call.
+    fn dispatch(&self, t: &str, l: &Arc<str>, about: &About, call: Option<&str>) {
+        for p in self.plugins.iter().filter(|p| p.manifest.subscribes(t)) {
+            if about.decrypted && !p.share_decrypted {
+                self.say_withheld(p);
                 continue;
-            };
-            if let Err(TrySendError::Full(_)) = tx.try_send(l.clone()) {
-                let n = p.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                let mut last = p.last_drop_note.lock().unwrap();
-                if last.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
-                    *last = Some(Instant::now());
-                    self.note_log(&p.id, Level::Warn, format!("is falling behind: {n} event(s) dropped so far"));
-                }
             }
+            if let Some(h) = self.hold.as_ref().filter(|h| !h.delay(&p.id, about).is_zero()) {
+                // Live audio late isn't live: a delayed call's isn't streamed at all.
+                if t == topic::AUDIO {
+                    if !p.audio_held_said.swap(true, Ordering::Relaxed) {
+                        self.note_log(&p.id, Level::Info, "isn't given the live audio of calls it's delayed for");
+                    }
+                } else if !h.push(&p.id, about, l, call) {
+                    self.dropped(p);
+                }
+                continue;
+            }
+            if self.give(p, l) == Offer::Full {
+                self.dropped(p);
+            }
+        }
+    }
+
+    /// Put `l` in `p`'s queue.
+    fn give(&self, p: &Plugin, l: &Arc<str>) -> Offer {
+        let Some(tx) = p.tx.lock().unwrap().clone() else {
+            return Offer::Gone;
+        };
+        match tx.try_send(l.clone()) {
+            Ok(()) => Offer::Sent,
+            Err(TrySendError::Full(_)) => Offer::Full,
+            Err(TrySendError::Disconnected(_)) => Offer::Gone,
+        }
+    }
+
+    /// `p` lost an event: it's too far behind.
+    fn dropped(&self, p: &Plugin) {
+        let n = p.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut last = p.last_drop_note.lock().unwrap();
+        if last.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+            *last = Some(Instant::now());
+            self.note_log(&p.id, Level::Warn, format!("is falling behind: {n} event(s) dropped so far"));
         }
     }
 }
 
-fn encode_worker(rx: &Mutex<Receiver<EncodeJob>>, sh: &Shared, e: &Encoder, kbps: u32) {
-    let mut last_error: Option<Instant> = None;
-    loop {
-        let job = rx.lock().unwrap().recv();
-        let Ok(EncodeJob { mut call, mut audio }) = job else {
-            return;
-        };
-        match e.m4a(&audio.wav, &audio.m4a_to, kbps) {
-            Ok(()) => call.files.m4a = Some(audio.m4a_to),
-            Err(err) => {
-                audio.write_wav();
-                if last_error.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
-                    last_error = Some(Instant::now());
-                    sh.note_log("", Level::Warn, format!("M4A encoding failed ({err}); plugins get WAV"));
-                }
-            }
+impl Outlet for Shared {
+    fn offer(&self, label: &str, line: &Arc<str>, decrypted: bool) -> Offer {
+        match self.plugins.iter().find(|p| p.id == label) {
+            Some(p) if !decrypted || p.share_decrypted => self.give(p, line),
+            _ => Offer::Gone,
         }
-        sh.dispatch(topic::CALL_CONCLUDED, &line(&HostMessage::CallConcluded(call)));
     }
 }
 
@@ -673,7 +751,7 @@ fn run_once(sh: &Shared, p: &Plugin, rx: Receiver<Arc<str>>) -> (Result<Ended, S
     *p.child.lock().unwrap() = Some(child);
     *p.started.lock().unwrap() = Some(Instant::now());
     let dead = Arc::new(AtomicBool::new(false));
-    let hello = p.hello.clone();
+    let hello = line(&HostMessage::Hello(p.hello.lock().unwrap().clone()));
     let dead2 = dead.clone();
     let drained_at = p.drained_at.clone();
     let writer = std::thread::spawn(move || {
@@ -709,8 +787,26 @@ fn run_once(sh: &Shared, p: &Plugin, rx: Receiver<Arc<str>>) -> (Result<Ended, S
             Ok(PluginMessage::Ready) => Note::State { plugin: p.id.clone(), state: State::Ok, message: "running".into() },
             Ok(PluginMessage::Log { level, message }) => Note::Log { plugin: p.id.clone(), level, text: message },
             Ok(PluginMessage::Status { state, message }) => Note::State { plugin: p.id.clone(), state, message },
-            Ok(PluginMessage::CallResult { path, outcome, message, url }) => Note::Result { plugin: p.id.clone(), path, outcome, message, url },
+            Ok(PluginMessage::CallResult { path, outcome, message, url, took_ms }) => Note::Result { plugin: p.id.clone(), path, outcome, message, url, took_ms },
             Ok(PluginMessage::Metrics(metrics)) => Note::Metrics { plugin: p.id.clone(), metrics },
+            // (To the button that was pressed, waiting in `action`.)
+            Ok(PluginMessage::ActionResult { request, ok, message }) => {
+                if let Some(tx) = sh.answers.lock().unwrap().remove(&request) {
+                    let _ = tx.send((ok, message));
+                }
+                continue;
+            }
+            // (Answered on its own queue, behind what's already waiting for it.)
+            Ok(PluginMessage::CallsQuery { request, query }) => {
+                let page = match &sh.calls {
+                    Some(answer) => answer(&query),
+                    None => CallsPage { error: Some("no recorder to ask".into()), ..Default::default() },
+                };
+                if let Some(tx) = p.tx.lock().unwrap().as_ref() {
+                    let _ = tx.send(Arc::from(line(&HostMessage::Calls { request, page })));
+                }
+                continue;
+            }
             Ok(PluginMessage::Unknown) => continue,
             // Not the protocol (a stray print): keep it as a log line.
             Err(_) => Note::Log { plugin: p.id.clone(), level: Level::Info, text: l },
@@ -763,6 +859,65 @@ mod tests {
         assert!(unset_required(None, &Value::Null).is_empty());
     }
 
+    fn test_plugin(id: &str, share_decrypted: bool) -> (Plugin, Receiver<Arc<str>>) {
+        let (tx, rx) = mpsc::sync_channel::<Arc<str>>(8);
+        let manifest = Manifest { id: id.into(), subscribe: vec![topic::CALL_CONCLUDED.into(), topic::AUDIO.into()], ..Default::default() };
+        let p = Plugin {
+            id: id.into(),
+            manifest,
+            exe: PathBuf::new(),
+            data_dir: PathBuf::new(),
+            hello: Mutex::new(Hello::default()),
+            tx: Mutex::new(Some(tx)),
+            child: Mutex::new(None),
+            dropped: AtomicU64::new(0),
+            last_drop_note: Mutex::new(None),
+            restarts: AtomicU64::new(0),
+            started: Mutex::new(None),
+            drained_at: Arc::new(Mutex::new(None)),
+            share_decrypted,
+            withheld_said: AtomicBool::new(false),
+            audio_held_said: AtomicBool::new(false),
+        };
+        (p, rx)
+    }
+
+    /// A decrypted call (or its live audio) reaches only the plugins allowed it; a clear one reaches all.
+    #[test]
+    fn a_decrypted_call_goes_only_to_the_plugins_allowed_it() {
+        let (allowed, local_rx) = test_plugin("rdioscanner", true);
+        let (public, public_rx) = test_plugin("openmhz", false);
+        let said = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = said.clone();
+        let sh = Shared {
+            plugins: vec![allowed, public],
+            stopping: AtomicBool::new(false),
+            go: Arc::new(AtomicBool::new(true)),
+            notes: Arc::new(move |n| {
+                if let Note::Log { plugin, text, .. } = n {
+                    log.lock().unwrap().push(format!("{plugin}: {text}"));
+                }
+            }),
+            hold: None,
+            answers: Default::default(),
+            requests: AtomicU64::new(0),
+            calls: None,
+        };
+        let msg: Arc<str> = "x\n".into();
+        let (clear, decrypted) = (About { system: "dcfd".into(), ..Default::default() }, About { system: "dcfd".into(), decrypted: true, ..Default::default() });
+        sh.dispatch(topic::CALL_CONCLUDED, &msg, &clear, None);
+        assert!(local_rx.try_recv().is_ok() && public_rx.try_recv().is_ok(), "a clear call goes to both");
+        sh.dispatch(topic::CALL_CONCLUDED, &msg, &decrypted, None);
+        sh.dispatch(topic::AUDIO, &msg, &decrypted, None);
+        sh.say_all_withheld(topic::CALL_CONCLUDED);
+        assert!(local_rx.try_recv().is_ok() && local_rx.try_recv().is_ok(), "the plugin that was allowed gets the call and its audio");
+        assert!(public_rx.try_recv().is_err(), "the public one gets neither");
+        // It is told once, with how to allow it, never the key.
+        let said = said.lock().unwrap();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("openmhz: is not given calls decrypted"), "{said:?}");
+    }
+
     /// What a system overrides of a plugin's settings, kept apart from its own.
     #[test]
     fn a_system_overrides_the_plugins_settings() {
@@ -791,6 +946,83 @@ mod tests {
         exe
     }
 
+    /// A plugin's `calls.query` is answered on its own queue, for its
+    /// request number, by what the host was given to answer with.
+    #[cfg(unix)]
+    #[test]
+    fn a_plugins_calls_query_is_answered() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("trunk-pro-host-calls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = r#"{"id":"asker","name":"Asker","version":"1.0.0","api":1,"subscribe":["call.concluded"]}"#;
+        let exe = dir.join("asker");
+        std::fs::write(&exe, format!("#!/bin/sh\nif [ \"$1\" = --describe ]; then echo '{manifest}'; exit 0; fi\nread line\necho '{{\"type\":\"ready\"}}'\necho '{{\"type\":\"calls.query\",\"request\":7,\"talkgroup\":101}}'\nwhile read l; do case \"$l\" in *'\"type\":\"calls\"'*) echo \"$l\" > answer.json;; esac; done\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = Spec { id: "asker".into(), copy: 0, exe, config: Value::Null, systems: BTreeMap::new(), data_dir: Some(dir.join("data")), share_decrypted: false };
+        let calls: Calls = Arc::new(|q| CallsPage { next: (q.talkgroup == Some(101)).then(|| "42:x".into()), ..Default::default() });
+        let mut host = PluginHost::start_when(vec![spec], &super::super::AudioSettings::default(), &[], &dir, Arc::new(|_| {}), Arc::new(AtomicBool::new(true)), None, Some(calls));
+        let answer = dir.join("data/answer.json");
+        let t0 = Instant::now();
+        while !answer.exists() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host.shutdown(Duration::from_secs(1));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&answer).expect("answered")).unwrap();
+        assert_eq!((v["request"].as_u64(), v["next"].as_str()), (Some(7), Some("42:x")), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin delayed for a talkgroup: that talkgroup's calls wait in the
+    /// hold (their live audio isn't sent), others go at once; once the delay
+    /// is lifted, what waited goes too.
+    #[cfg(unix)]
+    #[test]
+    fn a_delayed_talkgroup_waits_in_the_hold() {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("trunk-pro-host-delay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("taker");
+        let manifest = r#"{"id":"taker","name":"Taker","version":"1.0.0","api":1,"subscribe":["call.concluded","audio"]}"#;
+        std::fs::write(&exe, format!("#!/bin/sh\nif [ \"$1\" = --describe ]; then echo '{manifest}'; exit 0; fi\necho '{{\"type\":\"ready\"}}'\ncat >> got.jsonl\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hold = Hold::new(Arc::default());
+        let cfg = json!({ "systems": [{ "shortName": "dcfd", "pluginDelays": [{ "talkgroups": ["5"], "delayS": 3600 }] }] });
+        hold.set_delays(super::super::delay::Delays::of(&serde_json::from_value(cfg).unwrap()));
+        let systems = vec![SystemInfo { index: 0, short_name: "dcfd".into(), kind: "p25".into(), ..Default::default() }];
+        let spec = Spec { id: "taker".into(), copy: 0, exe, config: Value::Null, systems: BTreeMap::new(), data_dir: Some(dir.join("data")), share_decrypted: false };
+        let notes: Notes = Arc::new(|_| {});
+        let mut host = PluginHost::start_when(vec![spec], &super::super::AudioSettings::default(), &systems, &dir, notes, Arc::new(AtomicBool::new(true)), Some(hold.clone()), None);
+        hold.attach(Some(host.outlet()));
+        let call = |rel: &str, tg: u32| {
+            host.concluded(0, rel, CallRecord { talkgroup: tg, short_name: "dcfd".into(), ..Default::default() }, CallFiles::default(), false);
+        };
+        call("dcfd/held", 5);
+        call("dcfd/now", 6);
+        let mut frame = vec![2u8, 0, 0, 1, 0, 0, 0];
+        frame.extend(5u32.to_le_bytes());
+        frame.extend([0u8; 320]);
+        host.audio_frame(&frame, false);
+        let got = dir.join("data/got.jsonl");
+        let lines = || std::fs::read_to_string(&got).unwrap_or_default();
+        let t0 = Instant::now();
+        while !lines().contains("dcfd/now") && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(lines().contains("dcfd/now") && !lines().contains("dcfd/held"), "{}", lines());
+        assert!(!lines().contains("\"audio\""), "a delayed call's live audio isn't sent");
+        assert_eq!(hold.calls().get("taker"), Some(&1));
+        hold.set_delays(Default::default());
+        while !lines().contains("dcfd/held") && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host.shutdown(Duration::from_secs(1));
+        assert!(lines().contains("dcfd/held"), "it goes once the delay is lifted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Each system gets the plugin's settings with its overrides; a required
     /// one may come from the systems instead of the plugin's own settings.
     #[cfg(unix)]
@@ -812,6 +1044,7 @@ mod tests {
             config,
             systems: BTreeMap::from([("a".to_string(), a), ("b".to_string(), b)]),
             data_dir: Some(dir.join(data)),
+            share_decrypted: false,
         };
         let audio = super::super::AudioSettings::default();
 
@@ -836,6 +1069,88 @@ mod tests {
         assert!(host.is_empty());
         let said = notes_seen.lock().unwrap().iter().rev().find_map(|n| if let Note::State { message, .. } = n { Some(message.clone()) } else { None });
         assert_eq!(said.as_deref(), Some("not started: Server (for b) isn't set"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin that takes new settings as it runs is sent them (and starts
+    /// with them after a crash); settings leaving one it needs empty, or a
+    /// plugin that stopped over its settings, take a restart instead.
+    #[cfg(unix)]
+    #[test]
+    fn live_settings_reach_a_running_plugin() {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("trunk-pro-host-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // It keeps every line after its hello; with "stop" for a server, it stops over its settings.
+        let exe = dir.join("live");
+        let manifest = r#"{"id":"live","name":"Live","version":"1.0.0","api":1,"subscribe":["tone_pattern"],"live_settings":true,
+            "config":{"type":"object","properties":{"server":{"type":"string","title":"Server","x-required":true}}}}"#.replace('\n', " ");
+        std::fs::write(
+            &exe,
+            format!("#!/bin/sh\nif [ \"$1\" = --describe ]; then echo '{manifest}'; exit 0; fi\nread line\ncase \"$line\" in *stop*) exit 78;; esac\necho '{{\"type\":\"ready\"}}'\nwhile read l; do echo \"$l\" >> lines.jsonl; done\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let notes: Notes = Arc::new(|_| {});
+        let audio = super::super::AudioSettings::default();
+        let spec = |server: &str, data: &str| Spec {
+            id: "live".into(),
+            copy: 0,
+            exe: exe.clone(),
+            config: json!({ "server": server }),
+            systems: BTreeMap::new(),
+            data_dir: Some(dir.join(data)),
+            share_decrypted: false,
+        };
+        let wait = |cond: &dyn Fn() -> bool| {
+            let t0 = Instant::now();
+            while !cond() && t0.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let mut host = PluginHost::start(vec![spec("https://a", "on")], &audio, &[], &dir, notes.clone());
+        let lines = dir.join("on/lines.jsonl");
+        assert!(host.settle("live", &json!({ "server": "https://b" })));
+        wait(&|| std::fs::read_to_string(&lines).is_ok_and(|t| t.contains("https://b")));
+        let sent: Value = serde_json::from_str(std::fs::read_to_string(&lines).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!((sent["type"].as_str(), sent["config"]["server"].as_str()), (Some("settings"), Some("https://b")));
+        assert!(!host.settle("live", &json!({ "server": "" })), "a setting it needs left empty: restarted, to say so");
+        host.shutdown(Duration::from_secs(1));
+
+        // Stopped over its settings: only a restart starts it again.
+        let host = PluginHost::start(vec![spec("stop", "stopped")], &audio, &[], &dir, notes);
+        wait(&|| host.shared.plugins[0].tx.lock().unwrap().is_none());
+        assert!(!host.settle("live", &json!({ "server": "https://c" })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A button pressed: the plugin is handed it and its answer comes back to
+    /// whoever pressed it; one that isn't running, or doesn't answer, says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_button_pressed_waits_for_the_plugins_answer() {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("trunk-pro-host-action-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // It answers "test" with what it was given, and nothing else at all.
+        let exe = dir.join("act");
+        let manifest = r#"{"id":"act","name":"Act","version":"1.0.0","api":1,"subscribe":["tone_pattern"]}"#;
+        let answer = r#"r=$(echo "$l" | sed 's/.*"request":\([0-9]*\).*/\1/'); echo "{\"type\":\"action.result\",\"request\":$r,\"ok\":true,\"message\":\"sent to $(echo "$l" | sed 's/.*"to":"\([^"]*\)".*/\1/')\"}""#;
+        std::fs::write(&exe, format!("#!/bin/sh\nif [ \"$1\" = --describe ]; then echo '{manifest}'; exit 0; fi\nread line\necho '{{\"type\":\"ready\"}}'\nwhile read l; do case \"$l\" in *'\"action\":\"test\"'*) {answer};; esac; done\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = Spec { id: "act".into(), copy: 0, exe, config: Value::Null, systems: BTreeMap::new(), data_dir: Some(dir.join("data")), share_decrypted: false };
+        let mut host = PluginHost::start(vec![spec], &super::super::AudioSettings::default(), &[], &dir, Arc::new(|_| {}));
+        let wait = Duration::from_secs(5);
+        assert_eq!(host.action("act", "test".into(), json!({ "to": "discord" }), wait), Ok((true, "sent to discord".into())));
+        assert_eq!(host.action("act", "other".into(), json!({}), Duration::from_millis(200)), Err("No answer from the plugin".into()));
+        assert!(host.action("nope", "test".into(), json!({}), wait).is_err());
+        assert!(host.shared.answers.lock().unwrap().is_empty(), "nothing left waiting");
+        host.shutdown(Duration::from_secs(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

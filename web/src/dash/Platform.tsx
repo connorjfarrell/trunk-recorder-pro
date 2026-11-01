@@ -5,31 +5,30 @@
 // platform can't tell is listed, greyed, with why.
 
 import { useState } from "react";
-import type { PlatformInfo } from "../protocol.ts";
-import { useApp, useTopic, type StatsRange } from "../controller.ts";
+import type { ClockInfo, PlatformInfo, SeriesData } from "../protocol.ts";
+import { updateConfig, useApp, useTopic, type StatsRange } from "../controller.ts";
 import { Card, Choice, HeatStrip, LiveSpark, Meter, Ribbon, Stat, TimeSeries, type Level } from "../charts.tsx";
-import { ago, bytes, clockAt, dur, num, pct } from "../fmt.ts";
-import { platformHealth, total, useHistory } from "./data.ts";
-
-const RANGES: { v: StatsRange; label: string }[] = [
-  { v: "1h", label: "1 h" },
-  { v: "24h", label: "24 h" },
-  { v: "7d", label: "7 days" },
-];
+import { ago, bytes, clockAt, dur, ms, num, pct } from "../fmt.ts";
+import { platformHealth, total, useHistory, useRanges } from "./data.ts";
+import { Switch } from "../SetupLayout.tsx";
+import { StorageView } from "./Storage.tsx";
 
 const PRESSURE = ["normal", "warning", "critical"];
 
 export function PlatformPage() {
   const s = useApp();
   const [range, setRange] = useState<StatsRange>("24h");
+  const [part, setPart] = useState<"computer" | "storage">("computer");
+  const ranges = useRanges();
   useTopic("platform");
-  const hist = useHistory(["plat/cpu", "plat/proCpu", "plat/mem", "net/up", "net/rtt", "net/rx", "net/tx", "plat/temp"], range, 360);
+  const hist = useHistory(["plat/cpu", "plat/proCpu", "plat/mem", "net/up", "net/rtt", "net/rx", "net/tx", "plat/temp", "clock/offsetMs"], range, 360);
   const week = useHistory(["all/audioBytes"], "7d", 7);
   const h = s.host;
   if (!h) return <p className="empty">Waiting for the first sample…</p>;
   const v = h.values;
   const p = h.platform;
   const health = platformHealth(s);
+  const checks = s.config?.monitor?.networkChecks ?? true;
   const missing = (field: string) => p.unavailable.find((u) => u.field === field)?.why;
   const audioPerDay = (() => {
     const t = total(week?.["all/audioBytes"]);
@@ -40,8 +39,27 @@ export function PlatformPage() {
   const up = hist?.["net/up"];
   const upCells: (Level | null)[] = (up?.v ?? []).map((x, i) => (x === null ? null : (up!.lo[i] ?? x) >= 1 ? "ok" : x > 0 ? "warn" : "bad"));
   const downSteps = upCells.filter((c) => c === "warn" || c === "bad").length;
+  const store = p.store;
+  const parts = store && (
+    <div className="listen-tabs platform-tabs" role="tablist">
+      <button role="tab" aria-selected={part === "computer"} className={part === "computer" ? "on" : ""} onClick={() => setPart("computer")}>
+        Computer
+      </button>
+      <button role="tab" aria-selected={part === "storage"} className={part === "storage" ? "on" : ""} onClick={() => setPart("storage")}>
+        Storage
+      </button>
+    </div>
+  );
+  if (store && part === "storage")
+    return (
+      <div className="page">
+        {parts}
+        <StorageView store={store} />
+      </div>
+    );
   return (
     <div className="page">
+      {parts}
       {health.level !== "ok" && <p className={`why why-${health.level}`}>{health.why}</p>}
       <SpotlightNote spot={p.spotlight ?? null} />
       <div className="kpis">
@@ -88,7 +106,7 @@ export function PlatformPage() {
       <div className="row">
         <h2 className="section-title">Over time</h2>
         <span className="spacer" />
-        <Choice value={range} options={RANGES} onChange={setRange} label="Span" />
+        <Choice value={range} options={ranges} onChange={setRange} label="Span" />
       </div>
       <div className="columns">
         <Card title="CPU">
@@ -140,19 +158,24 @@ export function PlatformPage() {
                     <b>{spool ? "RAM spool" : d.name === "recordings" ? "Recordings" : "App data"}</b>
                     <span className="muted small mono">{d.path}</span>
                   </div>
-                  <Meter value={used} max={100} zones={spool ? [75, 90] : [90, 95]} label={`${d.name} disk used`} />
+                  <Meter value={d.missing ? null : used} max={100} zones={spool ? [75, 90] : [90, 95]} label={`${d.name} disk used`} />
                   <div className="kv small">
-                    <span>
-                      <b>{bytes(d.freeBytes)}</b> free of {bytes(d.totalBytes)}
-                    </span>
+                    {d.missing ? (
+                      <span className="bad">Gone: calls go to the recordings folder</span>
+                    ) : (
+                      <span>
+                        <b>{bytes(d.freeBytes)}</b> free of {bytes(d.totalBytes)}
+                      </span>
+                    )}
                     {spool ? (
                       <span title="Held in memory until plugins upload; overflows to disk.">
-                        {d.kind === "RAM disk" ? "a RAM disk" : d.kind === "tmpfs" ? "in /dev/shm" : "a folder of yours"} · calls waiting for upload
+                        {d.kind === "RAM disk" ? "a RAM disk" : d.kind === "tmpfs" ? "in /dev/shm" : d.kind === "service" ? "in the service's runtime folder" : "a folder of yours"} · calls waiting for upload
                       </span>
                     ) : (
                       <span>on {d.mount}</span>
                     )}
                     {spool && !!d.overflowed && <span className="warn">{d.overflowed} call{d.overflowed === 1 ? "" : "s"} overflowed to disk</span>}
+                    {spool && !!d.removed && <span className="warn">deleted {d.removed === 1 ? "once" : `${d.removed} times`} while running</span>}
                     {days !== null && (
                       <span className={days < 7 ? "warn" : ""} title="At last week's average, before M4A or clean-up">
                         About <b>{days > 365 ? "a year or more" : dur(days * 86400)}</b> of recordings left at {bytes(audioPerDay)} a day
@@ -165,8 +188,22 @@ export function PlatformPage() {
           </div>
         )}
       </Card>
-      <Card title="Network">
-        {upCells.length > 0 ? (
+      <Card
+        title="Network"
+        actions={
+          s.config && (
+            <Switch
+              label="Checks"
+              title="The internet checks (monitor.probeHosts) and the clock's time server (monitor.timeServer). Off: neither is asked."
+              checked={checks}
+              onChange={(on) => updateConfig((x) => void (x.monitor && (x.monitor.networkChecks = on)))}
+            />
+          )
+        }
+      >
+        {!checks ? (
+          <p className="empty">Checks off: the internet and the time server aren't asked (monitor.networkChecks).</p>
+        ) : upCells.length > 0 ? (
           <>
             <Ribbon cells={upCells} titles={(up?.v ?? []).map((x, i) => `${clockAt(up!.t0 + i * up!.stepS)}: ${x === null ? "no data" : x >= 1 ? "up" : `${Math.round((x ?? 0) * 100)}% of checks answered`}`)} h={18} label="internet reachability" />
             <p className="muted small">
@@ -218,6 +255,7 @@ export function PlatformPage() {
         )}
         {v["net/dns"] !== undefined && <p className="muted small">Name lookups take {num(v["net/dns"], 0)} ms.</p>}
       </Card>
+      <ClockCard c={p.clock} offsets={hist?.["clock/offsetMs"] ?? null} osMissing={missing("clockSynced")} checksOff={!checks} />
       <Card title="This computer">
         <div className="kv">
           <span>
@@ -290,5 +328,88 @@ function SpotlightNote({ spot }: { spot: PlatformInfo["spotlight"] }) {
       </div>
       {spot.state === "unknown" && <button onClick={note}>I've done it</button>}
     </div>
+  );
+}
+
+/** How far a clock is off, in words: "35 ms behind", "1.2 s ahead of" (positive: behind). */
+function offsetText(v: number): { by: string; way: string } {
+  return { by: ms(v), way: v > 0 ? "behind" : "ahead of" };
+}
+
+/**
+ * The clock: what the operating system says of it, and what the time server measured. The
+ * recorder decides what's wrong (`problem`); this only shows it.
+ */
+function ClockCard({ c, offsets, osMissing, checksOff }: { c: ClockInfo; offsets: SeriesData | null; osMissing?: string; checksOff?: boolean }) {
+  const m = c.measured;
+  const level: Level | undefined = c.problem?.level ?? (m?.current || c.os ? "ok" : undefined);
+  const off = m && offsetText(m.offsetMs);
+  return (
+    <Card title="Clock" level={level} why={c.problem?.why}>
+      <div className="src-grid">
+        <Stat
+          label="Offset, measured"
+          value={off ? off.by : "—"}
+          sub={
+            m
+              ? `${off!.way} ${c.server}, ${ago(m.at)}${m.current ? "" : " (too long ago to go by)"}`
+              : c.server
+                ? c.error ?? `asking ${c.server}…`
+                : checksOff
+                  ? "not asked: network checks are off"
+                  : "no time server set (monitor.timeServer)"
+          }
+          hint="This computer's clock less the time server's, from one SNTP query every 15 minutes. Measured here: no service reports it."
+        />
+        <Stat
+          label="Operating system"
+          value={c.os ? (c.os.synced ? "synchronized" : "not synchronized") : "—"}
+          level={c.os && !c.os.synced ? "warn" : undefined}
+          sub={c.os ? `within ${c.os.maxErrorMs >= 1000 ? `${num(c.os.maxErrorMs / 1000, 1)} s` : `${num(c.os.maxErrorMs, 0)} ms`} by its own account` : osMissing ?? "not read yet"}
+          hint="What the time service keeping the clock (chrony, systemd-timesyncd, ntpd, macOS) tells the kernel. Its error bound is loose."
+        />
+        <Stat label="Round trip" value={m ? num(m.delayMs, 0) : "—"} unit={m ? "ms" : undefined} sub={m ? `stratum ${m.stratum}` : undefined} hint="The query's round trip, less the server's own time: the offset is good to about half of it." />
+      </div>
+      {c.service && (
+        <p className="small">
+          Kept by <b>{c.service.name}</b>
+          {c.service.server ? <> from {c.service.server}</> : null}
+          {c.service.stratum ? `, stratum ${c.service.stratum}` : ""}
+          {c.service.lastSync ? `, last synchronized ${ago(c.service.lastSync)}` : ""}.
+        </p>
+      )}
+      {c.driftMs !== null && (
+        <p className={`small${c.problem?.cause === "recording" ? " warn" : ""}`} title="Calls are stamped by the clock as it was when recording started, carried on by a clock that never jumps: a correction since then doesn't reach them until the next Start.">
+          Calls are stamped by the clock as it was at Start:{" "}
+          {Math.abs(c.driftMs) < 1 ? "the same as the clock now" : `${offsetText(c.driftMs).by} ${offsetText(c.driftMs).way} the clock now`}.
+        </p>
+      )}
+      {c.radio.length > 0 && (
+        <>
+          <p className="small">The radio systems' own clocks, against the calls' time:</p>
+          <ul className="line-list small" aria-label="Radio systems' clocks">
+            {c.radio.map((r) => (
+              <li key={r.site}>
+                <b>{r.site}</b>
+                <span className="muted">
+                  {/* (offsetMs: the system's time less the calls': positive, the system's is ahead.) */}
+                  {r.sane ? ` ${ms(r.offsetMs)} ${r.offsetMs > 0 ? "ahead of" : "behind"} them` : " set to another time (its local time?): not compared"}
+                  {r.sane && !r.valid ? " (the system marks its time not valid: shown, not gone by)" : ""}, {ago(r.at)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <TimeSeries lines={[{ label: `This computer's clock against ${c.server ?? "the time server"}, ms (+: behind)`, color: "var(--series-1)", data: offsets }]} height={110} fmt={(x) => x.toFixed(0)} />
+      {c.check && c.check.fails > 0 && (
+        <p className="muted small">
+          {c.check.fails} of {c.check.tries} queries unanswered{c.error ? ` (last: ${c.error})` : ""}. Some networks block NTP (UDP port 123); the internet checks don't count it.
+        </p>
+      )}
+      <p className="muted small">
+        The recorder only watches the clock: the operating system's time service keeps it. A warning at {ms(c.warnMs)} off (monitor.clockWarnMs).
+      </p>
+    </Card>
   );
 }

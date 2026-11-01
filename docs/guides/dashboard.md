@@ -3,7 +3,7 @@
 The dashboard pages show how the recorder is doing: whether each system's control channel is
 decoding as usual, how well the radios hear the air, how clean the voice is, what the system is
 doing, and whether the computer and plugins are keeping up. This page goes through each one and
-what its numbers mean. For the frame around them, Setup and the Listen and Live pages, see
+what its numbers mean. For the frame around them, Setup and the Listen page, see
 [The web interface](interface.md).
 
 Most numbers come with a small chart of the last 10 minutes, and many pages have an **Over time**
@@ -118,7 +118,7 @@ Click a system's name for its own page, which adds:
 
 The system as heard. With several systems it first shows a card each (talkgroups and radios in
 24 hours, new talkgroups, talkgroups not in its file, the busiest talkgroups, what's on the air);
-**Open <system> ▸** goes to one. The **Span** is 24 hours or 7 days.
+clicking a system's card goes to it. The **Span** is 24 hours or 7 days.
 
 | Number | What it is |
 |---|---|
@@ -130,11 +130,18 @@ The system as heard. With several systems it first shows a card each (talkgroups
 
 **What happened to calls** splits the calls by what became of them: **Recorded**, **Followed
 only**, **Ignored**, **Encrypted**, **Not in the file**, **No recorder** and **Out of band**. The
-last two are calls you missed; see the reasons table on [the Live page](interface.md#active-calls).
+last two are calls you missed; see the reasons table under [Active calls](#active-calls).
 
-Then: **On the air now**, **Busiest … by hour**, **Who talks on what** (talkgroups and the
-busiest radios, linked by how often each radio talks on each), the **Talkgroups** table, the
-**Radios** table, and **Call lengths**.
+**Out of band** lists the frequencies those calls were granted on, in the span: how many calls,
+by hour, when the last was, and the nearest source with how far past the edge of its usable
+range each is (guard band left out). Move that source's centre toward them, widen its sample
+rate, or add a source. It shows when there are some; **Out of band** in **What happened to
+calls**, and a warning of calls out of band (on the Overview too), open it.
+
+Below the numbers: **Active calls** (see below), **What happened to calls** and **Call lengths**,
+**Busiest … by hour**, **Who talks on what** (talkgroups and the busiest radios, linked by how
+often each radio talks on each), the **Talkgroups** table, the **Radios** table, and at the
+bottom the **Control channel log**.
 
 The **Talkgroups** table can show **All**, **New**, **Unknown**, **Ignored** or **Encrypted** (more
 than half their calls encrypted), sorted by **Airtime**, **Calls**, **Latest** or **Newest**. The
@@ -143,6 +150,61 @@ it takes effect at once, even while recording. Click it again (**Ignored ✕**) 
 
 Click a talkgroup or a radio anywhere for its own page: its last 7 days, who talks on it (or what
 it talks on), what's affiliated with it, and its latest transmissions.
+
+### Active calls
+
+Near the top of a system's page: every call of that system on the air now, recording ones first. It
+replaces the small "On the air now" card, and the old Live page (`#/live` and `#/calls` links open
+the Radio system page).
+
+| Column | What it shows |
+|---|---|
+| **Talkgroup** | Its number and name (click it for the talkgroup's page), `EMERG` for an emergency call, what it's patched with, `· <site>` for a call heard on another site of the system, and `also on …` when the same call is on other sites (the best copy is saved) |
+| **Freq, MHz** | The voice channel, with `s0`/`s1` for a TDMA slot, `FM` (and its tone) for analog, `NXDN48`/`NXDN96` and the RAN for NXDN |
+| **Source** | The radio talking now: its name or talker alias when known, else its unit ID. Click it for the radio's page. |
+| **Time** | How long the call has gone on |
+| **State** | `recording`, `recording (encrypted)`, or why it isn't being recorded |
+| (button) | **Listen** plays just that talkgroup |
+
+The reasons a call isn't recorded:
+
+| State | Why | What to do |
+|---|---|---|
+| `encrypted — not recorded` | The call is encrypted and encrypted calls are off | Nothing: encrypted audio can't be decoded |
+| `outside tuned range` | No source covers its voice frequency | Move a source's centre, or add a source. See [Radios](radios.md). |
+| `no free recorder` | Every recorder is busy | Raise **Recorders** in Setup → Recording |
+| `not in talkgroup list` | It's not in the talkgroup file and **Talkgroups not in the talkgroup file** is off | Add it, or turn that on in Call rules |
+| `ignored (talkgroup list)` | It's set to Ignore in the talkgroup file | Un-ignore it on the Radio system page |
+| `monitoring` | Followed, not recorded, for another reason | |
+
+### Listening live
+
+Tick **Listen live** to hear that system's calls as they're decoded, like a scanner. It stays on
+one call until that call has been quiet for 2 seconds, then takes the next one. The line under the
+heading shows what's playing (`▶ TG 3747 · <radio>`).
+
+- Live audio is one system at a time: on another system's page it says "Listening to <system>".
+- Turning on Listen's **Live feed** turns **Listen live** off, and the other way round (one sound
+  at a time).
+- The **Listen** button on a recording call plays only that talkgroup. A button then appears
+  next to **Listen live** (`TG 3747 only ✕`); click it to go back to everything.
+- Only calls being recorded can be heard.
+- The audio comes from the recorder over the same connection as the rest of the page, so it works
+  from another machine too.
+- Safari can pause the audio when you switch tabs or audio devices; a click or key press anywhere
+  on the page starts it again.
+
+### Control channel log
+
+At the bottom of a system's page, collapsed. Click **Control channel log** to open it. It shows that
+system's last 150 control channel messages as they arrive, newest first (a site's name in brackets
+for a system with several sites): grants, updates, patches, the system's identity, neighbouring
+sites, talker aliases, protocol notes (such as a DMR site's colour code and kind), plugin notes and
+errors. Tick **Show unit activity** to also see affiliations, registrations and the like.
+
+The log is only made while it's open, because turning every control message into a line costs
+the recorder some work. This is not the same as the app's log file: see
+[Log levels and log files](../troubleshooting.md#where-is-the-log).
 
 ## Plugins
 
@@ -154,13 +216,16 @@ The **Health** tab has a card for each plugin that's on (**Install & settings** 
 | **Sent** | Calls it handled this run, and how many it skipped |
 | **Failed** | Calls it failed on, as a share of tries. Hover for the last failure. |
 | **Waiting** | Calls queued for it (amber over 20), and how many are waiting to retry |
-| **Upload time** | How long its uploads take, and how much it has sent |
+| **Age at delivery** | How long after a call ended the plugin finished with it, over the last 5 minutes (or the hour, when nothing was delivered in the last 5), and its parts: **held** by your delay rules, **waiting** (the call's files being finished, the plugin's queue, failed tries) and the plugin's own **upload**. Then the hour's longest. A plugin built before SDK 0.6 doesn't say its upload time, so only the age shows. All by this computer's clock: no service reports it. |
 
-Under them: a bar per minute for the last hour (sent, skipped, failed), each service the plugin
+Under them: how much it has sent this run, a bar per minute for the last hour (sent, skipped, failed), each service the plugin
 talks to with its state, any figures of its own the plugin reports (simplestream's packets sent and
 dropped, for example), and when it last succeeded and failed. **Restarted N×** means the plugin
 crashed and was restarted; **Fell behind N events** means it was too slow to take events and some
-were dropped. **Last 24 h and log ▾** shows its history and recent log lines.
+were dropped. **Last 24 h and log ▾** shows its history (the age at delivery among it) and recent log lines.
+
+The age at delivery is local, so it's only as right as this computer's clock: see [Clock](#clock).
+A call recorded while the clock was off says so in its JSON (`"clock_off": true`).
 
 A service shows as down after 3 failures in a row, or 5 minutes without a success.
 
@@ -181,6 +246,48 @@ The computer the recorder runs on, recording or not:
 the spool, and **About … of recordings left** at last week's daily average. **Network** shows each
 internet check (`monitor.probeHosts`, by default `1.1.1.1:443` and `dns.google:443`), and **This
 computer** the system, cores, uptime and anything the platform can't measure.
+
+### Clock
+
+Call times come from this computer's clock. Calls from several recorders are matched by their
+times, and services such as Broadcastify Calls go by them, so the clock is worth watching. The
+recorder only watches it: the operating system's time service (chrony, systemd-timesyncd, ntpd,
+macOS) keeps it. Nothing extra needs installing, and nothing runs with privileges.
+
+| Number | What it is |
+|---|---|
+| **Offset, measured** | This clock less the time server's (`monitor.timeServer`, by default `pool.ntp.org`), from one SNTP query every 15 minutes, and whether this clock is behind or ahead. It's measured here, so it's right whatever the time service says. |
+| **Operating system** | Whether the time service tells the kernel the clock is synchronized, and its own bound on the error. The bound is loose: a synchronized clock often claims hundreds of milliseconds. Linux and macOS; on Windows only the offset is measured. In a container this is the host's clock, which the container shares. |
+| **Round trip** | The query's round trip. The offset is good to about half of it. |
+
+Under them, when they're known:
+- **Kept by…**: the time service and the server it follows, its stratum and when it last
+  synchronized (Linux: chrony or systemd-timesyncd).
+- **Calls are stamped by the clock as it was at Start**: while recording. Calls are stamped by the
+  clock as it was when recording started, carried on by a clock that never jumps, so a call's times
+  never go backwards. A correction the time service makes after Start reaches them only at the
+  next Start: this line says how far apart the two are now.
+- **The radio systems' clocks**: P25 systems (Phase 2) broadcast their own time, to 7.5 ms,
+  usually from GPS. Each site's line says how far its system's clock is ahead of or behind the
+  calls' time ("3.0 s behind them": the system's clock is three seconds slow). Times are in ms under
+  a second, then seconds. Some systems mark their time not valid, and those can be seconds off
+  (or right, as DCFD's is): they're shown, not gone by. A system set to its local time is off by
+  hours and isn't compared.
+
+The chart shows this computer's clock against the time server over time, in ms. The Platform light turns amber, with an event, when call
+times are off by `monitor.clockWarnMs` (250 ms) or more, or the operating system says the clock
+isn't synchronized; red at 5 s. What's judged is the clock calls are stamped by:
+- measured against the time server, as the clock now plus how far it has moved since Start;
+- without an answer from the time server, against the radio systems that vouch for their time
+  (offline recorders).
+
+A measurement over an hour old isn't counted. A jump of the clock (its time service setting it, or
+the computer sleeping) is an event of its own. Some networks block NTP (UDP port 123): then nothing
+is measured, the card says the queries go unanswered, and the internet checks don't count it.
+Pointing `monitor.timeServer` at a server inside your network (often your router) can help.
+
+The offset is local: nothing Broadcastify or another service reports. Broadcastify Calls doesn't
+report how far off a recorder's clock is.
 
 On macOS, if Spotlight is indexing the recordings folder, a note at the top explains how to
 exclude it. See [Troubleshooting](../troubleshooting.md#spotlight).

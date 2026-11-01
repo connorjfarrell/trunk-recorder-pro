@@ -3,14 +3,16 @@
 // affiliated with and who they talk with — and, for one talkgroup or one
 // radio, its week and its connections.
 
-import { useMemo, useState } from "react";
-import { systemColor } from "../config.ts";
-import { radioQuery, setTalkgroupIgnore, setView, usePolled, useApp, type AppState } from "../controller.ts";
-import { Bipartite, Card, Choice, Heatmap, HeatStrip, Histogram, Light, RadialEgo, Stat, type Node } from "../charts.tsx";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { formatMhz, systemColor } from "../config.ts";
+import { callsQuery, radioQuery, setTalkgroupIgnore, setView, usePolled, useApp, type AppState } from "../controller.ts";
+import { BackBar, Bipartite, Card, Choice, Heatmap, HeatStrip, Histogram, Light, RadialEgo, Stat, SystemTag, type Node } from "../charts.tsx";
 import { ago, clockAt, compact, dur, hmm, num } from "../fmt.ts";
-import type { CipherSeen, LengthHistogram, RadioResult, TgRow, UnitRow } from "../protocol.ts";
-import { aliasOf } from "./Calls.tsx";
-import { dashSystems, K, KIND_LABEL, running, total, useHistory, type DashSystem } from "./data.ts";
+import type { CallEntry, CipherSeen, LengthHistogram, OutOfBandRow, RadioResult, TgRow, UnitRow } from "../protocol.ts";
+import { playable, playNow } from "../listen.ts";
+import { ActiveCalls, aliasOf, Log } from "./Calls.tsx";
+import { Tones } from "./Tones.tsx";
+import { coverage, dashSystems, goTo, K, KIND_LABEL, OUT_OF_BAND, running, systemRadioHealth, total, useHistory, type DashSystem, type Health } from "./data.ts";
 
 type Hours = "24" | "168";
 const HOURS: { v: Hours; label: string }[] = [
@@ -18,15 +20,15 @@ const HOURS: { v: Hours; label: string }[] = [
   { v: "168", label: "7 days" },
 ];
 
-/** Why calls weren't recorded (and were), in the order shown. */
-const REASONS: { k: string; label: string; color: string; hint: string }[] = [
+/** Why calls weren't recorded (and were), in the order shown; `at`: the part of the system's page listing them. */
+const REASONS: { k: string; label: string; color: string; hint: string; at?: string }[] = [
   { k: "recorded", label: "Recorded", color: "var(--series-1)", hint: "" },
   { k: "monitored", label: "Followed only", color: "var(--series-3)", hint: "Followed, not recorded" },
   { k: "ignored", label: "Ignored", color: "var(--muted-mark)", hint: "Set to Ignore in the talkgroup file" },
-  { k: "encrypted", label: "Encrypted", color: "var(--series-7)", hint: "Encrypted calls are off" },
+  { k: "encrypted", label: "Encrypted", color: "var(--series-6)", hint: "Encrypted calls are off" },
   { k: "unknown_tg", label: "Not in the file", color: "var(--series-4)", hint: "Unknown talkgroups are off" },
   { k: "no_recorder", label: "No recorder", color: "var(--critical)", hint: "All recorders busy" },
-  { k: "no_source", label: "Out of band", color: "var(--serious)", hint: "No source covers the frequency" },
+  { k: "no_source", label: "Out of band", color: "var(--serious)", hint: "No source covers the frequency: which ones", at: OUT_OF_BAND },
 ];
 
 const hourLabel = (hours: number) => (i: number) => {
@@ -62,12 +64,12 @@ function IgnoreToggle({ sys, r }: { sys: DashSystem; r: TgRow }) {
 
 // ── the system ───────────────────────────────────────────────────────────────
 
-function Reasons({ name, range }: { name: string; range: "24h" | "7d" }) {
+function Reasons({ name, range, health }: { name: string; range: "24h" | "7d"; health: Health }) {
   const hist = useHistory(REASONS.map((r) => K.sys(name, `why/${r.k}`)), range, 48);
   const counts = REASONS.map((r) => Math.round(total(hist?.[K.sys(name, `why/${r.k}`)]) ?? 0));
   const sum = counts.reduce((a, b) => a + b, 0);
   return (
-    <Card title="What happened to calls">
+    <Card title="What happened to calls" level={health.level} why={health.why} onWhy={goTo(health)}>
       {sum === 0 ? (
         <p className="empty">No calls yet.</p>
       ) : (
@@ -80,9 +82,9 @@ function Reasons({ name, range }: { name: string; range: "24h" | "7d" }) {
           <ul className="legend-list">
             {REASONS.map((r, i) =>
               counts[i] > 0 ? (
-                <li key={r.k} title={r.hint}>
+                <li key={r.k} title={r.hint} className={r.at ? "opens" : undefined} onClick={r.at ? () => setView("radio", name, r.at!) : undefined}>
                   <i style={{ background: r.color }} />
-                  {r.label}
+                  {r.at ? <button className="linkish">{r.label} →</button> : r.label}
                   <b>{compact(counts[i])}</b>
                   <span className="muted">{Math.round((100 * counts[i]) / sum)}%</span>
                 </li>
@@ -90,35 +92,6 @@ function Reasons({ name, range }: { name: string; range: "24h" | "7d" }) {
             )}
           </ul>
         </>
-      )}
-    </Card>
-  );
-}
-
-function ActiveNow({ s, sys }: { s: AppState; sys: DashSystem }) {
-  const calls = s.calls.filter((c) => c.systemName === sys.name);
-  return (
-    <Card title="On the air now">
-      {calls.length === 0 ? (
-        <p className="empty">Quiet.</p>
-      ) : (
-        <ul className="air">
-          {calls.map((c) => (
-            <li key={c.id}>
-              <button className="linkish" onClick={() => setView("radio", sys.name, "tg", c.talkgroup)}>
-                <span className={`dot dot-${c.state}${c.encrypted ? " dot-enc" : ""}`} />
-                <TgName r={{ tg: c.talkgroup, alphaTag: c.alphaTag }} />
-              </button>
-              <span className="row">
-                {[...new Set(c.sources)].slice(-4).map((u) => (
-                  <button key={u} className="chip" onClick={() => setView("radio", sys.name, "unit", u)}>
-                    {aliasOf(s, sys.name, u) ?? u}
-                  </button>
-                ))}
-              </span>
-            </li>
-          ))}
-        </ul>
       )}
     </Card>
   );
@@ -296,7 +269,65 @@ function Lengths({ h }: { h: LengthHistogram | undefined }) {
   );
 }
 
-function SystemView({ s, sys }: { s: AppState; sys: DashSystem }) {
+/**
+ * The frequencies granted that no source covered, in the span: how often,
+ * when last, and the nearest source with how far past its usable edge each
+ * is. Shown when there are some, or when asked for (`focus`: scrolled to).
+ */
+function OutOfBand({ s, sys, rows, hours, focus }: { s: AppState; sys: DashSystem; rows: OutOfBandRow[]; hours: number; focus: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (focus) ref.current?.scrollIntoView({ block: "start" });
+  }, [focus]);
+  if (!rows.length && !focus) return null;
+  const n = rows.reduce((a, r) => a + r.calls, 0);
+  return (
+    <div ref={ref}>
+      <Card title={`Out of band (${rows.length})`} actions={rows.length > 0 && <span className="muted small">{compact(n)} calls missed</span>}>
+        {rows.length === 0 ? (
+          <p className="empty">None in the last {hours === 24 ? "24 hours" : "7 days"}: every frequency granted was in a source's band.</p>
+        ) : (
+          <>
+            <p className="muted small">
+              Calls granted on these frequencies weren't recorded: no source covers them. Move a source's centre toward them, widen its sample rate, or add a source.
+            </p>
+            <div className="table-wrap">
+              <table className="calls">
+                <thead>
+                  <tr>
+                    <th>MHz</th>
+                    <th>Calls</th>
+                    <th>By hour</th>
+                    <th>Last</th>
+                    <th>Nearest source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => {
+                    const c = coverage(s, r.freqHz);
+                    return (
+                      <tr key={r.freqHz}>
+                        <td className="mono">{formatMhz(r.freqHz)}</td>
+                        <td className="mono" title={`${r.totalCalls} all told`}>{r.calls}</td>
+                        <td className="spark-cell">
+                          <HeatStrip v={r.hourly} titles={r.hourly.map((v, i) => `${hourLabel(hours)(i)}: ${v} calls`)} />
+                        </td>
+                        <td className="small">{ago(r.last)}</td>
+                        <td className="small">{!c ? "—" : c.beyondHz > 0 ? `${c.src.label}: ${c.beyondHz >= 1e6 ? `${num(c.beyondHz / 1e6, 2)} MHz` : `${num(c.beyondHz / 1000, 1)} kHz`} past its usable edge` : `${c.src.label} (covers it now)`}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function SystemView({ s, sys, focus }: { s: AppState; sys: DashSystem; focus?: string }) {
   const [hours, setHours] = useState<Hours>("24");
   const h = Number(hours);
   const live = running(s);
@@ -305,6 +336,7 @@ function SystemView({ s, sys }: { s: AppState; sys: DashSystem }) {
   const unitsR = usePolled(`units:${sys.name}:${hours}`, () => radioQuery({ what: "units", system: sys.name, hours: h, limit: 1000 }), every);
   const sumR = usePolled(`sum:${sys.name}`, () => radioQuery({ what: "summary" }), every * 2);
   const lenR = usePolled(`len:${sys.name}:${hours}`, () => radioQuery({ what: "lengths", system: sys.name, hours: h }), every * 2);
+  const freqsR = usePolled(`oob:${sys.name}:${hours}`, () => radioQuery({ what: "freqs", system: sys.name, hours: h }), every * 2);
   const tgs = (tgsR?.rows ?? []) as TgRow[];
   const units = (unitsR?.rows ?? []) as UnitRow[];
   const summary = sumR?.systems?.[sys.name];
@@ -332,10 +364,12 @@ function SystemView({ s, sys }: { s: AppState; sys: DashSystem }) {
         />
         <Stat label="Unknown" value={summary ? summary.unknownTgs24h : "—"} sub="not in the talkgroup file" />
       </div>
+      <ActiveCalls s={s} system={sys.name} />
       <div className="columns">
-        <Reasons name={sys.name} range={hours === "24" ? "24h" : "7d"} />
-        <ActiveNow s={s} sys={sys} />
+        <Reasons name={sys.name} range={hours === "24" ? "24h" : "7d"} health={systemRadioHealth(s, sys)} />
+        <Lengths h={lenR?.histogram} />
       </div>
+      <OutOfBand s={s} sys={sys} rows={freqsR?.outOfBand ?? []} hours={h} focus={focus === OUT_OF_BAND} />
       {busy.length > 0 && (
         <Card title={`Busiest ${busy.length} by hour`}>
           <Heatmap
@@ -348,10 +382,9 @@ function SystemView({ s, sys }: { s: AppState; sys: DashSystem }) {
       )}
       <Network s={s} sys={sys} tgs={tgs} units={units} />
       <Talkgroups sys={sys} rows={tgs} hours={h} />
-      <div className="columns">
-        <Units s={s} sys={sys} rows={units} total={unitsR?.total ?? units.length} />
-        <Lengths h={lenR?.histogram} />
-      </div>
+      <Units s={s} sys={sys} rows={units} total={unitsR?.total ?? units.length} />
+      <Log s={s} system={sys.name} />
+      <Tones s={s} sys={sys} hours={h} />
     </div>
   );
 }
@@ -378,11 +411,6 @@ function TgView({ s, sys, tg }: { s: AppState; sys: DashSystem; tg: number }) {
   const maxN = Math.max(1, ...talkers.map((t) => t.n));
   return (
     <div className="stack">
-      <div className="row">
-        <button className="btn ghost small" onClick={() => setView("radio", sys.name)}>
-          ← {sys.name}
-        </button>
-      </div>
       <section className="hero">
         <div>
           <h2 className="big">{row.alphaTag || `Talkgroup ${tg}`}</h2>
@@ -412,8 +440,8 @@ function TgView({ s, sys, tg }: { s: AppState; sys: DashSystem; tg: number }) {
           ) : (
             <ul className="barlist">
               {talkers.map((t) => (
-                <li key={t.unit}>
-                  <button className="linkish" onClick={() => setView("radio", sys.name, "unit", t.unit)}>
+                <li key={t.unit} className="opens" onClick={() => setView("radio", sys.name, "unit", t.unit)}>
+                  <button className="linkish">
                     {aliasOf(s, sys.name, t.unit) ?? (t.alias || t.unit)}
                   </button>
                   <span className="bar" style={{ width: `${(t.n / maxN) * 100}%` }} />
@@ -426,6 +454,7 @@ function TgView({ s, sys, tg }: { s: AppState; sys: DashSystem; tg: number }) {
         <div className="stack">
           <Lengths h={r.lengths} />
           {row.ciphers.length > 0 && <Ciphers ciphers={row.ciphers} />}
+          <CallsCard sys={sys} talkgroup={tg} />
           <Card title="Affiliated with it">
             {(r.affiliated ?? []).length === 0 ? (
               <p className="empty">None right now.</p>
@@ -442,6 +471,67 @@ function TgView({ s, sys, tg }: { s: AppState; sys: DashSystem; tg: number }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** Calls a page of the Calls card asks for. */
+const CALLS_PAGE = 25;
+
+/**
+ * A talkgroup's or a radio's recorded calls, newest first, a page at a time
+ * (`callsQuery`: the call store on the desktop app, as far back as it keeps
+ * them; the browser build, its own list). Each plays from here.
+ */
+function CallsCard({ sys, talkgroup, unit }: { sys: DashSystem; talkgroup?: number; unit?: number }) {
+  const [page, setPage] = useState<{ entries: CallEntry[]; next?: string; error?: string } | null>(null);
+  const ask = (cursor?: string) => callsQuery({ system: sys.name, talkgroup, unit, ...(cursor ? { cursor } : {}), limit: CALLS_PAGE });
+  useEffect(() => {
+    let live = true;
+    setPage(null);
+    void ask().then((r) => live && setPage({ entries: r.entries ?? [], next: r.next, error: r.error }));
+    return () => {
+      live = false;
+    };
+  }, [sys.name, talkgroup, unit]);
+  const older = () => {
+    if (!page?.next) return;
+    void ask(page.next).then((r) => setPage((p) => p && { entries: [...p.entries, ...(r.entries ?? [])], next: r.next, error: r.error }));
+  };
+  return (
+    <Card title="Calls">
+      {!page ? (
+        <p className="empty">Loading…</p>
+      ) : page.entries.length === 0 ? (
+        <p className="empty">No recorded calls.</p>
+      ) : (
+        <ul className="timeline">
+          {page.entries.map((c) => (
+            <li key={c.path}>
+              <span className="muted small">{clockAt(c.record.start_time_ms / 1000, true)}</span>
+              {unit !== undefined ? (
+                <button className="linkish" onClick={() => setView("radio", sys.name, "tg", c.record.talkgroup)}>
+                  {c.record.talkgroup_tag || c.record.talkgroup}
+                </button>
+              ) : (
+                <span className="small">{(c.record.srcList ?? []).length} talking</span>
+              )}
+              <span className="mono small">{num(c.record.call_length, 0)} s</span>
+              {playable(c) && (
+                <button className="btn ghost small" onClick={() => playNow(c)}>
+                  Play
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {page?.error && <p className="small muted">{page.error}</p>}
+      {page?.next && (
+        <button className="btn ghost small" onClick={older}>
+          Load older
+        </button>
+      )}
+    </Card>
   );
 }
 
@@ -493,11 +583,6 @@ function UnitView({ s, sys, unit }: { s: AppState; sys: DashSystem; unit: number
   const affTag = row.aff !== null ? (tgs.find((t) => t.tg === row.aff)?.alphaTag ?? "") : "";
   return (
     <div className="stack">
-      <div className="row">
-        <button className="btn ghost small" onClick={() => setView("radio", sys.name)}>
-          ← {sys.name}
-        </button>
-      </div>
       <section className="hero">
         <div>
           <h2 className="big">{alias || `Radio ${unit}`}</h2>
@@ -546,6 +631,7 @@ function UnitView({ s, sys, unit }: { s: AppState; sys: DashSystem; unit: number
               ))}
             </ul>
           </Card>
+          <CallsCard sys={sys} unit={unit} />
           <Card title="Affiliations">
             {(r.affiliations ?? []).length === 0 ? (
               <p className="empty">None heard.</p>
@@ -570,10 +656,13 @@ function UnitView({ s, sys, unit }: { s: AppState; sys: DashSystem; unit: number
 
 // ── the page ─────────────────────────────────────────────────────────────────
 
-/** Which system a page is about: its colour, name, kind and site, and the way back to all of them. */
-function SystemHeader({ s, sys, multi }: { s: AppState; sys: DashSystem; multi: boolean }) {
-  const id = sys.status?.identity;
-  const site = id && (id.sysId != null || id.site != null) ? [id.sysId != null ? `SysID ${id.sysId.toString(16).toUpperCase()}` : "", id.site != null ? `site ${id.rfss ?? "?"}-${id.site}` : ""].filter(Boolean).join(" · ") : "";
+/** Which system a page is about: its colour, name, kind and site. */
+function SystemHeader({ s, sys }: { s: AppState; sys: DashSystem }) {
+  // Its sites as their control channels say: "SysID 1A2 · site 1-3", or "SysID 1A2 · sites 1-3, 1-4".
+  const ids = sys.sites.flatMap((x) => (x.status ? [x.status.identity] : []));
+  const sysId = ids.find((i) => i.sysId != null)?.sysId;
+  const numbers = ids.filter((i) => i.site != null).map((i) => `${i.rfss ?? "?"}-${i.site}`);
+  const site = [sysId != null ? `SysID ${sysId.toString(16).toUpperCase()}` : "", numbers.length ? `site${numbers.length > 1 ? "s" : ""} ${numbers.join(", ")}` : ""].filter(Boolean).join(" · ");
   return (
     <div className="sys-header" style={{ borderLeftColor: systemColor(s.config, sys.name) }}>
       <div>
@@ -583,11 +672,6 @@ function SystemHeader({ s, sys, multi }: { s: AppState; sys: DashSystem; multi: 
           {site ? ` · ${site}` : ""}
         </p>
       </div>
-      {multi && (
-        <button className="btn ghost small" onClick={() => setView("radio")}>
-          All systems
-        </button>
-      )}
     </div>
   );
 }
@@ -604,16 +688,15 @@ function AllSystems({ s, systems }: { s: AppState; systems: DashSystem[] }) {
         const sm = sum?.systems?.[x.name];
         const top = (tops?.[i]?.rows ?? []) as TgRow[];
         const onAir = s.calls.filter((c) => c.systemName === x.name);
+        const h = systemRadioHealth(s, x);
         return (
           <Card
             key={x.name}
             className="sys-section"
-            title={
-              <span className="row">
-                <span className="sys-dot" style={{ background: systemColor(s.config, x.name) }} />
-                {x.name}
-              </span>
-            }
+            level={h.level}
+            why={h.why}
+            onWhy={goTo(h)}
+            title={<SystemTag config={s.config} name={x.name} />}
             onTitle={() => setView("radio", x.name)}
             actions={<span className="badge-kind">{KIND_LABEL[x.kind]}</span>}
           >
@@ -638,8 +721,8 @@ function AllSystems({ s, systems }: { s: AppState; systems: DashSystem[] }) {
             {top.length > 0 ? (
               <ul className="barlist">
                 {top.map((r) => (
-                  <li key={r.tg}>
-                    <button className="linkish" onClick={() => setView("radio", x.name, "tg", r.tg)}>
+                  <li key={r.tg} className="opens" onClick={() => setView("radio", x.name, "tg", r.tg)}>
+                    <button className="linkish">
                       <TgName r={r} />
                     </button>
                     <span className="bar" style={{ width: `${(r.secs / Math.max(1, top[0].secs)) * 100}%`, background: systemColor(s.config, x.name) }} />
@@ -666,9 +749,6 @@ function AllSystems({ s, systems }: { s: AppState; systems: DashSystem[] }) {
                 {sm.newTgs.length > 6 ? "…" : ""}
               </p>
             )}
-            <button className="card-more" onClick={() => setView("radio", x.name)}>
-              Open {x.name} ▸
-            </button>
           </Card>
         );
       })}
@@ -698,25 +778,35 @@ export function RadioPage() {
   const sys = systems.find((x) => x.name === name);
   if (!sys) return <p className="empty">No system called {name}.</p>;
   const [, what, key] = s.path;
+  // The other systems, beside the way back to them all (as Decode's sites are).
+  const picker = multi && (
+    <div className="filter-row" role="tablist" aria-label="System">
+      {systems.map((x) => (
+        <button key={x.name} className={`btn ghost small${x.name === sys.name ? " on" : ""}`} onClick={() => setView("radio", x.name)}>
+          <SystemTag config={s.config} name={x.name} health={systemRadioHealth(s, x)} />
+        </button>
+      ))}
+    </div>
+  );
   return (
     <div className="page">
-      <SystemHeader s={s} sys={sys} multi={multi} />
-      {multi && (
-        <div className="filter-row" role="tablist" aria-label="System">
-          {systems.map((x) => (
-            <button key={x.name} className={`btn ghost small${x.name === sys.name ? " on" : ""}`} onClick={() => setView("radio", x.name)}>
-              <span className="sys-dot" style={{ background: systemColor(s.config, x.name) }} />
-              {x.name}
-            </button>
-          ))}
-        </div>
+      {/* (A talkgroup's or radio's page goes back to its system; a system's, with others, to them all.) */}
+      {what && key ? (
+        <BackBar to={sys.name} onBack={() => setView("radio", sys.name)} />
+      ) : (
+        multi && (
+          <BackBar to="All systems" onBack={() => setView("radio")}>
+            {picker}
+          </BackBar>
+        )
       )}
+      <SystemHeader s={s} sys={sys} />
       {!running(s) && (
         <p className="muted small">
           <Light level="idle" /> Not recording — showing past data.
         </p>
       )}
-      {what === "tg" && key ? <TgView s={s} sys={sys} tg={Number(key)} /> : what === "unit" && key ? <UnitView s={s} sys={sys} unit={Number(key)} /> : <SystemView s={s} sys={sys} />}
+      {what === "tg" && key ? <TgView s={s} sys={sys} tg={Number(key)} /> : what === "unit" && key ? <UnitView s={s} sys={sys} unit={Number(key)} /> : <SystemView s={s} sys={sys} focus={what} />}
     </div>
   );
 }

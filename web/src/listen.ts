@@ -2,10 +2,13 @@
 // conclude (the live feed), filtered by the systems and talkgroups chosen,
 // with hold, avoid, pause, replay and skip. It all happens in this page: the
 // recorder only sends each call as it concludes, and older ones when asked.
-// Playback lives here, not in the page, so it goes on in other tabs.
+// Playback lives here, not in the page, so it goes on in other tabs. A call
+// heard on several sites of a system is its system's, whichever site's copy
+// was kept.
 
 import { useRef, useSyncExternalStore } from "react";
-import { onRecorderMessage, setListen, shallowEqual, snapshot, subscribe, transport } from "./controller.ts";
+import { callsQuery, onRecorderMessage, setListen, shallowEqual, snapshot, subscribe, transport } from "./controller.ts";
+import { migrateSelection } from "./migrate.ts";
 import type { CallEntry } from "./protocol.ts";
 
 /** What to hear, kept in this browser. Talkgroups are `<system>:<talkgroup>`. */
@@ -35,9 +38,10 @@ export interface ListenState {
   missed: number;
   /** Every call known, newest first: as they conclude, and older ones loaded. */
   calls: CallEntry[];
-  /** Loading older calls; whether there are older ones still (null: not asked yet). */
+  /** Loading older calls; whether there are older ones still (null: not asked yet), and where they go on from. */
   loadingOlder: boolean;
   moreOlder: boolean | null;
+  olderCursor: string | null;
   sel: Selection;
 }
 
@@ -48,19 +52,25 @@ const CALLS_MAX = 5000;
 export const OLDER_PAGE = 200;
 
 function loadSelection(): Selection {
-  const none: Selection = { offSystems: [], offTalkgroups: [], hold: null, avoid: {} };
   try {
-    const v = JSON.parse(localStorage.getItem(SEL_KEY) ?? "null") as Partial<Selection> | null;
-    if (!v || typeof v !== "object") return none;
-    return {
-      offSystems: Array.isArray(v.offSystems) ? v.offSystems.filter((x) => typeof x === "string") : [],
-      offTalkgroups: Array.isArray(v.offTalkgroups) ? v.offTalkgroups.filter((x) => typeof x === "string") : [],
-      hold: v.hold && typeof v.hold.system === "string" ? { system: v.hold.system, talkgroup: typeof v.hold.talkgroup === "number" ? v.hold.talkgroup : null } : null,
-      avoid: v.avoid && typeof v.avoid === "object" ? v.avoid : {},
-    };
+    return readSelection(JSON.parse(localStorage.getItem(SEL_KEY) ?? "null"));
   } catch {
-    return none;
+    return readSelection(null);
   }
+}
+
+/** A selection as this browser kept it (any version's), or none. */
+export function readSelection(kept: unknown): Selection {
+  const v = kept as (Partial<Selection> & { sites?: unknown }) | null;
+  if (!v || typeof v !== "object") return { offSystems: [], offTalkgroups: [], hold: null, avoid: {} };
+  const { name, key } = migrateSelection(v);
+  const strings = (x: unknown) => (Array.isArray(x) ? x.filter((y): y is string => typeof y === "string") : []);
+  return {
+    offSystems: strings(v.offSystems).map(name),
+    offTalkgroups: strings(v.offTalkgroups).map(key),
+    hold: v.hold && typeof v.hold.system === "string" ? { system: name(v.hold.system), talkgroup: typeof v.hold.talkgroup === "number" ? v.hold.talkgroup : null } : null,
+    avoid: v.avoid && typeof v.avoid === "object" ? Object.fromEntries(Object.entries(v.avoid).map(([k, t]) => [key(k), t])) : {},
+  };
 }
 
 let state: ListenState = {
@@ -75,6 +85,7 @@ let state: ListenState = {
   calls: [],
   loadingOlder: false,
   moreOlder: null,
+  olderCursor: null,
   sel: loadSelection(),
 };
 
@@ -87,18 +98,20 @@ function set(patch: Partial<ListenState>): void {
 /** One slice of the scanner's state (re-renders when it changes, shallowly). */
 export function useListen<T>(pick: (s: ListenState) => T): T {
   const last = useRef<{ s: ListenState; v: T } | null>(null);
+  const get = () => {
+    const l = last.current;
+    if (l?.s === state) return l.v;
+    const v = pick(state);
+    last.current = { s: state, v: l && shallowEqual(l.v, v) ? l.v : v };
+    return last.current.v;
+  };
   return useSyncExternalStore(
     (l) => {
       listeners.add(l);
       return () => listeners.delete(l);
     },
-    () => {
-      const l = last.current;
-      if (l?.s === state) return l.v;
-      const v = pick(state);
-      last.current = { s: state, v: l && shallowEqual(l.v, v) ? l.v : v };
-      return last.current.v;
-    },
+    get,
+    get,
   );
 }
 
@@ -162,7 +175,9 @@ export function setTalkgroupsOn(keys: string[], on: boolean, known: string[] = [
   const waking = new Set(keys.map(systemOfKey).filter((x) => state.sel.offSystems.includes(x)));
   const others = known.filter((k) => !drop.has(k) && waking.has(systemOfKey(k)));
   off = [...new Set([...off, ...others])];
-  setSelection({ ...state.sel, offSystems: state.sel.offSystems.filter((x) => !waking.has(x)), offTalkgroups: off });
+  // Switched on is heard: an avoid on it goes too.
+  const avoid = Object.fromEntries(Object.entries(state.sel.avoid).filter(([k]) => !drop.has(k)));
+  setSelection({ ...state.sel, offSystems: state.sel.offSystems.filter((x) => !waking.has(x)), offTalkgroups: off, avoid });
 }
 
 /** Everything on (or every listed system and talkgroup off). */
@@ -265,7 +280,7 @@ export function setFeed(on: boolean): void {
     set({ feed: false, queue: [], missed: 0, playing: null, paused: false, played: was ? [was, ...state.played].slice(0, PLAYED_MAX) : state.played });
     return;
   }
-  // One sound at a time: the Live page's live audio stops.
+  // One sound at a time: a Radio system page's live audio stops.
   if (snapshot().listen) setListen(false);
   // (A click: the browser now lets audio play.)
   audio?.play().catch(() => {});
@@ -340,18 +355,19 @@ function merge(calls: CallEntry[], more: CallEntry[]): CallEntry[] {
   return [...calls, ...add].sort((a, b) => b.record.start_time_ms - a.record.start_time_ms).slice(0, CALLS_MAX);
 }
 
-/** Ask for calls older than the oldest known (the last 24 hours). */
+/** Ask for older calls, from where the history (or the last page) left off: a page of `callsQuery`, as every list of calls asks. */
 export function loadOlder(): void {
   if (state.loadingOlder) return;
-  const oldest = state.calls.at(-1)?.record.start_time_ms ?? Date.now();
   set({ loadingOlder: true });
-  transport.send({ type: "olderCalls", before: oldest, limit: OLDER_PAGE });
+  void callsQuery({ ...(state.olderCursor ? { cursor: state.olderCursor } : {}), limit: OLDER_PAGE }).then((m) => {
+    set({ calls: merge(state.calls, m.entries ?? []), loadingOlder: false, moreOlder: !!m.next, olderCursor: m.next ?? null });
+  });
 }
 
 onRecorderMessage((m) => {
   switch (m.type) {
-    case "hello":
-      set({ calls: merge(state.calls, m.history) });
+    case "history":
+      set({ calls: merge(state.calls, m.entries), olderCursor: m.next ?? null, ...(m.next ? {} : { moreOlder: false }) });
       break;
     case "concluded":
       arrived(m.entry);
@@ -361,13 +377,10 @@ onRecorderMessage((m) => {
       set({ calls: state.calls.map(fix), queue: state.queue.map(fix).filter(playable) });
       break;
     }
-    case "olderCalls":
-      set({ calls: merge(state.calls, m.entries), loadingOlder: false, moreOlder: m.more });
-      break;
   }
 });
 
-// Live audio switched on on the Live page: the feed stops (one sound at a time).
+// Live audio switched on on a Radio system page: the feed stops (one sound at a time).
 subscribe(() => {
   if (snapshot().listen && state.feed) setFeed(false);
 });

@@ -10,7 +10,7 @@ use serde_json::Value;
 use trunk_app::profile::{self, Request};
 use trunk_core::dsp::rolloff::Profiler;
 
-use crate::config::{Config, Source};
+use crate::config::{Config, Source, SourceKind};
 use crate::sdr::{Control, SourceMsg};
 
 /// Give up on a source that sends nothing for this long.
@@ -26,25 +26,26 @@ pub fn run(cfg: &Config, req: &Request) -> Value {
 
 fn measure(cfg: &Config, req: &Request) -> Result<Value, String> {
     let src = cfg.sources.get(req.source).ok_or("No such source.")?;
-    let center = match src {
-        Source::File { .. } => cfg.resolved_centers()[req.source],
+    let center = match src.kind {
+        SourceKind::File { .. } => cfg.resolved_centers()[req.source],
         _ if req.center_hz > 0.0 => req.center_hz,
         _ => return Err("Choose a frequency to look at.".into()),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel::<SourceMsg>(256);
-    let th = crate::survey::spawn_source(src, req.source, center, tx, stop.clone(), Arc::new(Control::default()))?;
-    let mut p = Profiler::new(src.rate_hz(), profile::SECONDS);
+    let th = crate::runtime::spawn_source(src, req.source, center, tx, stop.clone(), Some(Arc::new(Control::default())), &format!("profile-source-{}", req.source)).map_err(|e| e.to_string())?;
+    let mut p = Profiler::new(src.rate_hz, profile::SECONDS);
     let mut last = Instant::now();
     let mut err = None;
+    let mut rx = crate::sdr::Inbox::new(rx);
     while !p.done() {
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(SourceMsg::Data { bytes, .. }) => {
-                p.push_u8(&bytes);
-                last = Instant::now();
-            }
-            Ok(SourceMsg::Iq { samples, .. }) => {
-                p.push_iq(&samples);
+            Ok(SourceMsg::Samples { block, .. }) => {
+                match &block {
+                    crate::sdr::Block::U8(b) => p.push_u8(b),
+                    crate::sdr::Block::Iq(b) => p.push_iq(b),
+                    crate::sdr::Block::Real16(_) => {}
+                }
                 last = Instant::now();
             }
             Ok(SourceMsg::Error { error, .. }) => {
@@ -77,17 +78,8 @@ pub fn cli(a: &crate::Args) {
     let center = a.num("center", 0.0);
     let guard_hz = crate::config::DEFAULT_GUARD_HZ;
     let src = match a.positional.first() {
-        Some(path) => Source::File { path: path.clone(), center_hz: center, rate_hz: rate, realtime: false, format: Some(crate::sample_format(path, a.get("format"))), auto_tune: false, guard_hz },
-        None => Source::Rtlsdr {
-            serial: a.get("serial").unwrap_or("").into(),
-            center_hz: center,
-            rate_hz: rate,
-            gain_db: a.get("gain").and_then(|g| g.parse().ok()).unwrap_or(crate::config::RTL_DEFAULT_GAIN_DB),
-            agc: false,
-            ppm: 0,
-            auto_tune: false,
-            guard_hz,
-        },
+        Some(path) => Source { kind: crate::config::SourceKind::File { path: path.clone(), realtime: false, format: Some(crate::sample_format(path, a.get("format"))) }, center_hz: center, rate_hz: rate, ppm: 0.0, auto_tune: false, guard_hz },
+        None => Source { kind: crate::config::SourceKind::Rtlsdr { serial: a.get("serial").unwrap_or("").into(), gain_db: a.get("gain").and_then(|g| g.parse().ok()).unwrap_or(crate::config::RTL_DEFAULT_GAIN_DB), agc: false, buf_len: a.num("buflen", 0.0) as u32, buffers: a.num("buffers", 0.0) as u32 }, center_hz: center, rate_hz: rate, ppm: 0.0, auto_tune: false, guard_hz },
     };
     let cfg = Config { sources: vec![src], ..Default::default() };
     let mut v = run(&cfg, &Request { source: 0, center_hz: center });

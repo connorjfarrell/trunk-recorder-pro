@@ -7,9 +7,10 @@
 //! as it fills), and what's left in it too long moved out; and on macOS,
 //! whether Spotlight indexes the recordings folder (`platform.spotlight`).
 
+use trunk_app::protocol::{body, ToClient};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use trunk_app::stats::{Aggregator, MonitorEvent};
@@ -18,6 +19,11 @@ use trunk_core::metrics::Sink;
 use crate::platform::{Platform, Probes, Watched};
 use crate::runtime::{publish, Ctx};
 
+/// Every connection hears from the recorder this often, recording or not: the
+/// `host` message is the connections' heartbeat, so it goes to all of them,
+/// never behind a topic or access. A browser that heard nothing for far longer
+/// wasn't running (transport.ts's `FROZEN_MS`); one whose `host` statuses lag
+/// the `t` stamped on them more and more is taking in a backlog (`BEHIND_MS`).
 pub const EVERY: Duration = Duration::from_secs(2);
 /// A watched disk below this much free, %, is an event.
 const DISK_LOW_PCT: f64 = 5.0;
@@ -28,10 +34,13 @@ const SPOOL_CRITICAL_PCT: f64 = 10.0;
 const SWEEP_EVERY: Duration = Duration::from_secs(600);
 /// How often Spotlight is asked again (and when the recordings folder changes).
 const SPOTLIGHT_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// How often the store's tables and indexes are measured (SQLite reads
+/// each page's header to, so not every tick).
+const SIZES_EVERY: Duration = Duration::from_secs(15 * 60);
 
 /// The `host` message: the series' values this tick, and the platform's own figures.
-pub fn message(t: f64, agg: &Aggregator, platform: serde_json::Value) -> serde_json::Value {
-    json!({ "type": "host", "t": (t * 10.0).round() / 10.0, "values": agg.values_json(), "platform": platform })
+pub fn message(t: f64, agg: &Aggregator, platform: serde_json::Value) -> ToClient {
+    ToClient::Host(body(json!({ "t": (t * 10.0).round() / 10.0, "values": agg.values_json(), "platform": platform })))
 }
 
 pub fn start(ctx: Arc<Ctx>) {
@@ -39,16 +48,22 @@ pub fn start(ctx: Arc<Ctx>) {
 }
 
 fn run(ctx: Arc<Ctx>) {
-    let (targets, capture) = {
+    let (targets, time_server, capture) = {
         let c = ctx.config.lock().unwrap();
-        (c.monitor.probe_hosts.clone(), c.recording.capture_dir.clone())
+        (c.monitor.probe_hosts.clone(), Some(c.monitor.time_server.trim().to_string()).filter(|s| !s.is_empty()), c.recording.capture_dir.clone())
     };
+    let checks = |c: &Arc<Ctx>| {
+        let c = c.clone();
+        move || c.config.lock().unwrap().monitor.network_checks
+    };
+    ctx.clock.start(time_server, checks(&ctx));
     let c2 = ctx.clone();
-    let probes = Probes::start(targets, move |(target, up, down_s)| {
+    let probes = Probes::start(targets, checks(&ctx), move |(target, up, down_s)| {
         c2.event(if up { MonitorEvent::LinkUp { target, down_s: down_s.round() } } else { MonitorEvent::LinkDown { target } });
     });
     let watched = vec![Watched { name: "recordings", path: capture.into() }, Watched { name: "data", path: crate::paths::data_dir() }];
-    run_with(ctx, Platform::new(watched, probes));
+    let clock = ctx.clock.clone();
+    run_with(ctx, Platform::new(watched, probes, clock));
 }
 
 fn run_with(ctx: Arc<Ctx>, mut platform: Platform) {
@@ -57,8 +72,17 @@ fn run_with(ctx: Arc<Ctx>, mut platform: Platform) {
     let mut spool = SpoolWatch::default();
     let spotlight: Arc<Mutex<Option<Value>>> = Default::default();
     let mut spotlight_for: Option<(String, Instant)> = None;
+    let sizes: Arc<Mutex<Option<crate::db::store::StoreSizes>>> = Default::default();
+    // (PostgreSQL's server's write-ahead log, read with the sizes.)
+    let server_wal: Arc<Mutex<Option<i64>>> = Default::default();
+    let mut sized: Option<Instant> = None;
     loop {
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let t = crate::clock::unix_s();
+        // The clock judged once a tick: the dashboard, the events and the calls go by it.
+        let warn_ms = ctx.config.lock().unwrap().monitor.clock_warn_ms;
+        for e in ctx.clock.look(warn_ms) {
+            ctx.event(e);
+        }
         if let Some(r) = agg.begin(t) {
             ctx.store.add(r);
         }
@@ -75,6 +99,39 @@ fn run_with(ctx: Arc<Ctx>, mut platform: Platform) {
             let _ = std::thread::Builder::new().name("spotlight".into()).spawn(move || *out.lock().unwrap() = crate::spotlight::check(Path::new(&capture)));
         }
         p["spotlight"] = spotlight.lock().unwrap().clone().unwrap_or(Value::Null);
+        // The store's tables and indexes, measured on a thread of their own:
+        // in the platform message (Platform → Storage) and its history (`store/<name>`).
+        if !ctx.db.is_disabled() && sized.is_none_or(|at| at.elapsed() >= SIZES_EVERY) {
+            sized = Some(Instant::now());
+            let (db, out, wal) = (ctx.db.clone(), sizes.clone(), server_wal.clone());
+            let _ = std::thread::Builder::new().name("store-sizes".into()).spawn(move || {
+                match db.sizes() {
+                    Ok(s) => *out.lock().unwrap() = Some(s),
+                    Err(e) => log::warn!("Store: sizes not measured ({e})"),
+                }
+                *wal.lock().unwrap() = db.server_wal_bytes();
+            });
+        }
+        // What the store writes to disk (a counter: the history has its rate).
+        let (written, how) = match (ctx.db.written(), *server_wal.lock().unwrap()) {
+            (Some(b), _) => (Some(b), "store"),
+            (None, Some(b)) => (Some(b.max(0) as u64), "server"),
+            (None, None) => (None, if ctx.db.backend() == "sqlite" { "this system doesn't count a thread's writes" } else { "the server doesn't say (pg_stat_wal: PostgreSQL 14 on)" }),
+        };
+        if let Some(b) = written {
+            agg.counter("store/written", b);
+        }
+        if let Some(s) = sizes.lock().unwrap().as_ref() {
+            for o in &s.objects {
+                agg.gauge(&format!("store/{}", o.name), o.bytes as f64);
+            }
+            agg.gauge("store/total", (s.file_bytes + s.wal_bytes) as f64);
+            let written = match written {
+                Some(b) => json!({ "bytes": b, "of": how }),
+                None => json!({ "why": how }),
+            };
+            p["store"] = json!({ "backend": ctx.db.backend(), "radioIndex": ctx.db.indexes_radios(), "talkgroupIndex": ctx.db.indexes_talkgroups(), "sizes": s, "written": written });
+        }
         for d in p["disks"].as_array().into_iter().flatten() {
             let (Some(name), Some(total), Some(free)) = (d["name"].as_str(), d["totalBytes"].as_f64(), d["freeBytes"].as_f64()) else { continue };
             if name == "spool" {
@@ -87,8 +144,8 @@ fn run_with(ctx: Arc<Ctx>, mut platform: Platform) {
             }
         }
         let msg = message(t, &agg, p);
-        publish(&ctx.hub, msg.clone());
-        *ctx.host_last.lock().unwrap() = Some(msg);
+        *ctx.host_last.lock().unwrap() = Some(msg.clone());
+        publish(&ctx.hub, msg);
         std::thread::sleep(EVERY);
     }
 }
@@ -99,6 +156,7 @@ struct SpoolWatch {
     /// 0 fine, 1 low, 2 nearly full: as last told.
     level: u8,
     overflowed: u64,
+    removed: u64,
     swept: Option<Instant>,
 }
 
@@ -107,24 +165,37 @@ impl SpoolWatch {
     fn watch(&mut self, ctx: &Ctx, s: &crate::spool::Spool, capture: &Path, sink: &mut dyn Sink, p: &mut Value) {
         if self.swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
             self.swept = Some(Instant::now());
-            let n = s.sweep(capture, crate::spool::STALE);
+            // (A call held back from a plugin waits that much longer.)
+            let n = s.sweep(capture, crate::spool::STALE + ctx.plugins.longest_delay());
             if n > 0 {
                 log::warn!("{n} file(s) left in the RAM spool by calls no plugin finished: moved to {}", capture.display());
             }
+        }
+        // Gone (deleted, unmounted): made again, and said, with how to stop it.
+        let here = s.revive();
+        let removed = s.removed();
+        if removed > self.removed {
+            ctx.event(MonitorEvent::SpoolRemoved { spool: s.kind.to_string(), remade: here });
+            self.removed = removed;
         }
         let n = s.overflowed();
         if n > self.overflowed {
             ctx.event(MonitorEvent::SpoolFull { calls: n - self.overflowed });
             self.overflowed = n;
         }
-        let Some((total, free)) = s.usage().filter(|u| u.0 > 0) else { return };
-        let pct = 100.0 * free as f64 / total as f64;
-        sink.gauge("plat/disk/spool/free", free as f64);
-        sink.gauge("plat/disk/spool/freePct", pct);
-        let row = json!({ "name": "spool", "path": s.dir.display().to_string(), "mount": s.dir.display().to_string(), "kind": s.kind, "totalBytes": total, "freeBytes": free, "overflowed": n });
+        // Its row stays while it's missing, so the dashboard says so.
+        let usage = s.usage().filter(|u| here && u.0 > 0);
+        let (total, free) = usage.unwrap_or_default();
+        let row = json!({ "name": "spool", "path": s.dir.display().to_string(), "mount": s.dir.display().to_string(), "kind": s.kind, "totalBytes": total, "freeBytes": free, "overflowed": n, "removed": removed, "missing": usage.is_none() });
         if let Some(d) = p["disks"].as_array_mut() {
             d.push(row);
         }
+        if usage.is_none() {
+            return;
+        }
+        let pct = 100.0 * free as f64 / total as f64;
+        sink.gauge("plat/disk/spool/free", free as f64);
+        sink.gauge("plat/disk/spool/freePct", pct);
         let level = if pct < SPOOL_CRITICAL_PCT { 2 } else if pct < SPOOL_LOW_PCT { 1 } else { 0 };
         let free_pct = (pct * 10.0).round() / 10.0;
         if level > self.level {

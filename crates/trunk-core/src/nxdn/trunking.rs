@@ -36,7 +36,8 @@ use crate::dsp::c4fm::C4fm;
 use crate::dsp::{Receiver, Symbol};
 use crate::trunk::engine::NoteLevel;
 use crate::trunk::identity::{IdField, Identity};
-use crate::trunk::message::{Message, MessageType};
+use crate::trunk::message::{table_from_str, table_to_string, Message, MessageType};
+use crate::trunk::Voice;
 
 /// A grant waits this long for its group to show up on a watched carrier.
 const LEARN_WINDOW_S: f64 = 4.0;
@@ -278,23 +279,31 @@ impl Site {
 
     /// The carrier sending CAC now; on Type-D (no control channel), the
     /// last one heard, so the site doesn't look like it is hunting.
-    pub fn control_hz(&self) -> Option<u64> {
+    fn control_carrier(&self) -> Option<&Carrier> {
         let at = |c: &Carrier| if self.cfg.kind == Kind::TypeD { c.heard_s } else { c.control_s };
-        self.carriers.iter().filter(|c| self.now_s - at(c) < CONTROL_HOLD_S).max_by(|a, b| at(a).total_cmp(&at(b))).map(|c| c.hz)
+        self.carriers.iter().filter(|c| self.now_s - at(c) < CONTROL_HOLD_S).max_by(|a, b| at(a).total_cmp(&at(b)))
+    }
+
+    pub fn control_hz(&self) -> Option<u64> {
+        self.control_carrier().map(|c| c.hz)
+    }
+
+    /// How far off the control carrier comes in, Hz, once its receiver can tell (AutoTune).
+    pub fn offset_hz(&self) -> Option<f32> {
+        self.control_carrier().and_then(|c| c.rx.offset_hz())
+    }
+
+    /// The control carrier's eye opening (the dashboard's).
+    pub fn quality(&self) -> Option<f32> {
+        self.control_carrier().and_then(|c| c.rx.quality())
     }
 
     /// The learned table as `channel=hz` lines.
     pub fn map_to_string(&self) -> String {
-        self.learned.iter().map(|(l, h)| format!("{l}={h}\n")).collect()
+        table_to_string(&self.learned)
     }
     pub fn map_from_str(&mut self, s: &str) {
-        for line in s.lines() {
-            if let Some((l, h)) = line.split_once('=') {
-                if let (Ok(l), Ok(h)) = (l.trim().parse(), h.trim().parse()) {
-                    self.learned.insert(l, h);
-                }
-            }
-        }
+        self.learned.extend(table_from_str(s));
     }
 
     /// Carrier `idx`'s channel IQ; `t0` + sample / `rate` is a sample's air time (s).
@@ -422,7 +431,7 @@ impl Site {
     }
 
     fn base(&self, kind: MessageType, t: f64) -> Message {
-        Message { kind, time_s: t, nxdn: Some(self.cfg.rate), ran: self.ran, sys_id: self.location.map_or(0, |l| l.system()), site: self.location.map_or(0, |l| l.site()), ..Default::default() }
+        Message { kind, time_s: t, voice: Voice::Nxdn(self.cfg.rate), ran: self.ran, sys_id: self.location.map_or(0, |l| l.system()), site: self.location.map_or(0, |l| l.site()), ..Default::default() }
     }
 
     fn set_learned(&mut self, n: u32, hz: u64, why: &str) {
@@ -477,7 +486,7 @@ impl Site {
         m.talkgroup = tg;
         m.source = if head.source != 0 { head.source as i64 } else { -1 };
         m.emergency = head.emergency();
-        m.nxdn = Some(rate);
+        m.voice = Voice::Nxdn(rate);
         m.opcode = if dup { super::layer3::VCALL_ASSGN_DUP } else { super::layer3::VCALL_ASSGN };
         m.meta = format!(
             "{}: {} {tg} from {} on channel {number} ({})",
@@ -617,7 +626,7 @@ impl Site {
         m.source = if src != 0 { src as i64 } else { -1 };
         m.encrypted = st.encrypted;
         m.emergency = st.emergency;
-        m.nxdn = Some(rate);
+        m.voice = Voice::Nxdn(rate);
         m.meta = format!("Voice: {} {tg} from {src} on {}{}", if st.group { "group" } else { "unit" }, mhz(hz), if st.encrypted { " (encrypted)" } else { "" });
         out.push(m);
     }
@@ -707,7 +716,7 @@ mod tests {
         let msgs = vec![l3::site_info(0x123 << 12 | 0x045, 0x0200, dfa, 0, [1, 0]), l3::vcall_assgn_dfa(&head(55, 9, CALL_INDIVIDUAL), 4, 40_100, 39_000, 1), l3::idle(), l3::idle(), l3::idle()];
         let out = run(&mut site, &[iq_of(&control_frames(&msgs, 5), Rate::N48, fs)], fs);
         let g = out.iter().find(|m| m.kind == MessageType::UuVGrant).expect("unit grant");
-        assert_eq!((g.freq_hz, g.talkgroup, g.nxdn), (450_125_000, 55, Some(Rate::N96)));
+        assert_eq!((g.freq_hz, g.talkgroup, g.voice.nxdn()), (450_125_000, 55, Some(Rate::N96)));
     }
 
     /// A Type-D repeater: idle messages, then a call whose who is in the SCCH.

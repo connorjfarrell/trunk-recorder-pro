@@ -10,7 +10,7 @@ The interface has three kinds of screen, each with its own density:
 
 | Kind | Where | What it's for | Density |
 | --- | --- | --- | --- |
-| **Dashboard** | Overview, Listen, RF, Decode, Radio system, Live, Plugins, Platform | Watching the recorder: figures, charts, status | Dense; figures are the largest type |
+| **Dashboard** | Overview, Listen, RF, Decode, Radio system, Platform, Plugins | Watching the recorder: figures, charts, status | Dense; figures are the largest type |
 | **Setup** | Setup (its tabs) | Changing settings | Roomy; headings and labels lead |
 | **Guide** | The setup guide (`Onboarding.tsx`, `.ob-*`) | One question at a time, for someone new | Large type, line art, one column |
 
@@ -184,15 +184,23 @@ query) they stack. Groups in a card are separated by a 1 px rule.
 - `full` puts the title above and lets the body use the card's whole width,
   for a table (a conventional system's channels). Its `actions` (Import,
   Export, Add a channel) go on the right of the title.
+- `fold={{ key, open, summary }}` makes a group that can grow long (a list
+  that comes from a lookup, like FCC licenses) fold to its title, with a
+  chevron like a card's. `key` remembers it per browser, as cards are;
+  `open` is how it starts (open while short); `summary` replaces the body
+  while folded ("20 frequencies, 5 call signs: …"). Settings someone must
+  see never fold.
 - 2–6 fields make a good group. More than that is usually two groups; one
   field on its own usually belongs in a neighbour (unless it's the only
   thing of its kind, like "Units").
 - Order groups from what everyone sets to what few touch: Basics first,
-  Overrides or Advanced last.
+  overrides (Plugins, Recording) or Advanced last.
 
 Group names used so far, to reuse where they fit: **Basics** (names, type),
 **On the air** (where to find it), **Talkgroups and units**, **Sites**,
-**Overrides** (this one's own versions of defaults set elsewhere),
+**Plugins** and **Recording** (a system's own versions of what the Plugins
+and Recording tabs set; Recording in two disclosures, **Recording** for call
+rules and **Archive** for file names and what's kept),
 **Device**, **Tuning**, **Gain**, **Frequency correction**, **Storage**,
 **Recording**, **Startup and diagnostics**, **Where it goes**, **What it
 says**.
@@ -214,6 +222,32 @@ A label, the input, and an optional hint below.
 - `needs` / `anchor` mark a field an import left to fill in (`.needs`, a
   warning ring); the to-do list's Show scrolls to it.
 
+### Inputs (`inputs.tsx`, `fieldText.ts`)
+
+Every setting typed in is a `<DraftInput>`: plain text a `<TextInput>` or
+`<TextArea>`, a number a `<NumberInput>` (`hex`, `gain`, `narrow`), anything
+else (frequencies, a list, a channel table, minutes) a `<DraftInput>` with a
+codec from `fieldText.ts`. Never a bare `<input onChange>` that writes the
+config. While focused it keeps the text as typed. It passes the value on,
+parsed, once: when the field is left or Enter pressed (a `<TextArea>`:
+Ctrl/⌘+Enter), or when its page goes away. Escape puts it back. Left, it
+shows the value kept. Each value passed on is a save, and can restart a
+plugin or rename a system and its files, so it's one per word typed, not one
+per letter. So:
+
+- Switches, menus and buttons act at once: each is one deliberate action.
+- A text input that isn't a setting (a search, a filter, a form submitted
+  with a button) can stay a plain `<input>` with its own state.
+
+- Clamp, round or default in the `onChange`, never in the input: a squelch
+  of 12 is typed "1" first, -5 is typed "-" first, and the field must not
+  snap back while that happens.
+- A new kind of text is a new codec in `fieldText.ts`, with a test in
+  `fieldText.test.ts` (`npm test`), not a new input component.
+- A hidden file input is `<FileInput>`: it clears after each pick, so the
+  same file chosen again is read again.
+- A short name is cleaned with `cleanShortName`.
+
 ### Toggle (`<Toggle>`)
 
 A checkbox with the label, and the hint on its own line beneath (first
@@ -228,7 +262,7 @@ say why in its hint ("Both are kept anyway").
 
 For what most people never open: help text ("CSV format", "Dongle not
 showing up?"), and advanced or override panels. The summary says what's
-inside and its state: "Site lock — off", "Recording override — 4
+inside and its state: "Site lock — off", "Archive — 3
 changed".
 
 ## Dashboard patterns
@@ -238,6 +272,11 @@ changed".
 - **Card** (`Card` in `charts.tsx`): a title (a link to its page when there
   is one), an optional status light (`level`: ok / warn / bad / idle) and,
   when not ok, a `.why` line saying why, in words. `detail` adds "More ▾".
+- **Drilling down** (a system on Decode or Radio, a source on RF, a
+  talkgroup or radio): the page starts with `BackBar` (`charts.tsx`),
+  "← All systems", "← All sources" or "← <system>", with what picks within
+  the page beside it (Decode's sites, Radio's systems). Never a button off
+  on the right of a header.
 - **Figures** (`Stat`): an uppercase label, the value large, the unit
   small and muted beside it, then a sub-line or sparkline. A warning shows
   as a coloured inset line on top of the tile, not a coloured value.

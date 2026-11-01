@@ -22,6 +22,9 @@ Trunk Recorder Pro supports:
   and ETSI Tier III
 - **NXDN** (NXDN48 and NXDN96): Type-C and Type-D trunking. NXDN has been tested on recordings and
   synthesized signals, but not yet on a live trunked system.
+- **EDACS** Standard and Networked sites, with analog and ProVoice voice (see
+  [Trunked systems](configuration/systems.md#edacs)). Analog calls tested live on a networked
+  system; ProVoice on synthesized signals.
 - **Conventional channels**: analog FM, P25, DMR and NXDN, on their own or alongside trunked
   systems. Several users of one frequency can be told apart by CTCSS tone, DCS code, NAC, colour
   code or RAN.
@@ -34,7 +37,7 @@ ARM64, glibc 2.28 or newer, including the **Raspberry Pi** 4 and 5 with a 64-bit
 version.
 
 ...and SDRs: RTL-SDR dongles (R820T / R828D tuners natively, older tuners through SoapySDR), Ettus
-USRPs through UHD, Airspy R2 and Mini, and anything else with a SoapySDR module (HackRF, SDRplay,
+USRPs through UHD, HackRF One (natively), Airspy R2 and Mini, and anything else with a SoapySDR module (SDRplay,
 LimeSDR...).
 
 ## Install
@@ -53,6 +56,8 @@ LimeSDR...).
 - [Getting started](getting-started.md): from a new install to your first recorded call
 - [Radios](guides/radios.md): center frequency, sample rate, gain, frequency correction, using
   more than one SDR
+- [Adding a system from the directory](guides/from-the-directory.md): a system other users share, with its
+  sites, licenses and named talkgroups, into your recorder.
 - [Find my system](guides/find-my-system.md): let the recorder scan for control channels and set
   itself up
 
@@ -72,9 +77,13 @@ LimeSDR...).
 - [The interface](guides/interface.md): Setup, live listening, events, remote access
 - [The dashboard](guides/dashboard.md): what each page and number means
 - [Recordings](guides/recordings.md): where calls go, file names, the call JSON, what is kept
+- [Signals](guides/signals.md): pages, alert tones, DTMF, KNOX and Morse IDs heard in calls, and naming them
 - [Plugins](plugins/README.md): uploading to [OpenMHz](plugins/openmhz.md),
   [Broadcastify](plugins/broadcastify.md) and [Rdio Scanner](plugins/rdioscanner.md),
-  [streaming](plugins/simplestream.md), [running a script](plugins/upload-script.md)
+  [streaming](plugins/simplestream.md), [running a script](plugins/upload-script.md),
+  [publishing to MQTT](plugins/mqtt.md)
+- [Interfaces](interfaces/README.md): pages for people who listen (a player, a scanner wall),
+  each on a port of its own, from the interface store or a folder of your own
 - [Coming from Trunk Recorder](migrating-from-trunk-recorder.md): importing your config, and what
   is different
 - [Troubleshooting](troubleshooting.md)
@@ -94,6 +103,8 @@ LimeSDR...).
 
 - [Development](development.md): building from source, making a release, the code layout and how
   it was verified
+- [Building an interface](api/README.md) and [publishing it](interfaces/publishing.md) in the
+  interface store
 - [Architecture](architecture.md): how it works, from SDR to audio file
 - [Architecture explainer](developer/architecture.html): interactive diagrams of the sample path,
   DSP chains, trunking, recorders, back-pressure, plugins, data objects, config, clocks,

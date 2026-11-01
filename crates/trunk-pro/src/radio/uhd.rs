@@ -3,17 +3,16 @@
 //! or the Ettus PPA), or the Ettus installer on Windows — plus the FPGA
 //! images (`uhd_images_downloader`) that UHD needs to open a device.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use libloading::Library;
 use num_complex::Complex32;
 
-use super::DriverInfo;
-use crate::sdr::{Control, SourceMsg};
+use super::{cstr, ppm_corrected, Deadline, DriverInfo, Handed};
+use crate::sdr::{Applied, Block, Control, Gain, Retuned, Sink, Tunable};
 
 type Handle = *mut c_void;
 type Err = c_int;
@@ -53,6 +52,19 @@ struct StreamCmd {
     time_spec_frac_secs: f64,
 }
 
+/// uhd_usrp_rx_info_t: strings UHD allocates (freed by uhd_usrp_rx_info_free).
+#[repr(C)]
+struct RxInfo {
+    mboard_id: *mut c_char,
+    mboard_name: *mut c_char,
+    mboard_serial: *mut c_char,
+    rx_id: *mut c_char,
+    rx_subdev_name: *mut c_char,
+    rx_subdev_spec: *mut c_char,
+    rx_serial: *mut c_char,
+    rx_antenna: *mut c_char,
+}
+
 const POLICY_AUTO: c_int = 65;
 const MODE_START: c_int = 97;
 const MODE_STOP: c_int = 111;
@@ -89,6 +101,11 @@ struct Api {
     rx_metadata_error_code: unsafe extern "C" fn(Handle, *mut c_int) -> Err,
     rx_metadata_has_time_spec: unsafe extern "C" fn(Handle, *mut bool) -> Err,
     rx_metadata_time_spec: unsafe extern "C" fn(Handle, *mut i64, *mut f64) -> Err,
+    /// Not in every UHD.
+    set_master_clock_rate: Option<unsafe extern "C" fn(Handle, f64, usize) -> Err>,
+    get_master_clock_rate: Option<unsafe extern "C" fn(Handle, usize, *mut f64) -> Err>,
+    get_rx_info: Option<unsafe extern "C" fn(Handle, usize, *mut RxInfo) -> Err>,
+    rx_info_free: Option<unsafe extern "C" fn(*mut RxInfo) -> Err>,
 }
 
 // SAFETY: the function pointers are plain C entry points; UHD objects are
@@ -136,6 +153,10 @@ fn api() -> Result<&'static Api, String> {
                 rx_metadata_error_code: f!("uhd_rx_metadata_error_code"),
                 rx_metadata_has_time_spec: f!("uhd_rx_metadata_has_time_spec"),
                 rx_metadata_time_spec: f!("uhd_rx_metadata_time_spec"),
+                set_master_clock_rate: lib.get(b"uhd_usrp_set_master_clock_rate\0").ok().map(|s| *s),
+                get_master_clock_rate: lib.get(b"uhd_usrp_get_master_clock_rate\0").ok().map(|s| *s),
+                get_rx_info: lib.get(b"uhd_usrp_get_rx_info\0").ok().map(|s| *s),
+                rx_info_free: lib.get(b"uhd_usrp_rx_info_free\0").ok().map(|s| *s),
                 _lib: lib,
             };
             Ok((api, path))
@@ -154,17 +175,12 @@ pub fn info() -> DriverInfo {
             let v = a.get_version_string.map(|f| {
                 // SAFETY: buffer and its length.
                 unsafe { f(buf.as_mut_ptr(), buf.len()) };
-                cstr(&buf)
+                unsafe { cstr(buf.as_ptr()) }
             });
             DriverInfo { loaded: true, detail: format!("UHD {}", v.unwrap_or_else(|| "(version unknown)".into())) }
         }
         Err(e) => DriverInfo { loaded: false, detail: format!("UHD {e}") },
     }
-}
-
-fn cstr(buf: &[c_char]) -> String {
-    // SAFETY: UHD NUL-terminates within the buffer we gave it.
-    unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
 }
 
 fn check(a: &Api, what: &str, e: Err) -> Result<(), String> {
@@ -174,7 +190,7 @@ fn check(a: &Api, what: &str, e: Err) -> Result<(), String> {
     let mut buf = [0 as c_char; 512];
     // SAFETY: buffer and its length.
     unsafe { (a.get_last_error)(buf.as_mut_ptr(), buf.len()) };
-    let msg = cstr(&buf);
+    let msg = unsafe { cstr(buf.as_ptr()) };
     Err(format!("USRP {what}: {}", if msg.is_empty() { format!("UHD error {e}") } else { msg }))
 }
 
@@ -195,7 +211,7 @@ pub fn find(args: &str) -> Result<Vec<String>, String> {
         for i in 0..n {
             let mut buf = [0 as c_char; 512];
             if (a.string_vector_at)(v, i, buf.as_mut_ptr(), buf.len()) == 0 {
-                out.push(cstr(&buf));
+                out.push(cstr(buf.as_ptr()));
             }
         }
         (a.string_vector_free)(&mut v);
@@ -213,39 +229,34 @@ pub struct UsrpConfig {
     pub agc: bool,
     pub antenna: String,
     pub ppm: f64,
+    /// Samples on the wire: "sc16", "sc12" (B2xx), "sc8", or "" to choose ([`wire_format`]).
+    pub wire_format: String,
 }
 
-/// Stream a USRP until `stop`; reopens after errors with a short back-off.
-pub fn run(source: usize, cfg: UsrpConfig, tx: SyncSender<SourceMsg>, stop: Arc<AtomicBool>) {
-    run_with(source, cfg, tx, stop, None)
-}
-
-/// [`run`], retuned on request.
-pub fn run_with(source: usize, mut cfg: UsrpConfig, tx: SyncSender<SourceMsg>, stop: Arc<AtomicBool>, ctl: Option<Arc<Control>>) {
-    // The device's buffer holds only milliseconds: a receive thread left
-    // waiting behind other work (a screen-sharing session, say) loses samples.
-    #[cfg(target_os = "macos")]
-    // SAFETY: sets this thread's own QoS class.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+impl crate::sdr::Radio for UsrpConfig {
+    const BACKOFF: Duration = Duration::from_secs(3);
+    fn rate_hz(&self) -> f64 {
+        self.rate_hz
     }
-    while !stop.load(Ordering::Relaxed) {
-        if let Some(c) = ctl.as_ref().and_then(|c| *c.current_hz.lock().unwrap()) {
-            cfg.center_hz = c;
+    fn retune_to(&mut self, hz: f64) {
+        self.center_hz = hz;
+    }
+    fn gain_to(&mut self, g: Gain) {
+        if let Gain::Db(db) = g {
+            self.gain_db = db as f64;
         }
-        if let Err(e) = stream_once(source, &cfg, &tx, &stop, ctl.as_deref()) {
-            let _ = tx.send(SourceMsg::Error { source, error: e });
-            std::thread::sleep(Duration::from_secs(3));
-        }
+    }
+    fn stream_once(&self, sink: &mut Sink, stop: &Arc<AtomicBool>, ctl: Option<&Control>) -> Result<(), String> {
+        stream_once(self, sink, stop, ctl)
     }
 }
 
 /// UHD's default USB buffer (16 frames on a B200: ~4 ms at 8 MSPS) overflows
-/// whenever the receive thread waits a few ms for the CPU; 256 frames hold
-/// ~65 ms. Kept when `args` sets its own.
-const RECV_FRAMES: usize = 256;
+/// whenever the receive thread waits a few ms for the CPU; 1024 frames hold
+/// ~260 ms (256 still lost ~100 ms an hour on a Mac). Kept when `args` sets its own.
+const RECV_FRAMES: usize = 1024;
 
-fn device_args(args: &str) -> String {
+pub(crate) fn device_args(args: &str) -> String {
     if args.split(',').any(|kv| kv.trim().starts_with("num_recv_frames=")) {
         return args.to_string();
     }
@@ -253,16 +264,76 @@ fn device_args(args: &str) -> String {
     format!("{args}{sep}num_recv_frames={RECV_FRAMES}")
 }
 
+/// The AD9364's highest master clock (a B2xx's).
+const MAX_MASTER_CLOCK_HZ: f64 = 61.44e6;
+
+/// The format on the wire, as set or chosen: sc16, unless a B2xx sits on a
+/// USB 2.0 link (`usb2`) above 8 MSPS — sc16 is then most of what the link
+/// carries, with no room to catch up after the host stalls — where sc12
+/// (the AD9364's ADC is 12-bit: nothing real is lost) takes a quarter less
+/// (sdr-uhd's policy).
+fn wire_format(set: &str, b2xx: bool, usb2: bool, rate_hz: f64) -> &str {
+    match set.trim() {
+        "" if b2xx && usb2 && rate_hz > 8e6 => "sc12",
+        "" => "sc16",
+        f => f,
+    }
+}
+
 /// Owns the UHD objects so every exit path frees them.
-struct Session<'a> {
-    a: &'a Api,
+struct Session {
+    a: &'static Api,
     usrp: Handle,
     rx: Handle,
     md: Handle,
     streaming: bool,
+    ppm: f64,
 }
 
-impl Drop for Session<'_> {
+// SAFETY: UHD's objects are used from one thread at a time ([`super::open`]'s hands it over).
+unsafe impl Send for Session {}
+
+impl Session {
+    /// The motherboard's id ("B210") and serial, when this UHD says.
+    fn board(&self) -> (String, String) {
+        let (Some(get), Some(free)) = (self.a.get_rx_info, self.a.rx_info_free) else { return Default::default() };
+        // SAFETY: UHD fills the struct with strings it allocated; freed here.
+        unsafe {
+            let mut info: RxInfo = std::mem::zeroed();
+            if get(self.usrp, 0, &mut info) != 0 {
+                return Default::default();
+            }
+            let r = (cstr(info.mboard_id), cstr(info.mboard_serial));
+            free(&mut info);
+            r
+        }
+    }
+}
+
+impl Tunable for Session {
+    fn tune(&mut self, hz: f64) -> Result<Retuned, String> {
+        let mut req = TuneRequest {
+            target_freq: ppm_corrected(hz, self.ppm),
+            rf_freq_policy: POLICY_AUTO,
+            rf_freq: 0.0,
+            dsp_freq_policy: POLICY_AUTO,
+            dsp_freq: 0.0,
+            args: std::ptr::null_mut(),
+        };
+        let mut res = TuneResult::default();
+        // SAFETY: an open USRP; the request and result are live locals.
+        check(self.a, "tune", unsafe { (self.a.set_rx_freq)(self.usrp, &mut req, 0, &mut res) })?;
+        Ok(Retuned { hz, gap: 0 })
+    }
+    /// A manual gain (AGC on or off waits for the next start).
+    fn set_gain(&mut self, g: Gain) -> Result<u64, String> {
+        let Gain::Db(db) = g else { return Ok(0) };
+        // SAFETY: an open USRP.
+        check(self.a, "set gain", unsafe { (self.a.set_rx_gain)(self.usrp, db as f64, 0, c"".as_ptr()) }).map(|()| 0)
+    }
+}
+
+impl Drop for Session {
     fn drop(&mut self) {
         // SAFETY: handles made by this session (or null).
         unsafe {
@@ -283,14 +354,39 @@ impl Drop for Session<'_> {
     }
 }
 
-fn stream_once(source: usize, cfg: &UsrpConfig, tx: &SyncSender<SourceMsg>, stop: &AtomicBool, ctl: Option<&Control>) -> Result<(), String> {
+fn stream_once(cfg: &UsrpConfig, sink: &mut Sink, stop: &AtomicBool, ctl: Option<&Control>) -> Result<(), String> {
     let a = api()?;
-    let mut s = Session { a, usrp: std::ptr::null_mut(), rx: std::ptr::null_mut(), md: std::ptr::null_mut(), streaming: false };
     let args = CString::new(device_args(&cfg.args)).map_err(|e| e.to_string())?;
+    let name = format!("USRP {}", if cfg.args.is_empty() { "(first)" } else { &cfg.args });
+    // (Loading an FPGA image over USB, or a search of the network, takes
+    // seconds. UHD serializes its own opens: not under the shared lock.)
+    let mut s = super::open(&name, Deadline::Slow, false, move || {
+        let mut s = Session { a, usrp: std::ptr::null_mut(), rx: std::ptr::null_mut(), md: std::ptr::null_mut(), streaming: false, ppm: 0.0 };
+        // SAFETY: UHD makes the USRP; the Session frees it.
+        check(a, "open", unsafe { (a.usrp_make)(&mut s.usrp, args.as_ptr()) })?;
+        Ok(Handed(s))
+    })?
+    .0;
+    s.ppm = cfg.ppm;
+    let (board, serial) = s.board();
+    let b2xx = board.starts_with("B2");
     // SAFETY: UHD C API calls on handles this session owns.
     unsafe {
-        check(a, "open", (a.usrp_make)(&mut s.usrp, args.as_ptr()))?;
         check(a, "set rate", (a.set_rx_rate)(s.usrp, cfg.rate_hz, 0))?;
+        // Left to itself UHD can run a B2xx's master clock at the rate itself
+        // (decimation 1), where the AD9364 puts sidebands ±270–310 kHz around
+        // every strong carrier, −18 to −40 dBc (sdr-uhd's measurement): then
+        // it's doubled. A clock set in the device arguments is left alone.
+        if b2xx
+            && !cfg.args.contains("master_clock_rate")
+            && let (Some(get), Some(set)) = (a.get_master_clock_rate, a.set_master_clock_rate)
+        {
+            let mut mcr = 0.0;
+            if get(s.usrp, 0, &mut mcr) == 0 && (mcr - cfg.rate_hz).abs() < 1.0 && 2.0 * cfg.rate_hz <= MAX_MASTER_CLOCK_HZ {
+                check(a, "master clock", set(s.usrp, 2.0 * cfg.rate_hz, 0))?;
+                check(a, "set rate", (a.set_rx_rate)(s.usrp, cfg.rate_hz, 0))?;
+            }
+        }
         let mut actual = 0.0;
         check(a, "get rate", (a.get_rx_rate)(s.usrp, 0, &mut actual))?;
         if (actual - cfg.rate_hz).abs() > 1.0 {
@@ -310,19 +406,20 @@ fn stream_once(source: usize, cfg: &UsrpConfig, tx: &SyncSender<SourceMsg>, stop
             }
             check(a, "set gain", (a.set_rx_gain)(s.usrp, cfg.gain_db, 0, c"".as_ptr()))?;
         }
-        // A reference off by `ppm` makes a requested f come out at f·(1+ppm).
-        let mut req = TuneRequest {
-            target_freq: cfg.center_hz / (1.0 + cfg.ppm * 1e-6),
-            rf_freq_policy: POLICY_AUTO,
-            rf_freq: 0.0,
-            dsp_freq_policy: POLICY_AUTO,
-            dsp_freq: 0.0,
-            args: std::ptr::null_mut(),
-        };
-        let mut res = TuneResult::default();
-        check(a, "tune", (a.set_rx_freq)(s.usrp, &mut req, 0, &mut res))?;
+        s.tune(cfg.center_hz)?;
 
-        let (cpu, otw, sargs) = (c"fc32".to_owned(), c"sc16".to_owned(), c"".to_owned());
+        // A B2xx on USB 2.0 (a port, a hub, a cable) is the usual cause of overflows at high rates.
+        let usb2 = b2xx && super::usb_speed::slowest(super::usb_speed::ETTUS_VID).is_some_and(super::usb_speed::is_usb2_class);
+        let otw = wire_format(&cfg.wire_format, b2xx, usb2, cfg.rate_hz);
+        log::info!(
+            "{} {}{}: {:.3} MSPS, {otw} on the wire{}",
+            if board.is_empty() { "USRP" } else { &board },
+            if serial.is_empty() { String::new() } else { format!("SN {serial}") },
+            if usb2 { " on USB 2.0" } else { "" },
+            actual / 1e6,
+            if usb2 && cfg.rate_hz > 8e6 && otw == "sc16" { " — USB 2.0 has little room for that: expect overflows (a USB 3 port, or wire format sc12)" } else { "" }
+        );
+        let (cpu, otw, sargs) = (c"fc32".to_owned(), CString::new(otw).map_err(|e| e.to_string())?, c"".to_owned());
         let mut chan = [0usize];
         let mut sa = StreamArgs {
             cpu_format: cpu.as_ptr() as *mut c_char,
@@ -345,25 +442,14 @@ fn stream_once(source: usize, cfg: &UsrpConfig, tx: &SyncSender<SourceMsg>, stop
         let mut next_t: Option<f64> = None;
         let mut timeouts = 0;
         while !stop.load(Ordering::Relaxed) {
-            if let Some(c) = ctl {
-                let (freq, gain) = c.take();
-                if let Some(f) = freq {
-                    let mut req = TuneRequest { target_freq: f / (1.0 + cfg.ppm * 1e-6), ..req };
-                    check(a, "tune", (a.set_rx_freq)(s.usrp, &mut req, 0, &mut res))?;
-                    *c.current_hz.lock().unwrap() = Some(f);
-                }
-                if let Some(g) = gain {
-                    check(a, "set gain", (a.set_rx_gain)(s.usrp, g as f64, 0, c"".as_ptr()))?;
-                }
-                if freq.is_some() || gain.is_some() {
-                    let hz = c.current_hz.lock().unwrap().unwrap_or(cfg.center_hz);
-                    if tx.send(SourceMsg::Tuned { center_hz: hz }).is_err() {
-                        return Ok(());
-                    }
-                }
+            if let Some(c) = ctl
+                && c.apply(&mut s, cfg.center_hz, sink)? == Applied::Closed
+            {
+                return Ok(());
             }
-            let mut buf = vec![Complex32::default(); per];
-            let mut ptr = buf.as_mut_ptr() as *mut c_void;
+            let mut buf = sink.iq_buffer(per);
+            buf.vec().resize(per, Complex32::default());
+            let mut ptr = buf.vec().as_mut_ptr() as *mut c_void;
             let mut n = 0usize;
             check(a, "receive", (a.rx_streamer_recv)(s.rx, &mut ptr, per, &mut s.md, 1.0, false, &mut n))?;
             let mut code = 0;
@@ -398,8 +484,8 @@ fn stream_once(source: usize, cfg: &UsrpConfig, tx: &SyncSender<SourceMsg>, stop
             if n == 0 {
                 continue;
             }
-            buf.truncate(n);
-            if tx.send(SourceMsg::Iq { source, samples: buf, dropped, at: std::time::Instant::now() }).is_err() {
+            buf.vec().truncate(n);
+            if !sink.send(Block::Iq(buf), dropped, std::time::Instant::now()) {
                 return Ok(());
             }
         }
@@ -409,12 +495,21 @@ fn stream_once(source: usize, cfg: &UsrpConfig, tx: &SyncSender<SourceMsg>, stop
 
 #[cfg(test)]
 mod tests {
-    use super::device_args;
+    use super::{device_args, wire_format};
 
     #[test]
     fn recv_frames_added_unless_set() {
-        assert_eq!(device_args(""), "num_recv_frames=256");
-        assert_eq!(device_args("serial=31A"), "serial=31A,num_recv_frames=256");
+        assert_eq!(device_args(""), "num_recv_frames=1024");
+        assert_eq!(device_args("serial=31A"), "serial=31A,num_recv_frames=1024");
         assert_eq!(device_args("serial=31A, num_recv_frames=64"), "serial=31A, num_recv_frames=64");
+    }
+
+    #[test]
+    fn wire_format_chosen_for_the_link() {
+        assert_eq!(wire_format("", true, true, 10e6), "sc12", "a B2xx on USB 2.0 above 8 MSPS");
+        assert_eq!(wire_format("", true, true, 8e6), "sc16");
+        assert_eq!(wire_format("", true, false, 20e6), "sc16", "USB 3");
+        assert_eq!(wire_format("", false, true, 10e6), "sc16", "not a B2xx");
+        assert_eq!(wire_format("sc8", true, false, 1e6), "sc8", "as set");
     }
 }

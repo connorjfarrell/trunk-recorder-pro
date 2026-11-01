@@ -24,7 +24,10 @@ protocol, plus an SDK that does the plumbing for you:
 - **`Host::metrics`**: report the same yourself (`Metrics`: queue, timing,
   bytes sent, the services you talk to, and any figures of your own in
   `extra`) when you don't use the queue.
-- **`TalkgroupFilter`**: Trunk Recorder's talkgroup allow and deny patterns.
+- **`Talkgroups`** and **`TalkgroupFilter`**: a system's talkgroups as the
+  uploaders pick them (every one, only some, all but some), its settings form
+  and checks; and the allow and deny lists it comes to: numbers, ranges
+  (`1000-1099`) and patterns (`507*`).
 - **`Multipart`**: a `multipart/form-data` body for any HTTP client.
 - **`testing`**: run a plugin without the recorder, and a mock web server to
   point it at.
@@ -72,6 +75,13 @@ Complete plugins to learn from:
 
 `sdk` (on by default) is everything for writing a plugin. The recorder itself
 uses only the protocol types, with `default-features = false`.
+
+## Recorded calls
+
+`host.calls(CallsQuery { talkgroup: Some(101), ..Default::default() })` asks the recorder for
+recorded calls (by system, talkgroup, radio and time, a page at a time); the page arrives at
+`Plugin::calls(request, page)` with the request number it returned. A `CallsPage` is `entries`, `next` (present when more calls remain: put it in the next query's `cursor`) and `error` (the call store is off: the page is the recent calls alone). The recorder answers from its call store, the
+latest calls included. On the wire the request number rides beside the query and the page: `{"type":"calls.query","request":1,"talkgroup":101}` and `{"type":"calls","request":1,"entries":[...],"next":"..."}`. (Since SDK 0.9.0.)
 
 ## Versions
 

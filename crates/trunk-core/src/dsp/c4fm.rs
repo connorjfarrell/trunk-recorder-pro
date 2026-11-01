@@ -24,6 +24,7 @@ use std::f64::consts::PI;
 use num_complex::Complex32;
 
 use super::filters;
+use super::levels;
 use super::msd::{Msd, Pulse};
 use super::{Receiver, Symbol};
 
@@ -71,6 +72,10 @@ pub struct C4fmOptions {
     /// Also undo a transmitter's x / sin x pre-emphasis (NXDN's: TS 1-A
     /// §3.4–3.5): the matched filter times sin(πfT)/(πfT), a one-symbol boxcar.
     pub rx_sinc: bool,
+    /// Decimate the channel first (by the largest whole factor) to no fewer
+    /// samples per symbol than this; 0: never. Every stage's cost is per
+    /// sample, and MSD's per symbol grows with them too.
+    pub min_sps: f64,
 }
 
 /// P25: an RRC matched filter (α 0.5) and cluster-mean levels. Against the
@@ -79,7 +84,7 @@ pub struct C4fmOptions {
 /// CQPSK receivers carry it.
 impl Default for C4fmOptions {
     fn default() -> Self {
-        C4fmOptions { box_symbols: 0.9, rrc: Some(0.5), clip: None, rail_means: true, block: BLOCK, msd: Some(Pulse::Rc(0.2)), baud: SYMBOL_RATE, outer_hz: 1800.0, rx_sinc: false }
+        C4fmOptions { box_symbols: 0.9, rrc: Some(0.5), clip: None, rail_means: true, block: BLOCK, msd: Some(Pulse::Rc(0.2)), baud: SYMBOL_RATE, outer_hz: 1800.0, rx_sinc: false, min_sps: 0.0 }
     }
 }
 
@@ -92,14 +97,16 @@ impl C4fmOptions {
 
     /// NXDN at `baud` (2400: NXDN48, 4800: NXDN96): root-raised-cosine
     /// shaped (α 0.2) like DMR. (The spec adds a sinc pre-emphasis at the
-    /// transmitter and its inverse at the receiver, which cancel.)
+    /// transmitter and its inverse at the receiver, which cancel.) At no
+    /// more samples per symbol than DMR runs at: NXDN48 on a 37.5 kS/s
+    /// channel is decimated by 2 (a Type-D site watches every repeater).
     pub fn nxdn(baud: f64) -> Self {
-        C4fmOptions { baud, outer_hz: if baud < 3000.0 { 1050.0 } else { 2400.0 }, ..Self::dmr() }
+        C4fmOptions { baud, outer_hz: if baud < 3000.0 { 1050.0 } else { 2400.0 }, min_sps: 7.5, ..Self::dmr() }
     }
 
     /// The first receiver (boxcar, quantile levels), for comparisons.
     pub fn legacy() -> Self {
-        C4fmOptions { box_symbols: 0.9, rrc: None, clip: None, rail_means: false, block: BLOCK, msd: None, baud: SYMBOL_RATE, outer_hz: 1800.0, rx_sinc: false }
+        C4fmOptions { box_symbols: 0.9, rrc: None, clip: None, rail_means: false, block: BLOCK, msd: None, baud: SYMBOL_RATE, outer_hz: 1800.0, rx_sinc: false, min_sps: 0.0 }
     }
 
     /// Apply one `name[=value]` setting; false if unknown.
@@ -118,6 +125,7 @@ impl C4fmOptions {
             "nomsd" => self.msd = None,
             "block" => self.block = v.unwrap_or(240.0) as u64,
             "sinc" => self.rx_sinc = v.is_none_or(|v| v != 0.0),
+            "minsps" => self.min_sps = v.unwrap_or(0.0),
             _ => return false,
         }
         true
@@ -126,6 +134,10 @@ impl C4fmOptions {
 
 pub struct C4fm {
     opts: C4fmOptions,
+    /// The channel decimated first ([`C4fmOptions::min_sps`]); everything
+    /// else runs at the lower rate.
+    decim: Option<Decimator>,
+    dec: Vec<Complex32>,
     msd: Option<Msd>,
     msd_in: Vec<Symbol>,
     /// Multi-symbol detection running (the signal isn't clean enough without it).
@@ -226,12 +238,17 @@ impl C4fm {
     }
 
     pub fn with_options(rate: f64, opts: C4fmOptions) -> Self {
+        let n = if opts.min_sps > 0.0 { ((rate / opts.baud / opts.min_sps).floor() as usize).max(1) } else { 1 };
+        let decim = (n > 1).then(|| Decimator::new(n, 1.25 * opts.baud / rate));
+        let rate = rate / n as f64;
         let sps = rate / opts.baud;
         let boxw = ((sps * opts.box_symbols).round() as usize).max(1);
         let taps = opts.rrc.map(|a| filters::rrc_taps(a, sps, (8.0 * sps).round() as usize | 1)).map(|t| if opts.rx_sinc { filters::with_boxcar(&t, sps) } else { t });
         let delay = taps.as_ref().map_or((boxw - 1) as f64 / 2.0, |t| (t.len() - 1) as f64 / 2.0);
         C4fm {
             opts,
+            decim,
+            dec: Vec::new(),
             // DMR (RRC pulse): decision feedback; P25 (RC): the full search.
             msd: opts.msd.map(|p| Msd::with_baud(rate, opts.baud, p, opts.rrc.unwrap_or(0.5), matches!(p, Pulse::Rrc(_)))),
             msd_in: Vec::new(),
@@ -453,40 +470,10 @@ impl C4fm {
                 self.tmp.clear();
                 self.tmp.extend(self.soft.iter());
             }
-            let n = self.tmp.len();
-            let (lo, hi) = (n * 2 / 100, (n * 98 / 100).min(n - 1));
-            let q_lo = *self.tmp.select_nth_unstable_by(lo, f32::total_cmp).1;
-            let q_hi = *self.tmp.select_nth_unstable_by(hi, f32::total_cmp).1;
-            self.center = (q_hi + q_lo) / 2.0;
-            let outer = (q_hi - q_lo) / 2.0;
-            self.thr = if outer > 300.0 { outer * 2.0 / 3.0 } else { self.opts.outer_hz * 2.0 / 3.0 };
-            if self.opts.rail_means && outer > 300.0 {
-                // Refine from the clusters: a few rounds of assigning symbols to
-                // the nearest level and taking each level's mean.
-                for _ in 0..3 {
-                    let (mut s, mut n) = ([0.0f64; 4], [0u32; 4]);
-                    for &v in &self.tmp {
-                        let x = v - self.center;
-                        let k = if x >= self.thr { 3 } else if x >= 0.0 { 2 } else if x >= -self.thr { 1 } else { 0 };
-                        s[k] += v as f64;
-                        n[k] += 1;
-                    }
-                    if n.iter().any(|&c| c < 8) {
-                        break;
-                    }
-                    let m: Vec<f32> = (0..4).map(|k| (s[k] / n[k] as f64) as f32).collect();
-                    // Spread of the symbols about their levels, against the level step.
-                    let mut var = 0f64;
-                    for &v in &self.tmp {
-                        let k = (0..4).min_by(|&a, &b| (v - m[a]).abs().total_cmp(&(v - m[b]).abs())).unwrap();
-                        var += ((v - m[k]) as f64).powi(2);
-                    }
-                    let sd = (var / self.tmp.len() as f64).sqrt() as f32;
-                    self.separation = (m[3] - m[0]) / 3.0 / sd.max(1e-3);
-                    self.center = (m[0] + m[3]) / 2.0;
-                    // Thresholds halfway between the inner and outer levels.
-                    self.thr = ((m[2] + m[3]) / 2.0 - self.center + self.center - (m[0] + m[1]) / 2.0) / 2.0;
-                }
+            let f = levels::fit::<4>(&mut self.tmp, levels::FitOptions { min_outer: 300.0, default_outer: self.opts.outer_hz, means: self.opts.rail_means });
+            (self.center, self.thr) = (f.center, f.thr);
+            if let Some(sep) = f.separation {
+                self.separation = sep;
             }
         }
         let x = v - self.center;
@@ -561,6 +548,22 @@ impl Receiver for C4fm {
     }
 
     fn push(&mut self, iq: &[Complex32], out: &mut Vec<Symbol>) {
+        let Some(d) = self.decim.as_mut() else { return self.push_at_rate(iq, out) };
+        let mut dec = std::mem::take(&mut self.dec);
+        dec.clear();
+        d.push(iq, &mut dec);
+        let (n, from) = (d.n as f64, out.len());
+        self.push_at_rate(&dec, out);
+        self.dec = dec;
+        // (Back to the channel's samples: decimated sample k is the channel's k·n.)
+        for s in &mut out[from..] {
+            s.sample *= n;
+        }
+    }
+}
+
+impl C4fm {
+    fn push_at_rate(&mut self, iq: &[Complex32], out: &mut Vec<Symbol>) {
         let k = (self.rate / (2.0 * PI)) as f32;
         // Clicks: a noise-driven phase wrap gives a spike far outside the rails.
         let lim = self.opts.clip.map(|c| c * (self.thr * 1.5).max(1500.0));
@@ -649,6 +652,49 @@ impl Receiver for C4fm {
             }
         }
         self.compact();
+    }
+}
+
+/// Decimation by `n` behind a low-pass: output k is the channel's sample k·n
+/// (centred: the filter's delay is taken out).
+struct Decimator {
+    n: usize,
+    taps: Vec<f32>,
+    /// From channel sample `x0` on (before the first: zeros).
+    x: Vec<Complex32>,
+    x0: i64,
+    /// The next output's channel sample.
+    next: i64,
+}
+
+impl Decimator {
+    /// `pass`: the signal's edge, cycles per channel sample. Only what folds
+    /// onto it must go: the band from 1/n − pass up; the cutoff is 0.5/n.
+    fn new(n: usize, pass: f64) -> Self {
+        let width = (1.0 / n as f64 - 2.0 * pass).max(0.05);
+        let len = ((5.5 / width).ceil() as usize) | 1;
+        let h = filters::blackman_sinc(len, 0.5 / n as f64);
+        let sum: f64 = h.iter().sum();
+        let half = (len / 2) as i64;
+        Decimator { n, taps: h.iter().map(|v| (v / sum) as f32).collect(), x: vec![Complex32::default(); half as usize], x0: -half, next: 0 }
+    }
+
+    fn push(&mut self, iq: &[Complex32], out: &mut Vec<Complex32>) {
+        self.x.extend_from_slice(iq);
+        let half = (self.taps.len() / 2) as i64;
+        let end = self.x0 + self.x.len() as i64;
+        while self.next + half < end {
+            let w = &self.x[(self.next - half - self.x0) as usize..][..self.taps.len()];
+            let mut acc = Complex32::default();
+            for (a, &t) in w.iter().zip(&self.taps) {
+                acc += a * t;
+            }
+            out.push(acc);
+            self.next += self.n as i64;
+        }
+        let drop = (self.next - half - self.x0).clamp(0, self.x.len() as i64);
+        self.x.drain(..drop as usize);
+        self.x0 += drop;
     }
 }
 

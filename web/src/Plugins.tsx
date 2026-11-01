@@ -9,82 +9,47 @@
 // The settings forms are drawn from the schemas plugins describe themselves
 // with (trunk-recorder-plugin's schema.rs lists the subset).
 
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   addPlugin,
   addSystemPluginCopy,
-  fetchPluginStore,
-  installPlugin,
-  installPluginFrom,
+  installFromGitHub,
+  installFromStore,
+  pluginAction,
   pluginOn,
   removePlugin,
   removeSystemPluginCopy,
   setM4a,
   setPluginEnabled,
   setPluginSettings,
+  setPluginShareDecrypted,
   setSystemPluginOverride,
   setSystemPluginSettings,
   settingsOpened,
   setView,
   systemAt,
   useApp,
+  useSelect,
   type AppState,
+  type PluginActionResult,
   type SystemRef,
 } from "./controller.ts";
+import { activeSystems } from "./config.ts";
+import { EveryDelays, PluginDelay } from "./Delays.tsx";
 import { IconPuzzle, IconUpload, IconWave } from "./Onboarding.tsx";
 import { showTodo } from "./Setup.tsx";
-import { Group, Section } from "./SetupLayout.tsx";
+import { DraftInput, NumberInput, TextArea, TextInput, Toggle } from "./inputs.tsx";
+import { numberList, talkgroupList, talkgroupProblem, textList } from "./fieldText.ts";
+import { Group, Section, Switch } from "./SetupLayout.tsx";
+import { Card } from "./charts.tsx";
+import { ToneList } from "./ToneList.tsx";
 import { openTodos } from "./todo.ts";
 import { copyOverride, copyOwn, pluginCopies } from "./protocol.ts";
-import type { Config, PluginInfo, PluginInstall, PluginManifest, PluginSchema, PluginStore, PluginValues, PluginsList, StoreListing } from "./protocol.ts";
-
-/** Is version `a` newer than `b`? Semver: a prerelease is older than its release. */
-function newer(a: string, b: string): boolean {
-  const parse = (v: string) => {
-    const [core, pre] = v.replace(/^v/, "").split("+")[0].split(/-(.*)/s);
-    const n = core.split(".").map(Number);
-    return n.length === 3 && n.every(Number.isInteger) ? { n, pre: pre ?? null } : null;
-  };
-  const x = parse(a);
-  const y = parse(b);
-  if (!x || !y) return false;
-  for (let i = 0; i < 3; i++) if (x.n[i] !== y.n[i]) return x.n[i] > y.n[i];
-  if (x.pre === null || y.pre === null) return x.pre === null && y.pre !== null;
-  return x.pre > y.pre;
-}
-
-const STAGES: Record<PluginInstall["stage"], string> = {
-  finding: "Finding it…",
-  downloading: "Downloading…",
-  checking: "Checking it…",
-  installing: "Installing…",
-  done: "Installed",
-  failed: "Didn't install",
-};
-
-/** The tier, as a chip. */
-function TierChip(props: { tier: StoreListing["tier"] | "unreviewed"; title?: string }) {
-  switch (props.tier) {
-    case "official":
-      return (
-        <span className="chip ok" title={props.title ?? "From the recorder's authors; reviewed"}>
-          Official
-        </span>
-      );
-    case "community":
-      return (
-        <span className="chip" title={props.title ?? "Third-party; reviewed"}>
-          Community
-        </span>
-      );
-    default:
-      return (
-        <span className="chip warn" title={props.title ?? "Not from the registry; unreviewed"}>
-          Not reviewed
-        </span>
-      );
-  }
-}
+import { fieldsOf } from "./pluginSettings.ts";
+import { applies, fillTemplate, followRenames, mentions, refOptions, summarize, type KeyMemory } from "./pluginForm.ts";
+import { signalChoices, signalRef } from "./Signals.tsx";
+import type { Config, InstallProgress, PluginContribution, PluginInfo, PluginListing, PluginManifest, PluginSchema, PluginValues, PluginsList, SignalDef } from "./protocol.ts";
+import { Author, InstallStage, newer, STAGES, StoreCard, StorePanel, TierChip, webUrl, type StoreWords } from "./StoreParts.tsx";
 
 /** "apiKey" → "Api key": a label for a field the plugin didn't title. */
 function spell(key: string): string {
@@ -94,12 +59,6 @@ function spell(key: string): string {
     .trim()
     .toLowerCase();
   return words.charAt(0).toUpperCase() + words.slice(1);
-}
-
-function fieldsOf(schema: PluginSchema | undefined): [string, PluginSchema][] {
-  const props = schema?.properties ?? {};
-  const order = schema?.["x-order"] ?? Object.keys(props);
-  return order.filter((k) => props[k]).map((k) => [k, props[k]]);
 }
 
 const hasFields = (schema: PluginSchema | undefined) => fieldsOf(schema).length > 0;
@@ -160,6 +119,11 @@ function destinationOf(m: PluginManifest, over: PluginValues): string | null {
 }
 
 /** The systems plugins can be set up for: where each is, its short name (conventional ones with channels), and its copies of each plugin. */
+/** Some system that records names encryption keys (only then can a call be decrypted). */
+function hasKeys(c: Config): boolean {
+  return activeSystems(c).some((s) => !!s.keys?.trim()) || c.conventional.some((x) => x.enabled && !!x.keys?.trim());
+}
+
 function systemsOf(c: Config): { at: SystemRef; name: string; copies: (id: string) => PluginValues[] }[] {
   const out: { at: SystemRef; name: string; copies: (id: string) => PluginValues[] }[] = c.systems.map((x, i) => ({
     at: i,
@@ -172,29 +136,6 @@ function systemsOf(c: Config): { at: SystemRef; name: string; copies: (id: strin
   return out;
 }
 
-/** A system was renamed: plugin settings that name it (`x-system` fields) follow. Changes `x`. */
-export function renameSystemRefs(x: Config, from: string, to: string, plugins: PluginInfo[]): void {
-  if (!from || from === to) return;
-  const walk = (schema: PluginSchema | undefined, v: unknown) => {
-    if (!v || typeof v !== "object") return;
-    const obj = v as PluginValues;
-    for (const [k, f] of fieldsOf(schema)) {
-      if (f["x-system"] && obj[k] === from) obj[k] = to;
-      else if (f.type === "object") walk(f, obj[k]);
-      else if (f.type === "array" && f.items?.type === "object" && Array.isArray(obj[k])) for (const item of obj[k] as unknown[]) walk(f.items, item);
-    }
-  };
-  for (const p of plugins) {
-    if (!p.manifest) continue;
-    walk(p.manifest.config, x.plugins?.[p.id]?.settings);
-    for (const sys of [...x.systems, ...x.conventional])
-      for (const v of pluginCopies(sys.plugins?.[p.id])) {
-        walk(p.manifest.system_config, v);
-        walk(p.manifest.config, copyOverride(v));
-      }
-  }
-}
-
 function isUrl(s: string): boolean {
   try {
     const u = new URL(s);
@@ -204,14 +145,203 @@ function isUrl(s: string): boolean {
   }
 }
 
+/** The settings a form shows, whole (the lists `x-ref` names are in them), and whose they are (for its buttons). */
+const FormRoot = createContext<{ plugin: string; values: PluginValues }>({ plugin: "", values: {} });
+
+/** Choices to tick, as chips; ticked ones no longer offered stay, marked. */
+function Ticks(props: { id: string; options: { value: string; label: string }[]; value: string[]; onChange: (v: string[]) => void; none: string }) {
+  const { options, value } = props;
+  const gone = value.filter((v) => !options.some((o) => o.value === v)).map((v) => ({ value: v, label: `${v} (gone)` }));
+  const all = [...options, ...gone];
+  if (!all.length) return <span className="muted small">{props.none}</span>;
+  return (
+    <div className="ticks" id={props.id} role="group">
+      {all.map((o) => {
+        const on = value.includes(o.value);
+        return (
+          <button
+            type="button"
+            key={o.value}
+            className={`chip tick${on ? " on" : ""}`}
+            aria-pressed={on}
+            onClick={() => props.onChange(on ? value.filter((v) => v !== o.value) : [...value, o.value])}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** An object's buttons (`x-actions`): each sends the plugin the object as it is now, and shows how it went (the plugin's answer, to this browser). */
+function ActionButtons(props: { schema: PluginSchema | undefined; value: unknown }) {
+  const root = useContext(FormRoot);
+  const [said, setSaid] = useState<Record<string, { pending: boolean; ok: boolean; message: string }>>({});
+  const defs = props.schema?.["x-actions"] ?? [];
+  if (!defs.length || !root.plugin) return null;
+  const press = async (id: string) => {
+    setSaid((x) => ({ ...x, [id]: { pending: true, ok: false, message: "" } }));
+    // (Not answered at all: `ask` gives up with no `ok`.)
+    const r: Partial<PluginActionResult> = await pluginAction(root.plugin, id, props.value ?? {});
+    setSaid((x) => ({ ...x, [id]: { pending: false, ok: r.ok === true, message: r.message ?? "" } }));
+  };
+  return (
+    <div className="row plugin-buttons">
+      {defs.map((d) => {
+        const st = said[d.id];
+        return (
+          <span key={d.id} className="row">
+            <button type="button" className="btn small" disabled={st?.pending} title={d.hint} onClick={() => void press(d.id)}>
+              {d.label}
+            </button>
+            {st && (
+              <span className={`small ${st.pending ? "muted" : st.ok ? "tone-ok" : "bad-text"}`} role="status">
+                {st.pending ? "Sending…" : `${st.ok ? "✓" : "✗"} ${st.message || (st.ok ? "Done" : "Failed")}`}
+              </span>
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * A list's items, each its own group: titled by a field (`x-title`) with a line saying what it is (`x-summary`), an
+ * on/off switch (an `enabled` field) and opened to edit one at a time; or numbered and always open. `panel`: the list is
+ * a card of its own (a plugin's page), its fields laid out in a grid.
+ */
+function ObjectList(props: { f: PluginSchema; label: string; hint?: string; value: unknown; onChange: (v: unknown) => void; id: string; panel?: boolean }) {
+  const { f, id } = props;
+  const items = (Array.isArray(props.value) ? props.value : []) as PluginValues[];
+  const itemLabel = f.items?.title ?? "Item";
+  const titled = f.items?.["x-title"];
+  const switched = f.items?.properties?.enabled?.type === "boolean";
+  const [open, setOpen] = useState<number | null>(null);
+  const set = (next: PluginValues[]) => props.onChange(next.length ? next : undefined);
+  const setItem = (i: number, v: PluginValues) => set(items.map((x, j) => (j === i ? v : x)));
+  const remove = (i: number) => {
+    set(items.filter((_, j) => j !== i));
+    setOpen(null);
+  };
+  const add = () => {
+    set([...items, {}]);
+    setOpen(items.length);
+  };
+  const addButton = (
+    <button type="button" className={`btn small${props.panel ? " primary" : ""}`} onClick={add}>
+      Add {itemLabel.toLowerCase()}
+    </button>
+  );
+  const list = items.map((item, i) => {
+    const body = (
+      <>
+        <SchemaFields schema={f.items} values={item ?? {}} onChange={(v) => setItem(i, v)} id={`${id}-${i}`} grid={props.panel} omit={titled && switched ? ["enabled"] : []} />
+        <div className="row">
+          <ActionButtons schema={f.items} value={item} />
+          <span className="spacer" />
+          <button type="button" className="btn ghost small" onClick={() => remove(i)}>
+            Remove {itemLabel.toLowerCase()}
+          </button>
+        </div>
+      </>
+    );
+    if (!titled)
+      return (
+        <fieldset className="plugin-group" key={i}>
+          <legend>
+            {itemLabel} {i + 1}
+          </legend>
+          {body}
+        </fieldset>
+      );
+    const name = typeof item?.[titled] === "string" && item[titled] ? String(item[titled]) : `New ${itemLabel.toLowerCase()}`;
+    const on = item?.enabled !== false;
+    const line = summarize(f.items, item ?? {});
+    return (
+      <div className={`plugin-item${open === i ? " open" : ""}${on ? "" : " off"}`} key={i}>
+        <div className="plugin-item-head">
+          <button type="button" className="plugin-item-title" aria-expanded={open === i} onClick={() => setOpen(open === i ? null : i)}>
+            <span className="plugin-item-name">{name}</span>
+            {line && <span className="plugin-item-line">{line}</span>}
+          </button>
+          {switched && <Switch label={on ? "On" : "Off"} checked={on} onChange={(v) => setItem(i, { ...item, enabled: v })} />}
+          <button type="button" className="btn ghost small" aria-expanded={open === i} onClick={() => setOpen(open === i ? null : i)}>
+            {open === i ? "Close" : "Edit"}
+          </button>
+        </div>
+        {open === i && <div className="plugin-item-body">{body}</div>}
+      </div>
+    );
+  });
+  if (props.panel)
+    return (
+      <Card title={props.label} actions={addButton}>
+        {props.hint && <p className="muted small plugin-panel-hint">{props.hint}</p>}
+        <div className="stack">
+          {list}
+          {items.length === 0 && <p className="empty">None yet.</p>}
+        </div>
+      </Card>
+    );
+  return (
+    <fieldset className="plugin-group">
+      <legend>{props.label}</legend>
+      {props.hint && <p className="field-hint">{props.hint}</p>}
+      <div className="stack">
+        {list}
+        <div>{addButton}</div>
+      </div>
+    </fieldset>
+  );
+}
+
+/** An object in a list (a group of fields each): drawn as [`ObjectList`]. */
+const isList = (f: PluginSchema) => f.type === "array" && f.items?.type === "object";
+
+/** Its value is picked from choices ([`choicesOf`]): ticked (a list) or from a menu. */
+const choosesFrom = (f: PluginSchema) => !!(f.items?.enum || f["x-systems"] || f["x-signals"] || f["x-ref"] || f["x-system"]);
+
+/**
+ * The choices field `f` is picked from: its items' `enum`, the systems (`x-system`, `x-systems`), the signals
+ * (`x-signals`), another list's items (`x-ref`, in `root`). `none`: said when there are none to pick.
+ */
+function choicesOf(f: PluginSchema, c: Config | null, root: PluginValues): { options: { value: string; label: string }[]; none: string } {
+  if (f.items?.enum) return { options: f.items.enum.map((x, i) => ({ value: String(x), label: f.items?.["x-enum-labels"]?.[i] ?? String(x) })), none: "" };
+  if (f["x-signals"]) return { options: c ? signalChoices(c) : [], none: "No signals yet: name them in Setup (each system's Signals), or Add one from its Tones card" };
+  if (f["x-ref"]) return { options: refOptions(root, f["x-ref"]), none: `None yet: add them under ${spell(f["x-ref"])}` };
+  return { options: (c ? systemsOf(c) : []).map((x) => ({ value: x.name, label: x.name })), none: "No systems yet" };
+}
+
+/** A menu of choices, `blank` first (not set); one picked that's no longer offered stays, marked. */
+function Menu(props: { id: string; options: { value: string; label: string }[]; value: string; blank: string; onChange: (v: string | undefined) => void }) {
+  const { options, value } = props;
+  return (
+    <select id={props.id} value={value} onChange={(e) => props.onChange(e.target.value === "" ? undefined : e.target.value)}>
+      <option value="">{props.blank}</option>
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label}
+        </option>
+      ))}
+      {value && !options.some((o) => o.value === value) && <option value={value}>{value} (gone)</option>}
+    </select>
+  );
+}
+
 /** One setting. Empty text means "not set": the value for every system
  * (`inherited`), else the plugin's default, applies — shown as the placeholder. */
-function SchemaField(props: { name: string; schema: PluginSchema; value: unknown; onChange: (v: unknown) => void; id: string; inherited?: unknown; required?: boolean }) {
+const textByComma = textList(/,/);
+const numbersByComma = numberList(/,/);
+
+function SchemaField(props: { name: string; schema: PluginSchema; value: unknown; onChange: (v: unknown) => void; id: string; inherited?: unknown; required?: boolean; panel?: boolean }) {
   const { schema: f, value, onChange, id, inherited } = props;
   const label = f.title ?? spell(props.name);
   const hint = f.description;
   const [shown, setShown] = useState(false);
   const c = useApp().config;
+  const root = useContext(FormRoot);
   const fallback = emptyValue(inherited) ? f.default : inherited;
   const needed = !!props.required && emptyValue(value) && emptyValue(inherited);
 
@@ -225,66 +355,36 @@ function SchemaField(props: { name: string; schema: PluginSchema; value: unknown
       </fieldset>
     );
   }
-  if (f.type === "array" && f.items?.type === "object") {
-    const items = (Array.isArray(value) ? value : []) as PluginValues[];
-    const itemLabel = f.items.title ?? "Item";
-    const set = (next: PluginValues[]) => onChange(next.length ? next : undefined);
+  if (f.type === "array" && f["x-tones"])
     return (
-      <fieldset className="plugin-group">
-        <legend>{label}</legend>
-        {hint && <p className="field-hint">{hint}</p>}
-        <div className="stack">
-          {items.map((item, i) => (
-            <fieldset className="plugin-group" key={i}>
-              <legend>
-                {itemLabel} {i + 1}
-              </legend>
-              <SchemaFields schema={f.items} values={item ?? {}} onChange={(v) => set(items.map((x, j) => (j === i ? v : x)))} id={`${id}-${i}`} />
-              <button type="button" className="btn ghost small" onClick={() => set(items.filter((_, j) => j !== i))}>
-                Remove {itemLabel.toLowerCase()} {i + 1}
-              </button>
-            </fieldset>
-          ))}
-          <div>
-            <button type="button" className="btn small" onClick={() => set([...items, {}])}>
-              Add {itemLabel.toLowerCase()}
-            </button>
-          </div>
-        </div>
-      </fieldset>
+      <div className="field">
+        <span className="field-label">{label}</span>
+        {hint && <span className="field-hint">{hint}</span>}
+        <ToneList value={value} onChange={onChange} id={id} />
+      </div>
     );
-  }
+  if (isList(f)) return <ObjectList f={f} label={label} hint={hint} value={value} onChange={onChange} id={id} panel={props.panel} />;
   if (f.type === "boolean") {
     const on = typeof value === "boolean" ? value : fallback === true;
     return (
-      <label className="toggle" htmlFor={id}>
-        <input id={id} type="checkbox" checked={on} onChange={(e) => onChange(e.target.checked)} />
-        <span>
-          {label}
-          {hint && <span className="field-hint"> — {hint}</span>}
-        </span>
-      </label>
+      <Toggle id={id} label={label} hint={hint} checked={on} onChange={onChange} />
     );
   }
 
   let control: React.ReactNode;
   let problem: string | null = null;
-  if (f["x-system"]) {
-    // A menu of the systems (and one no longer there, if it names one).
-    const names = c ? systemsOf(c).map((x) => x.name) : [];
-    const cur = typeof value === "string" ? value : "";
-    control = (
-      <select id={id} value={cur} onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}>
-        <option value="">{typeof fallback === "string" && fallback ? `As for every system (${fallback})` : props.required ? "Choose a system" : "Every system"}</option>
-        {names.map((n) => (
-          <option key={n} value={n}>
-            {n}
-          </option>
-        ))}
-        {cur && !names.includes(cur) && <option value={cur}>{cur} (no such system)</option>}
-      </select>
-    );
-    if (cur && !names.includes(cur)) problem = "No system has this name any more";
+  if (choosesFrom(f)) {
+    const { options, none } = choicesOf(f, c, root.values);
+    if (f.type === "array") {
+      const list = (Array.isArray(value) ? value : []).map(String);
+      control = <Ticks id={id} options={options} value={list} onChange={(v) => onChange(v.length ? v : undefined)} none={none} />;
+    } else {
+      // A menu (with one no longer there, if it names one).
+      const cur = typeof value === "string" ? value : "";
+      const blank = !f["x-system"] ? "None" : typeof fallback === "string" && fallback ? `As for every system (${fallback})` : props.required ? "Choose a system" : "Every system";
+      control = <Menu id={id} options={options} value={cur} blank={blank} onChange={onChange} />;
+      if (cur && !options.some((o) => o.value === cur)) problem = f["x-system"] ? "No system has this name any more" : "No longer there";
+    }
   } else if (f.enum) {
     const labels = f["x-enum-labels"];
     const cur = value ?? fallback ?? f.enum[0];
@@ -298,18 +398,14 @@ function SchemaField(props: { name: string; schema: PluginSchema; value: unknown
       </select>
     );
   } else if (f.type === "integer" || f.type === "number") {
-    const text = typeof value === "number" ? String(value) : "";
     control = (
-      <input
+      <NumberInput
         id={id}
-        className="mono"
-        type="number"
-        min={f.minimum}
-        max={f.maximum}
-        step={f.type === "integer" ? 1 : "any"}
-        value={text}
+        label={label}
+        inputMode={f.type === "integer" ? "numeric" : "decimal"}
+        value={typeof value === "number" ? value : undefined}
         placeholder={fallback !== undefined && fallback !== null ? String(fallback) : ""}
-        onChange={(e) => onChange(e.target.value === "" ? undefined : Number(e.target.value))}
+        onChange={onChange}
       />
     );
     if (typeof value === "number") {
@@ -320,37 +416,36 @@ function SchemaField(props: { name: string; schema: PluginSchema; value: unknown
   } else if (f.type === "array") {
     const items = Array.isArray(value) ? value : [];
     const numeric = f.items?.type === "integer" || f.items?.type === "number";
+    const tgs = !!f["x-talkgroups"];
     control = (
-      <input
+      <DraftInput
         id={id}
-        className={numeric ? "mono" : ""}
-        value={items.join(", ")}
-        placeholder={Array.isArray(fallback) && fallback.length ? fallback.join(", ") : "Separate with commas"}
-        onChange={(e) => {
-          const parts = e.target.value.split(",").map((x) => x.trim());
-          const vals = numeric ? parts.filter((x) => x !== "").map(Number) : parts.filter((x, i) => x !== "" || i === parts.length - 1);
-          onChange(vals.length ? vals : undefined);
-        }}
+        className={numeric || tgs ? "mono" : ""}
+        codec={numeric ? numbersByComma : tgs ? talkgroupList : textByComma}
+        value={tgs ? items.map(String) : items}
+        placeholder={Array.isArray(fallback) && fallback.length ? fallback.join(", ") : tgs ? "1001, 1000-1099, 507*" : "Separate with commas"}
+        onChange={(vals) => onChange(vals.length ? vals : undefined)}
       />
     );
     if (numeric && items.some((x) => typeof x === "number" && Number.isNaN(x))) problem = "Numbers, separated with commas";
+    if (tgs) problem = talkgroupProblem(items);
   } else {
     const text = typeof value === "string" ? value : "";
     const placeholder = typeof fallback === "string" ? fallback : "";
     const set = (v: string) => onChange(v === "" ? undefined : v);
     if (f["x-multiline"]) {
-      control = <textarea id={id} rows={4} value={text} placeholder={placeholder} onChange={(e) => set(e.target.value)} />;
+      control = <TextArea id={id} rows={4} value={text} placeholder={placeholder} onChange={set} />;
     } else if (f["x-secret"]) {
       control = (
         <span className="secret">
-          <input id={id} className="mono" type={shown ? "text" : "password"} autoComplete="off" value={text} placeholder={placeholder} onChange={(e) => set(e.target.value)} />
+          <TextInput id={id} className="mono" type={shown ? "text" : "password"} autoComplete="off" value={text} placeholder={placeholder} onChange={set} />
           <button type="button" className="btn ghost small" onClick={() => setShown(!shown)} aria-label={shown ? `Hide ${label}` : `Show ${label}`}>
             {shown ? "Hide" : "Show"}
           </button>
         </span>
       );
     } else {
-      control = <input id={id} type={f.format === "uri" ? "url" : "text"} value={text} placeholder={placeholder} onChange={(e) => set(e.target.value)} />;
+      control = <TextInput id={id} type={f.format === "uri" ? "url" : "text"} value={text} placeholder={placeholder} onChange={set} />;
     }
     if (f.format === "uri" && text && !isUrl(text)) problem = "A web address, like https://example.com";
   }
@@ -373,6 +468,11 @@ function SchemaField(props: { name: string; schema: PluginSchema; value: unknown
   );
 }
 
+/** A field that wants a whole row of a grid: a group, a list of groups, tones, choices to tick, a text area. */
+function wide(f: PluginSchema): boolean {
+  return f.type === "object" || isList(f) || (f.type === "array" && (!!f["x-tones"] || choosesFrom(f))) || !!f["x-multiline"];
+}
+
 function SchemaFields(props: {
   schema: PluginSchema | undefined;
   values: PluginValues;
@@ -381,27 +481,41 @@ function SchemaFields(props: {
   inherited?: PluginValues;
   /** The fields to mark as needed (by default, those the schema requires). */
   required?: string[];
+  /** Laid out in a grid (a plugin's page), rather than one under another. */
+  grid?: boolean;
+  /** Fields drawn elsewhere (an item's switch). */
+  omit?: string[];
 }) {
   const required = props.required ?? requiredOf(props.schema);
+  const fields = fieldsOf(props.schema).filter(([k, f]) => !props.omit?.includes(k) && applies(props.schema, props.values, f));
   return (
-    <div className="stack plugin-fields">
-      {fieldsOf(props.schema).map(([k, f]) => (
-        <SchemaField
-          key={k}
-          name={k}
-          schema={f}
-          id={`${props.id}-${k}`}
-          value={props.values[k]}
-          inherited={props.inherited?.[k]}
-          required={required.includes(k)}
-          onChange={(v) => {
-            const next = { ...props.values };
-            if (v === undefined) delete next[k];
-            else next[k] = v;
-            props.onChange(next);
-          }}
-        />
-      ))}
+    <div className={props.grid ? "plugin-grid" : "stack plugin-fields"}>
+      {fields.map(([k, f]) => {
+        const field = (
+          <SchemaField
+            key={k}
+            name={k}
+            schema={f}
+            id={`${props.id}-${k}`}
+            value={props.values[k]}
+            inherited={props.inherited?.[k]}
+            required={required.includes(k)}
+            onChange={(v) => {
+              const next = { ...props.values };
+              if (v === undefined) delete next[k];
+              else next[k] = v;
+              props.onChange(next);
+            }}
+          />
+        );
+        return props.grid ? (
+          <div key={k} className={wide(f) ? "wide" : ""}>
+            {field}
+          </div>
+        ) : (
+          field
+        );
+      })}
     </div>
   );
 }
@@ -428,7 +542,6 @@ export function SystemPluginSettings(props: { system: SystemRef }) {
   };
   return (
     <div className="system-plugins stack" id={typeof props.system === "number" ? `need-sysplug-${sys.shortName}` : `need-convplug-${sys.shortName}`}>
-      <h4>Plugins</h4>
       {plugins.flatMap((p) => {
         const m = p.manifest!;
         const every = c.plugins?.[p.id]?.settings;
@@ -455,16 +568,16 @@ export function SystemPluginSettings(props: { system: SystemRef }) {
               {hasFields(m.system_config) && (
                 <>
                   {!copySetUp(m, values, every) && <p className="field-hint warn-text">Not set up for {sys.shortName} yet.</p>}
-                  <SchemaFields
-                    schema={m.system_config}
-                    values={copyOwn(values)}
-                    inherited={every}
-                    onChange={(v) => setSystemPluginSettings(props.system, p.id, v, i)}
-                    id={idOf(i)}
-                  />
+                  <Held id={`copy:${sys.shortName}:${p.id}:${i}`} name={m.name} saved={copyOwn(values)} save={(v) => setSystemPluginSettings(props.system, p.id, v, i)} restarts>
+                    {(own, change) => <SchemaFields schema={m.system_config} values={own} inherited={every} onChange={change} id={idOf(i)} />}
+                  </Held>
                 </>
               )}
-              {hasFields(m.config) && <PluginOverride m={m} over={over} every={every} system={sys.shortName} id={`${idOf(i)}-ov`} onChange={(v) => setSystemPluginOverride(props.system, p.id, v, i)} />}
+              {hasFields(m.config) && (
+                <Held id={`override:${sys.shortName}:${p.id}:${i}`} name={m.name} saved={over} save={(v) => setSystemPluginOverride(props.system, p.id, v, i)} restarts>
+                  {(o, change) => <PluginOverride m={m} over={o} every={every} system={sys.shortName} id={`${idOf(i)}-ov`} onChange={change} />}
+                </Held>
+              )}
             </fieldset>
           );
         });
@@ -546,6 +659,7 @@ export function PluginSetupPanel() {
           {plugins.map((p) => (
             <PluginSetupCard key={p.id} p={p} c={c} />
           ))}
+          {plugins.some((p) => pluginOn(c, p.id)) && <EveryDelays />}
           {plugins.length === 0 && (
             <p className="empty">
               No plugins installed yet.{" "}
@@ -564,24 +678,30 @@ function PluginSetupCard(props: { p: PluginInfo; c: Config }) {
   const { p, c } = props;
   const s = useApp();
   const m = p.manifest;
-  const on = pluginOn(c, p.id);
+  const { on, recording, st, needs, state } = usePluginStatus(p, c);
   const settings = c.plugins?.[p.id]?.settings;
-  const recording = s.phase === "running" || s.phase === "starting";
-  const st = stateOf(p, on, recording);
   const imported = openTodos(s).find((t) => t.target === `plugin-${p.id}`);
-  const needs = m ? pluginNeeds(m, c, p.id) : [];
   const systems = systemsOf(c);
   const perSystem = !!m && hasFields(m.system_config);
   return (
     <article className={`plugin-card${on ? "" : " off"}${imported ? " needs" : ""}`} aria-labelledby={`ps-${p.id}`} id={`need-plugin-${p.id}`}>
       {imported && <div className="field-needs">{imported.text}</div>}
-      <PluginHead p={p} on={on} tone={st.tone} state={needs.length && on ? "Needs setting up" : st.text} titleId={`ps-${p.id}`} />
+      <PluginHead p={p} on={on} tone={st.tone} state={state} titleId={`ps-${p.id}`} />
       {m?.description && <p className="plugin-desc">{m.description}</p>}
       {p.problem && <p className="small bad-text">{p.problem}</p>}
-      {m && hasFields(m.config) && (
-        <div className="plugin-settings stack">
-          <SchemaFields schema={m.config} values={settings ?? {}} onChange={(v) => setPluginSettings(p.id, v)} id={`pg-${p.id}`} required={needs} />
+      {m?.page ? (
+        <div className="row">
+          <button className="btn" onClick={() => setView("plugin", p.id)}>
+            Open {m.page.title || m.name}
+          </button>
+          <span className="muted small">Its settings have a page of their own.</span>
         </div>
+      ) : (
+        m && hasFields(m.config) && (
+          <div className="plugin-settings stack">
+            <PluginSettingsForm p={p} m={m} settings={settings} needs={needs} />
+          </div>
+        )
       )}
       {m && perSystem && (
         <div className="plugin-systems small">
@@ -607,8 +727,193 @@ function PluginSetupCard(props: { p: PluginInfo; c: Config }) {
           )}
         </div>
       )}
-      {recording && on && <p className="small muted">Changes restart it.</p>}
+      {on && hasKeys(c) && (m?.subscribe.includes("audio") || m?.subscribe.includes("call.concluded")) && (
+        <Toggle
+          label="Share decrypted calls"
+          hint="Calls decrypted with your keys go to it too. Once sent they can't be taken back, and may become public."
+          checked={!!c.plugins?.[p.id]?.shareDecrypted}
+          onChange={(v) => setPluginShareDecrypted(p.id, v)}
+        />
+      )}
+      {on && (m?.subscribe.includes("audio") || m?.subscribe.includes("call.concluded")) && <PluginDelay p={p} c={c} />}
+      {recording && on && <ChangesNote m={m} />}
     </article>
+  );
+}
+
+/**
+ * A plugin's own settings (`config`), its buttons, and lists that name others' items kept in step. `page`: on its own
+ * page, each list of items is a card of its own and the rest a card of settings.
+ */
+function PluginSettingsForm(props: { p: PluginInfo; m: PluginManifest; settings: PluginValues | undefined; needs: string[]; page?: boolean }) {
+  const { p, m } = props;
+  return (
+    <Held id={`settings:${p.id}`} name={m.name} saved={props.settings ?? {}} save={(v) => setPluginSettings(p.id, v)} restarts={!m.live_settings}>
+      {(values, set) => <PluginSettingsFields {...props} values={values} set={set} />}
+    </Held>
+  );
+}
+
+/** [`PluginSettingsForm`]'s fields, showing `values` (held or saved), changed with `set`. */
+function PluginSettingsFields(props: { p: PluginInfo; m: PluginManifest; values: PluginValues; set: (v: PluginValues) => void; needs: string[]; page?: boolean }) {
+  const { p, m, values } = props;
+  const keys = useRef<KeyMemory>({});
+  const change = (v: PluginValues) => props.set(followRenames(m.config, values, v, keys.current));
+  if (!props.page)
+    return (
+      <FormRoot.Provider value={{ plugin: p.id, values }}>
+        <SchemaFields schema={m.config} values={values} onChange={change} id={`pg-${p.id}`} required={props.needs} />
+        <ActionButtons schema={m.config} value={values} />
+      </FormRoot.Provider>
+    );
+  const fields = fieldsOf(m.config);
+  const rest = fields.filter(([, f]) => !isList(f));
+  const restSchema: PluginSchema = { ...m.config, properties: Object.fromEntries(rest), "x-order": rest.map(([k]) => k) };
+  const setField = (k: string, v: unknown) => {
+    const next = { ...values };
+    if (v === undefined) delete next[k];
+    else next[k] = v;
+    change(next);
+  };
+  return (
+    <FormRoot.Provider value={{ plugin: p.id, values }}>
+      {fields
+        .filter(([, f]) => isList(f))
+        .map(([k, f]) => (
+          <ObjectList key={k} panel f={f} label={f.title ?? spell(k)} hint={f.description} value={values[k]} onChange={(v) => setField(k, v)} id={`pg-${p.id}-${k}`} />
+        ))}
+      {(rest.length > 0 || m.config?.["x-actions"]?.length) && (
+        <Card title="Settings">
+          <SchemaFields schema={restSchema} values={values} onChange={change} id={`pg-${p.id}`} required={props.needs.filter((k) => rest.some(([r]) => r === k))} grid />
+          <ActionButtons schema={m.config} value={values} />
+        </Card>
+      )}
+    </FormRoot.Provider>
+  );
+}
+
+/**
+ * Plugin settings changed while recording that would restart the plugin
+ * (`restarts`: its own settings when it doesn't take them as it runs; a
+ * system's copy of it, always): held here until Apply, so a restart is one
+ * the user chose, not one per field. Discard drops them. Held by form `id`
+ * while the page changes; changed when not recording, saved at once.
+ */
+const held = new Map<string, PluginValues>();
+const heldViews = new Set<() => void>();
+
+function Held(props: { id: string; name: string; saved: PluginValues; save: (v: PluginValues) => void; restarts: boolean; children: (values: PluginValues, change: (v: PluginValues) => void) => ReactNode }) {
+  const recording = useSelect((x) => x.phase === "running" || x.phase === "starting");
+  const [, redraw] = useState(0);
+  useEffect(() => {
+    const f = () => redraw((n) => n + 1);
+    heldViews.add(f);
+    return () => void heldViews.delete(f);
+  }, []);
+  const tell = () => heldViews.forEach((f) => f());
+  const draft = held.get(props.id);
+  const change = (v: PluginValues) => {
+    if (draft !== undefined || (recording && props.restarts)) {
+      held.set(props.id, v);
+      tell();
+    } else props.save(v);
+  };
+  const done = (apply: boolean) => {
+    if (apply && draft !== undefined) props.save(draft);
+    held.delete(props.id);
+    tell();
+  };
+  return (
+    <>
+      {props.children(draft ?? props.saved, change)}
+      {draft !== undefined && (
+        <div className="held-bar" role="status">
+          <span className="small">Not applied yet: applying restarts {props.name}{recording ? "" : " when recording starts"}.</span>
+          <button type="button" className="btn primary small" onClick={() => done(true)}>
+            Apply
+          </button>
+          <button type="button" className="btn ghost small" onClick={() => done(false)}>
+            Discard
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** The plugins (installed, on) that have a page of their own, for the navigation. */
+function pluginPages(s: AppState): { id: string; title: string }[] {
+  return (s.plugins?.plugins ?? [])
+    .filter((p) => p.manifest?.page && pluginOn(s.config, p.id))
+    .map((p) => ({ id: p.id, title: p.manifest!.page!.title || p.manifest!.name }))
+    .sort((a, b) => a.title.localeCompare(b.title));
+}
+
+/** [`pluginPages`], drawn again only when they change. */
+export function usePluginPages(): { id: string; title: string }[] {
+  return useSelect(pluginPages, (a, b) => a.length === b.length && a.every((p, i) => p.id === b[i].id && p.title === b[i].title));
+}
+
+/** A plugin as its card in Setup and its own page show it: on, recording, what it needs set, its state in words. */
+function usePluginStatus(p: PluginInfo, c: Config) {
+  const s = useApp();
+  const on = pluginOn(c, p.id);
+  const recording = s.phase === "running" || s.phase === "starting";
+  const st = stateOf(p, on, recording);
+  const needs = p.manifest ? pluginNeeds(p.manifest, c, p.id) : [];
+  return { on, recording, st, needs, state: needs.length && on ? "Needs setting up" : st.text };
+}
+
+/** What changing its settings does while it runs. */
+function ChangesNote(props: { m: PluginManifest | null | undefined }) {
+  return <p className="small muted">{props.m?.live_settings ? "It takes changes as they're made." : "While recording, changes wait for Apply: applying restarts it (delays don't)."}</p>;
+}
+
+/** A plugin's log, newest last (`newestFirst`: first). */
+function LogLines(props: { p: PluginInfo; newestFirst?: boolean }) {
+  const lines = props.newestFirst ? [...props.p.runtime.log].reverse() : props.p.runtime.log;
+  return (
+    <pre className="log-lines plugin-log">
+      {lines.map((l, i) => (
+        <div key={i} className={l.level === "info" ? "" : "bad-text"}>
+          {new Date(l.time * 1000).toLocaleTimeString()} {l.text}
+        </div>
+      ))}
+    </pre>
+  );
+}
+
+/** A plugin's own page: all its settings, room to work in, its log. */
+export function PluginPage(props: { id: string }) {
+  const s = useApp();
+  const c = s.config;
+  const p = s.plugins?.plugins.find((x) => x.id === props.id);
+  if (!c || !s.plugins) return <p className="muted">Loading…</p>;
+  if (!p?.manifest) return <p className="empty">No plugin {props.id} is installed.</p>;
+  return <PluginPageOf p={p} m={p.manifest} c={c} />;
+}
+
+function PluginPageOf(props: { p: PluginInfo; m: PluginManifest; c: Config }) {
+  const { p, m, c } = props;
+  const { on, recording, st, needs, state } = usePluginStatus(p, c);
+  const message = p.problem ?? (on && p.runtime.message && p.runtime.message !== "running" ? p.runtime.message : "");
+  return (
+    <div className="plugin-page stack">
+      <section className="panel" aria-labelledby={`pp-${p.id}`}>
+        <PluginHead p={p} on={on} tone={st.tone} state={state} titleId={`pp-${p.id}`} />
+        {m.description && <p className="plugin-desc">{m.description}</p>}
+        {message && <p className={`small ${st.tone === "bad" ? "bad-text" : st.tone === "warn" ? "warn-text" : "muted"}`}>{message}</p>}
+        {recording && on && <ChangesNote m={m} />}
+      </section>
+      {hasFields(m.config) && <PluginSettingsForm p={p} m={m} settings={c.plugins?.[p.id]?.settings} needs={needs} page />}
+      <Card title="Log">
+        {p.runtime.log.length ? (
+          <LogLines p={p} newestFirst />
+        ) : (
+          <p className="empty">Nothing yet{recording ? "" : ": it runs while the recorder records"}.</p>
+        )}
+      </Card>
+    </div>
   );
 }
 
@@ -636,22 +941,24 @@ function PluginHead(props: { p: PluginInfo; on: boolean; tone: string; state: st
         </div>
         <span className={`plugin-state tone-${props.tone}`}>{props.state}</span>
       </div>
-      <label className="switch" title={p.problem ? "It can't run: see below" : ""}>
-        <input type="checkbox" role="switch" checked={on} disabled={!!p.problem && !on} onChange={(e) => setPluginEnabled(p.id, e.target.checked)} />
-        <span className="switch-track" aria-hidden="true" />
-        <span>{on ? "On" : "Off"}</span>
-      </label>
+      <Switch label={on ? "On" : "Off"} title={p.problem ? "It can't run: see below" : ""} checked={on} disabled={!!p.problem && !on} onChange={(v) => setPluginEnabled(p.id, v)} />
     </div>
   );
 }
 
 /** M4A for the plugins that upload it (Setup's Recording tab). */
+/** The plugins on that take an .m4a of each call (made for them whether or not it's kept). */
+export function useM4aPlugins(): PluginInfo[] {
+  const s = useApp();
+  return (s.plugins?.plugins ?? []).filter((p) => pluginOn(s.config, p.id) && p.manifest?.audio_formats.includes("m4a"));
+}
+
 export function M4aSettings() {
   const s = useApp();
   const c = s.config;
   const a = c?.recording.m4a ?? { encoder: "auto", bitrateKbps: 32 };
   const found = s.plugins?.encoderFound ?? null;
-  const wanted = (s.plugins?.plugins ?? []).filter((p) => pluginOn(c, p.id) && p.manifest?.audio_formats.includes("m4a"));
+  const wanted = useM4aPlugins();
   const [kbps, setKbps] = useState(String(a.bitrateKbps));
   useEffect(() => setKbps(String(a.bitrateKbps)), [a.bitrateKbps]);
   return (
@@ -668,7 +975,7 @@ export function M4aSettings() {
         title="Encoding"
         hint={
           <>
-            Used by the plugins that upload M4A, and by <b>Also save an M4A</b>.{" "}
+            Used by the plugins that upload M4A, and by <b>Keep .m4a</b>.{" "}
             {wanted.length > 0 && !found && (
               <span className="bad-text">
                 {wanted.map((p) => p.manifest!.name).join(", ")} {wanted.length > 1 ? "need" : "needs"} it: install ffmpeg.
@@ -735,7 +1042,7 @@ function stateOf(p: PluginInfo, on: boolean, recording: boolean): { tone: "ok" |
 }
 
 /** An installed plugin on the Plugins page: how it's doing, its log, updates; "Set up" goes to Setup. */
-function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: StoreListing; install?: PluginInstall }) {
+function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: PluginListing; install?: InstallProgress }) {
   const { p, recording, listing, install } = props;
   const m = p.manifest;
   const s = useApp();
@@ -748,6 +1055,15 @@ function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: StoreL
   const needs = on && m && s.config ? pluginNeeds(m, s.config, p.id) : [];
   // A newer version in the registry (not for a build of the user's own, or a plugin from elsewhere).
   const update = listing && m && !p.custom && !p.unlistedFrom && !listing.unavailable && newer(listing.version, m.version) ? listing : null;
+  // Taken again from where it came (the newer version, if there is one): the user's file, the
+  // GitHub repository's latest release, or the registry. Its settings stay.
+  const again = p.custom
+    ? () => addPlugin(p.path)
+    : p.unlistedFrom
+      ? () => installFromGitHub("plugin", p.unlistedFrom!)
+      : listing && !listing.unavailable
+        ? () => installFromStore("plugin", p.id)
+        : null;
 
   // Just installed from this browser: on to setting it up.
   useEffect(() => {
@@ -768,6 +1084,7 @@ function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: StoreL
           <>
             {listing && !p.custom && !p.unlistedFrom && <TierChip tier={listing.tier} />}
             {update && <span className="chip warn">v{update.version} available</span>}
+            <Author repository={m?.repository || p.unlistedFrom} />
           </>
         }
       />
@@ -781,14 +1098,19 @@ function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: StoreL
           {r.failed > 0 && r.lastFailure && <span className="plugin-last-failure"> — last: {r.lastFailure}</span>}
         </p>
       )}
+      {(r.held ?? 0) > 0 && (
+        <p className="small muted" title="Its delays hold these back; they go when their time is up, after a restart too">
+          {r.held} call{r.held === 1 ? "" : "s"} waiting out a delay
+        </p>
+      )}
       {m && (
         <p className="small muted plugin-meta">
           {needsM4a && "Uploads M4A audio · "}
           {m.subscribe.length ? `Hears ${m.subscribe.map((t) => TOPIC_NAMES[t] ?? t).join(", ")}` : "Hears nothing"}
-          {(m.homepage || m.repository) && (
+          {webUrl(m.homepage || m.repository) && (
             <>
               {" · "}
-              <a href={m.homepage || m.repository} target="_blank" rel="noreferrer">
+              <a href={webUrl(m.homepage || m.repository)} target="_blank" rel="noreferrer">
                 {m.homepage ? "Website" : "Source"}
               </a>
             </>
@@ -807,9 +1129,9 @@ function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: StoreL
             {STAGES[install.stage]}
           </span>
         ) : (
-          update && (
-            <button className="btn primary" onClick={() => installPlugin(p.id)} title={recording && on ? "It restarts with the new version." : undefined}>
-              Update to v{update.version}
+          again && (
+            <button className={`btn${update ? " primary" : ""}`} onClick={again} title={recording && on ? "It restarts with it." : undefined}>
+              {update ? `Update to v${update.version}` : "Reinstall"}
             </button>
           )
         )}
@@ -819,12 +1141,12 @@ function PluginCard(props: { p: PluginInfo; recording: boolean; listing?: StoreL
           disabled={!!install}
           onClick={() => {
             const what = p.custom
-              ? `Remove ${m?.name ?? p.id} and its settings? ${p.path} stays.`
+              ? `Uninstall ${m?.name ?? p.id} and delete its settings? Your file ${p.path} stays.`
               : `Uninstall ${m?.name ?? p.id} and delete its settings?`;
             if (confirm(what)) removePlugin(p.id);
           }}
         >
-          {p.custom ? "Remove" : "Uninstall"}
+          Uninstall
         </button>
       </div>
     </article>
@@ -838,25 +1160,17 @@ const TOPIC_NAMES: Record<string, string> = {
   unit: "radio activity",
   audio: "live audio",
   status: "system status",
+  tone_pattern: "tone patterns heard",
 };
 
 function PluginLog(props: { p: PluginInfo }) {
   const [open, setOpen] = useState(false);
-  const lines = props.p.runtime.log;
   return (
     <>
       <button className="btn ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
-        {open ? "Hide log" : `Log (${lines.length})`}
+        {open ? "Hide log" : `Log (${props.p.runtime.log.length})`}
       </button>
-      {open && (
-        <pre className="log-lines plugin-log">
-          {lines.map((l, i) => (
-            <div key={i} className={l.level === "info" ? "" : "bad-text"}>
-              {new Date(l.time * 1000).toLocaleTimeString()} {l.text}
-            </div>
-          ))}
-        </pre>
-      )}
+      {open && <LogLines p={props.p} />}
     </>
   );
 }
@@ -898,193 +1212,37 @@ function AddPlugin() {
   );
 }
 
-/** "3 minutes ago", for when the list was fetched. */
-function ago(t: number): string {
-  const s = Math.max(0, Date.now() / 1000 - t);
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.round(s / 60)} min ago`;
-  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-  return new Date(t * 1000).toLocaleDateString();
-}
+/** What the plugin registry says on this page. */
+const PLUGIN_STORE: StoreWords = {
+  title: "Find plugins",
+  searchHint: "OpenMHz, upload, stream…",
+  empty: "The registry has no plugins yet.",
+  warning: "Unreviewed. Plugins get full access to this computer.",
+  repoExample: "https://github.com/someone/trunk-plugin-pager",
+  template: "Must use the plugin template's release workflow.",
+};
 
-function StoreSource(props: { store: PluginStore }) {
-  const st = props.store;
-  if (st.source === "registry") return <p className="muted small">Registry checked {st.fetched ? ago(st.fetched) : "now"}.</p>;
-  const when = st.source === "saved" && st.fetched ? `the list from ${new Date(st.fetched * 1000).toLocaleString()}` : "the built-in list";
-  return (
-    <p className="small warn-text" title={st.problem ?? undefined}>
-      Registry unreachable; showing {when}.
-    </p>
-  );
-}
-
-/** One of the registry's plugins: what it is, and Install / Update / Installed. */
-function StoreCard(props: { l: StoreListing; installed?: PluginInfo; install?: PluginInstall; recording: boolean }) {
+/** One of the registry's plugins: Install / Update / Installed. */
+function StoreListingCard(props: { l: PluginListing; installed?: PluginInfo; install?: InstallProgress }) {
   const { l, installed, install } = props;
   const have = installed?.manifest?.version;
   let action: React.ReactNode;
-  if (install) {
+  if (install) action = <InstallStage install={install} />;
+  else if (installed?.custom) action = <span className="small muted">Your build is installed</span>;
+  else if (l.unavailable) action = <span className="small muted">{l.unavailable}</span>;
+  else if (installed && have && !installed.unlistedFrom && !newer(l.version, have)) action = <span className="chip ok">Installed{have !== l.version ? ` v${have}` : ""}</span>;
+  else
     action = (
-      <span className="small muted install-stage" role="status">
-        {STAGES[install.stage]}
-      </span>
-    );
-  } else if (installed?.custom) {
-    action = <span className="small muted">Your build is installed</span>;
-  } else if (l.unavailable) {
-    action = <span className="small muted">{l.unavailable}</span>;
-  } else if (installed && have && !installed.unlistedFrom && !newer(l.version, have)) {
-    action = <span className="chip ok">Installed{have !== l.version ? ` v${have}` : ""}</span>;
-  } else if (installed && have) {
-    action = (
-      <button className="btn primary" onClick={() => installPlugin(l.id)}>
-        {installed.unlistedFrom ? `Install the registry's v${l.version}` : `Update to v${l.version}`}
+      <button className="btn primary" onClick={() => installFromStore("plugin", l.id)}>
+        {installed && have ? (installed.unlistedFrom ? `Install the registry's v${l.version}` : `Update to v${l.version}`) : "Install"}
       </button>
     );
-  } else {
-    action = (
-      <button className="btn primary" onClick={() => installPlugin(l.id)}>
-        Install
-      </button>
-    );
-  }
-  return (
-    <article className="plugin-card store-card" aria-labelledby={`sn-${l.id}`}>
-      <div className="plugin-head">
-        <span className="plugin-icon tone-off" aria-hidden="true">
-          <IconPuzzle />
-        </span>
-        <div className="plugin-title">
-          <div className="row">
-            <strong id={`sn-${l.id}`}>{l.name}</strong>
-            <span className="chip">v{l.version}</span>
-            <TierChip tier={l.tier} />
-          </div>
-        </div>
-        {action}
-      </div>
-      <p className="plugin-desc">{l.description}</p>
-      <p className="small muted plugin-meta">
-        {l.license && `${l.license} · `}
-        {l.homepage && (
-          <>
-            <a href={l.homepage} target="_blank" rel="noreferrer">
-              Website
-            </a>
-            {" · "}
-          </>
-        )}
-        <a href={l.repository} target="_blank" rel="noreferrer">
-          Source
-        </a>
-      </p>
-    </article>
-  );
+  return <StoreCard l={l} icon={<IconPuzzle />} action={action} />;
 }
 
-/** A plugin from a GitHub release that isn't in the registry. */
-function InstallFromGitHub(props: { busy: boolean }) {
-  const [open, setOpen] = useState(false);
-  const [repo, setRepo] = useState("");
-  const [tag, setTag] = useState("");
-  if (!open)
-    return (
-      <button className="btn ghost" onClick={() => setOpen(true)}>
-        Install from GitHub…
-      </button>
-    );
-  return (
-    <form
-      className="add-plugin"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (!repo.trim()) return;
-        installPluginFrom(repo.trim(), tag);
-        setRepo("");
-        setTag("");
-        setOpen(false);
-      }}
-    >
-      <p className="small warn-text">Unreviewed. Plugins get full access to this computer.</p>
-      <div className="grid2">
-        <div className="field">
-          <label className="field-label" htmlFor="gh-repo">
-            GitHub repository or release URL
-          </label>
-          <input id="gh-repo" className="mono" autoFocus value={repo} placeholder="https://github.com/someone/trunk-plugin-pager" onChange={(e) => setRepo(e.target.value)} />
-        </div>
-        <div className="field">
-          <label className="field-label" htmlFor="gh-tag">
-            Release (optional)
-          </label>
-          <input id="gh-tag" className="mono" value={tag} placeholder="latest" onChange={(e) => setTag(e.target.value)} />
-        </div>
-      </div>
-      <span className="field-hint">Must use the plugin template's release workflow.</span>
-      <div className="row">
-        <button className="btn primary" type="submit" disabled={!repo.trim() || props.busy}>
-          Install
-        </button>
-        <button className="btn ghost" type="button" onClick={() => setOpen(false)}>
-          Cancel
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function PluginStorePanel(props: { list: PluginsList; recording: boolean }) {
-  const s = useApp();
-  const store = s.pluginStore;
-  const [query, setQuery] = useState("");
-  useEffect(() => {
-    if (!store) fetchPluginStore();
-  }, [store]);
-  const q = query.trim().toLowerCase();
-  const order = { official: 0, community: 1, unlisted: 2 };
-  const listings = (store?.plugins ?? [])
-    .filter((l) => !q || [l.id, l.name, l.description].some((f) => f.toLowerCase().includes(q)))
-    .sort((a, b) => order[a.tier] - order[b.tier] || a.name.localeCompare(b.name));
-  // Installs from GitHub, by repository: shown until they're done.
-  const fromGitHub = Object.values(s.pluginInstalls).filter((i) => !store?.plugins.some((l) => l.id === i.key));
-
-  return (
-    <section className="panel" aria-labelledby="store-title">
-      <header className="panel-head">
-        <h2 id="store-title">Find plugins</h2>
-        <button className="btn ghost small" onClick={() => fetchPluginStore(true)} disabled={!store}>
-          Check again
-        </button>
-      </header>
-      {!store ? (
-        <p className="muted">Loading…</p>
-      ) : (
-        <div className="stack">
-          <StoreSource store={store} />
-          {store.plugins.length > 4 && (
-            <div className="field">
-              <label className="field-label" htmlFor="store-search">
-                Search
-              </label>
-              <input id="store-search" type="search" value={query} placeholder="OpenMHz, upload, stream…" onChange={(e) => setQuery(e.target.value)} />
-            </div>
-          )}
-          {listings.map((l) => (
-            <StoreCard key={l.id} l={l} installed={props.list.plugins.find((p) => p.id === l.id)} install={s.pluginInstalls[l.id]} recording={props.recording} />
-          ))}
-          {listings.length === 0 && <p className="empty">{q ? `No plugins match “${query.trim()}”.` : "The registry has no plugins yet."}</p>}
-          {fromGitHub.map((i) => (
-            <p key={i.key} className="small muted" role="status">
-              {i.key}: {STAGES[i.stage]}
-            </p>
-          ))}
-          <div className="row">
-            <InstallFromGitHub busy={fromGitHub.length > 0} />
-          </div>
-        </div>
-      )}
-    </section>
-  );
+function PluginStorePanel(props: { list: PluginsList }) {
+  const installs = useApp().installs.plugin;
+  return <StorePanel kind="plugin" words={PLUGIN_STORE} card={(l) => <StoreListingCard key={l.id} l={l} installed={props.list.plugins.find((p) => p.id === l.id)} install={installs[l.id]} />} />;
 }
 
 export function PluginsPage() {
@@ -1109,14 +1267,50 @@ export function PluginsPage() {
               key={p.id}
               p={p}
               recording={recording}
-              listing={s.pluginStore?.plugins.find((l) => l.id === p.id)}
-              install={s.pluginInstalls[p.id]}
+              listing={s.stores.plugin?.listings.find((l) => l.id === p.id)}
+              install={s.installs.plugin[p.id] ?? (p.unlistedFrom ? s.installs.plugin[p.unlistedFrom] : undefined)}
             />
           ))}
           {plugins.length === 0 && <p className="empty">No plugins yet.</p>}
         </div>
       </section>
-      <PluginStorePanel list={list} recording={recording} />
+      <PluginStorePanel list={list} />
     </div>
+  );
+}
+
+/** Plugins' buttons for a signal (`contribute` on `signal`): each adds an item to its settings, then shows them. */
+export function SignalButtons({ system, d }: { system: string; d: SignalDef }) {
+  const s = useApp();
+  const signal = signalRef(system, d.id);
+  const all = (s.plugins?.plugins ?? []).filter((p) => p.manifest && pluginOn(s.config, p.id));
+  const show = (p: PluginInfo) => (p.manifest!.page ? setView("plugin", p.id) : showTodo(`plugin-${p.id}`));
+  const add = (p: PluginInfo, k: PluginContribution) => {
+    const settings: PluginValues = s.config?.plugins?.[p.id]?.settings ?? {};
+    const list = Array.isArray(settings[k.append]) ? (settings[k.append] as unknown[]) : [];
+    const item = fillTemplate(k.item, { system, signal, id: d.id, name: d.name || d.id });
+    setPluginSettings(p.id, { ...settings, [k.append]: [...list, item] });
+    show(p);
+  };
+  return (
+    <>
+      {all.flatMap((p) =>
+        (p.manifest!.contribute ?? [])
+          .filter((k) => k.on === "signal" && d.id)
+          .map((k) => {
+            // Already named in what it would add to: say so, and go there.
+            const named = mentions(s.config?.plugins?.[p.id]?.settings?.[k.append], signal);
+            return named ? (
+              <button key={`${p.id}-${k.label}`} className="btn ghost small" title={`${p.manifest!.name} has it already`} onClick={() => show(p)}>
+                ✓ {k.label}
+              </button>
+            ) : (
+              <button key={`${p.id}-${k.label}`} className="btn ghost small" title={k.hint || `${k.label} (${p.manifest!.name})`} onClick={() => add(p, k)}>
+                {k.label}
+              </button>
+            );
+          }),
+      )}
+    </>
   );
 }

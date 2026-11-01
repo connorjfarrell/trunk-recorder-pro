@@ -23,7 +23,7 @@ plugins.
 | [docs.rs/trunk-recorder-plugin](https://docs.rs/trunk-recorder-plugin) | The SDK's API reference |
 | [The template's protocol page](https://github.com/TrunkRecorder/trunk-plugin-template/blob/main/docs/protocol.md) | The wire format, for plugins in other languages |
 | [TrunkRecorder/plugins](https://github.com/TrunkRecorder/plugins) | The registry the plugin store installs from |
-| The published plugins ([OpenMHz](https://github.com/TrunkRecorder/trunk-plugin-openmhz), [Broadcastify](https://github.com/TrunkRecorder/trunk-plugin-broadcastify), [Rdio Scanner](https://github.com/TrunkRecorder/trunk-plugin-rdioscanner), [simplestream](https://github.com/TrunkRecorder/trunk-plugin-simplestream), [upload-script](https://github.com/TrunkRecorder/trunk-plugin-upload-script)) | Complete plugins to learn from |
+| The published plugins ([OpenMHz](https://github.com/TrunkRecorder/trunk-plugin-openmhz), [Broadcastify](https://github.com/TrunkRecorder/trunk-plugin-broadcastify), [Rdio Scanner](https://github.com/TrunkRecorder/trunk-plugin-rdioscanner), [simplestream](https://github.com/TrunkRecorder/trunk-plugin-simplestream), [upload-script](https://github.com/TrunkRecorder/trunk-plugin-upload-script), [MQTT](https://github.com/TrunkRecorder/trunk-plugin-mqtt)) | Complete plugins to learn from |
 
 ## Starting from the template
 
@@ -90,15 +90,21 @@ far behind loses events (counted on the dashboard) rather than slowing the recor
 
 | Topic | Message | When |
 |---|---|---|
-| `call.start` | `CallInfo` | A call starts: talkgroup and its tag, frequency, TDMA slot, analog / encrypted / emergency flags, whether it's recorded (and why not), the radios heard so far, patched talkgroups |
+| `call.start` | `CallInfo` | A call starts: talkgroup and its tag, frequency, TDMA slot, analog / encrypted / emergency flags and the grant's duplex / packet / priority, whether it's recorded (and why not), the radios heard so far (`sources`: each with what its own transmission said of itself — emergency, encrypted, duplex, packet, priority), patched talkgroups |
 | `call.end` | `CallInfo` | A call ends; its files follow in `call.concluded` |
-| `call.concluded` | `ConcludedCall` | A recorded call's files are on disk: its path key, its call JSON (Trunk Recorder's format) and the paths of its `.json`, `.wav` and, when asked for, `.m4a` |
+| `call.concluded` | `ConcludedCall` | A recorded call's files are on disk: its path key, its call JSON (Trunk Recorder's format, as a typed `CallRecord`: every field the recorder writes is a named field) and the paths of its `.json`, `.wav` and, when asked for, `.m4a` |
 | `unit` | `UnitEvent` | A radio registered, deregistered, affiliated, acknowledged, reported its location, got a data grant, or sent an answer request or call alert |
+| `tone_pattern` | `TonePatternEvent` | A call's tones made a pattern: every page, alert tone, DTMF or KNOX string and Morse ID heard, as soon as it's over (a second after its last tone). The pattern is as the call JSON's `tone_patterns` has it (with `text` for a person, the radio that sent it, and the ids of the system's [signals](../configuration/systems.md#signals) it is), with the call's system, site, `call_num`, talkgroup and alpha tag. One heard in voice decrypted with the recorder's keys (`decrypted`) goes only to plugins with `shareDecrypted` |
 | `audio` | `AudioChunk` | Live audio of recording calls: 16-bit mono PCM at 8 kHz, base64 |
 | `status` | `Status` | Every system's state every few seconds: control channel, decode rate, active and recording calls |
 
 Every event carries the system's `short_name`, which is its identity. The numeric `system` index is
-for the current run only, so store anything by short name.
+for the current run only, so store anything by short name. It counts from 0: the trunked systems
+being recorded first, then the conventional ones (there is no `CONVENTIONAL` index any more); a
+system's `kind` in `hello` (`p25`, `smartnet`, `dmr`, `nxdn`, `edacs` or `conventional`) says which it is. Calls and unit events also carry `site`,
+the name of the site they were heard on (a system of one site: its short name), and `status` has an
+entry per site, with its `site_name`. A call heard on several sites of a system is one call: one
+`call.start` and one `call.end` (from its first copy), and one `call.concluded`, for the copy kept.
 
 ### What a plugin sends back
 
@@ -107,16 +113,32 @@ for the current run only, so store anything by short name.
 | `ready` | It read `hello` and is running |
 | `log` | A log line at `error`, `warn`, `info` or `debug`. All but debug show in the plugin's log in the interface and in the recorder's log |
 | `status` | Its health (`ok`, `warning`, `error`) and a message, shown on its card until the next one |
-| `call.result` | What became of a concluded call: `ok`, `skipped` or `failed`, a message, and optionally a URL |
+| `call.result` | What became of a concluded call: `ok`, `skipped` or `failed`, a message, optionally a URL, and optionally `took_ms`, how long your work on it took (an upload's last try) |
 | `metrics` | Figures for the Health tab: queue depth, retries, in flight, bytes sent, latency, the services it talks to (up, degraded, down), and any of its own |
+| `action.result` | How one of its buttons went (an `action`, below): `ok`, and a message shown beside the button |
+| `calls.query` | Recorded calls, asked of the recorder: any of `system`, `talkgroup`, `unit`, `from` / `to` (Unix ms), `before` (the last page's), `limit` (1 to 500), and a `request` number. Answered with `calls` (below) |
 
 Lines on stdout that aren't protocol messages become log lines, and so does everything on stderr.
+
+**Recorded calls.** A plugin that needs calls from before (a talkgroup's last week, a radio's
+history) sends `calls.query`; the recorder answers `calls` with the same `request`: `entries`
+(each `{ path, record, audio, json }`, newest first), `more`, and `before` to send back for the
+next page. It's the recorder's call store, the latest calls included; when the store is off, the
+recent calls alone, and `error` says so. In the Rust SDK, `host.calls(CallsQuery { … })` sends it
+and the page arrives at `Plugin::calls`. Ask this way rather than opening `trunk-pro.sqlite`: its
+tables are the recorder's own and change between versions.
 
 **If you subscribe to `call.concluded`, send a `call.result` for every call.** The recorder keeps
 each call's files until every plugin taking recorded calls has reported on it, then deletes what
 the user's **Archive** settings don't keep. `ok` and `skipped` count the same there: the plugin is
 finished with the call. Only `failed` matters, and keeps the files when the user has **Keep when a
 plugin fails** on. A call your plugin never reports on counts as failed after an hour.
+
+The recorder times every call it gives you, from the call's end to your `ok`, and shows that age
+on your card in the Health tab with its parts: how long the user's delay rules held it, and how
+long it waited. Send `took_ms` with `ok` (`Host::call_result_took`; `CallQueue` does it for you)
+and the card can tell your upload from the waiting. Without it, the card shows the age alone. You
+don't measure anything else: the recorder does, the same for every plugin.
 
 ### Audio
 
@@ -133,13 +155,19 @@ Add the crate and `schemars` (for the settings form):
 
 ```toml
 [dependencies]
-trunk-recorder-plugin = "0.2.1"
+trunk-recorder-plugin = "0.7.0"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-A plugin implements the `Plugin` trait and calls `run` from `main`:
+SDK 0.7.0 is the one for Trunk Recorder Pro 0.2.10. A plugin built on 0.5.0 runs unchanged unless
+it subscribes to tone patterns: that topic is `tone_pattern` now (`TonePatternEvent`), a pattern has
+`text`, and KNOX digits are `knox: true` rather than a `KNOX ` prefix. Rebuild on it for buttons, a page
+of its own, settings taken without a restart and the names in events (below). A plugin built on an
+SDK older than 0.5.0 must be rebuilt: systems are numbered from 0 (conventional ones too), and the
+call record names every field instead of keeping some in `extra`. A plugin implements the `Plugin` trait and calls `run`
+from `main`:
 
 ```rust
 use trunk_recorder_plugin::{topic, ConcludedCall, Host, Manifest, NoConfig, Outcome, Plugin, Setup};
@@ -170,18 +198,20 @@ The main pieces:
 
 | Item | What it does |
 |---|---|
-| `Plugin` | The trait. `Config` and `SystemConfig` are your settings types (`NoConfig` for none). `manifest()`, `start()`, one method per topic (`call_start`, `call_end`, `call_concluded`, `unit`, `audio`, `status`) and `shutdown(grace)`. Every method runs on the one thread reading the recorder's messages, so return quickly and hand network or disk work to threads of your own |
+| `Plugin` | The trait. `Config` and `SystemConfig` are your settings types (`NoConfig` for none). `manifest()`, `start()`, one method per topic (`call_start`, `call_end`, `call_concluded`, `unit`, `audio`, `status`, `tone_pattern`), `action(a, reply)` (one of its buttons pressed: answer with the `Reply`), `settings(setup)` (new settings while it runs, with `live_settings`) and `shutdown(grace)`. Every method runs on the one thread reading the recorder's messages, so return quickly and hand network or disk work to threads of your own |
 | `manifest!()` | A `Manifest` with the id, version, description, homepage, repository, authors and license from `Cargo.toml`; set `name`, `subscribe` and `audio_formats` |
 | `run::<P>()` | Answers `--describe` (and `--version`), parses `hello` and your settings, calls your methods, and exits with 78 when `start` returns `Err` |
-| `Setup` | What `start` gets: `config`, `systems` (each with `index`, `short_name`, `kind` and your `SystemConfig` or `None`), `capture_dir`, `data_dir`, `audio_formats`; `system_named()` and `has_format()` |
-| `Host` | The way back, usable from any thread: `info`/`warn`/`error`/`debug`, `status`, `call_result`, `metrics`. Never `println!` in a plugin: stdout belongs to the protocol |
+| `Setup` | What `start` gets: `config`, `systems` (each with `index`, `short_name`, `kind`, `name`, `fcc` (its FCC licenses by frequency), `fcc_call_sign` and `fcc_name` (the one that names it), `sites` (each `SiteInfo { name }`), and your `SystemConfig` or `None`), `host` (`HostInfo { name, version }`: the recorder's), `capture_dir`, `data_dir`, `audio_formats`; `system_named()` and `has_format()`. The name and FCC licenses are optional, so often empty |
+| `Host` | The way back, usable from any thread: `info`/`warn`/`error`/`debug`, `status`, `call_result` (and `call_result_took`, with your time on it), `metrics`. Never `println!` in a plugin: stdout belongs to the protocol |
+| `Reply` | The answer to a button (`Plugin::action`): `ok(message)` or `fail(message)`, once, from any thread; dropped unsent, it answers that the plugin didn't. The recorder waits 15 s for it |
 | `CallQueue`, `QueueOptions`, `Attempt` | An upload queue on worker threads (2 by default) with retries after 10 s, 1 min, 5 min and 15 min, a warning status while calls wait, `call.result`s and `metrics` sent for you, and calls still waiting at shutdown saved to the data folder (`QueueOptions::saved_in`) and resumed next start. Your closure returns `Attempt::Done`, `Skip`, `Retry` or `Fail`. `CallQueue::start_by` also takes a closure naming each call's lane (the server it goes to): each lane gets workers, retries and an endpoint status of its own |
-| `TalkgroupFilter` | Trunk Recorder's talkgroup allow and deny patterns (`507*`, `12?45`); `filter::patterns` deserializes a list that mixes numbers and strings |
+| `Talkgroups` | A system's talkgroups, for your `SystemConfig` (`#[serde(flatten)] talkgroups: Talkgroups`): the **Talkgroups** menu (every one, only some, all but some) and its lists, as the uploaders have it. `filter_for(short_name)?` in `start` checks every entry and gives a `TalkgroupFilter` (SDK 0.8.0) |
+| `TalkgroupFilter` | Talkgroup allow and deny lists: numbers, ranges (`1000-1099`) and patterns (`507*`, `12?45`); `passes(tg)`. `TalkgroupFilter::parse` and `filter::talkgroup_list` read lists as typed and say which entry isn't a talkgroup; `filter::patterns` deserializes a list that mixes numbers and strings |
 | `Multipart` | A `multipart/form-data` body for any HTTP client |
 | `testing` | Run a plugin without the recorder (below) |
 
-Four of the five published plugins use `CallQueue` (simplestream, which is live, doesn't), and each
-is short enough to read in one sitting.
+Four of the six published plugins use `CallQueue` (simplestream, which is live, and MQTT, which has
+a queue of its own, don't), and the smaller ones are short enough to read in one sitting.
 
 ### Settings for each system
 
@@ -211,11 +241,40 @@ The form understands:
 | `object` | A group of the above |
 | `"x-system": true` on a string | A menu of the recorder's systems; follows renames |
 | `"x-required": true` | Must be filled in; until it is, the plugin (or that system) shows as not set up. Mark it with `#[schemars(extend("x-required" = true))]` |
+| array whose items are an `enum` | The choices, to tick |
+| `"x-systems": true` on an array of strings | The recorder's systems, to tick |
+| `"x-talkgroups": true` on an array of strings | Talkgroups, typed as everywhere in the app (spaces, commas or semicolons between; `1000 - 1099` one range), and each checked. `Talkgroups` sets it |
+| `"x-signals": true` on an array of strings | Every system's [signals](../guides/signals.md), to tick, as `system:ID` |
+| `"x-ref": "<list>"` | Items of the top-level array `<list>` (by their `id`, else their `name`): a menu on a string, items to tick on an array. Renaming an item renames what names it |
+| `"x-tones": true` on an array of objects | Tones to type in, each `pattern`, `tonesHz`, `digits`, `knox`, `lengthsS` and `extraTolerancePct` (a [signal](../configuration/systems.md#signals)'s fields), with ▶ and a note of what the recorder would match within |
+| `"x-summary": ["{field}", "{field\|fallback}", …]` on an object in an array | Its line in the list: each segment with its fields read as the form shows them (a choice by its label), left out when a field in it is empty (and has no fallback) or doesn't apply |
+| `"x-title": "<field>"` on an object in an array | Each item is titled by that field and opened to edit, one at a time, rather than all shown at once |
+| `"x-when": {"<field>": <value or [values]>}` | Shown only while the object's other fields are so (a webhook's URL only for `"type": "webhook"`); hidden, it keeps its value |
+| `"x-actions": [{"id", "label", "hint"}]` on an object | Buttons under it (an array's item, or the whole settings): pressed, the plugin is sent `action` with the object as edited |
 
 `Option<T>` becomes `T` (empty means not set), unit-variant enums become menus, and nested structs
-are inlined. The template's [Settings](https://github.com/TrunkRecorder/trunk-plugin-template/blob/main/docs/settings.md)
+are inlined. Extensions go on a field with `#[schemars(extend("x-ref" = "destinations"))]`, or on a
+struct used as an array's items with the same attribute on the struct. The template's [Settings](https://github.com/TrunkRecorder/trunk-plugin-template/blob/main/docs/settings.md)
 page has examples, and advice on changing settings in later versions without breaking existing
 installs. Mark API keys and passwords `x-secret`, and never log them.
+
+### More room, buttons, and live settings
+
+A plugin whose settings are more than a few fields (rules and where they send, say) can ask for
+more of the interface in its manifest:
+
+| Manifest | What it gets |
+|---|---|
+| `page: { title }` | A page of its own, in the navigation under the radio pages (`#/plugin/<id>`): its settings full width, its state and its log. Its card in Setup links to it |
+| `contribute: [{ on, label, hint, append, item }]` | Buttons elsewhere in the interface. `on: "signal"` puts one on each of a system's signals in Setup; pressed, it adds `item` to the settings array `append` (with `{system}`, `{signal}` (`system:ID`), `{id}` and `{name}` filled in) and opens the plugin's page |
+| `live_settings: true` | Its own settings, changed, are sent to it as `settings` (the hello it would start with now) instead of every plugin being restarted. The SDK calls `Plugin::settings` |
+
+An `x-actions` button sends the running plugin `action` (`request`, `action`: the button's `id`,
+`value`: the object it's under, as edited, saved or not). It answers with `action.result` (the
+same `request`) within 15 seconds, else the button says there was no answer; the answer is shown
+only in the browser that pressed it. The SDK's `Plugin::action` gets a `Reply` to answer with,
+from any thread. Plugins only run while the recorder records: pressed while it doesn't, the
+button says so.
 
 ## Testing
 

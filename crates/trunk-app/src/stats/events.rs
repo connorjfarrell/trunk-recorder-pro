@@ -31,10 +31,25 @@ pub enum MonitorEvent {
     /// Calls in the last minute (once a minute: watchers only).
     #[serde(rename_all = "camelCase")]
     CallVolume { system: String, per_min: u32 },
+    /// A call's tones made a pattern: one of the system's signals (always),
+    /// or any other (watchers only).
     #[serde(rename_all = "camelCase")]
-    ControlLost { system: String, freq_hz: Option<u64> },
+    TonePattern { system: String, talkgroup: u32, text: String, signals: Vec<String> },
+    /// A site's control channel stopped decoding (`site`: its own name, if it has one).
     #[serde(rename_all = "camelCase")]
-    ControlRegained { system: String, freq_hz: Option<u64> },
+    ControlLost {
+        system: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
+        freq_hz: Option<u64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ControlRegained {
+        system: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
+        freq_hz: Option<u64>,
+    },
     /// A source dropped samples after a quiet spell.
     #[serde(rename_all = "camelCase")]
     SourceDrops { source: String, per_s: f64 },
@@ -60,6 +75,21 @@ pub enum MonitorEvent {
     SpoolFull { calls: u64 },
     #[serde(rename_all = "camelCase")]
     SpoolRecovered { free_pct: f64 },
+    /// Its folder went while the app ran (Linux: systemd's RemoveIPC at
+    /// logout; macOS: the RAM disk ejected); `spool`: its kind ("tmpfs",
+    /// "service", "RAM disk", "folder"); `remade`: made again (else calls go to disk).
+    #[serde(rename_all = "camelCase")]
+    SpoolRemoved { spool: String, remade: bool },
+    /// The clock is off, or not synchronized (`why`); `bad`: badly off.
+    #[serde(rename_all = "camelCase")]
+    ClockOff { why: String, bad: bool },
+    /// And right again.
+    #[serde(rename_all = "camelCase")]
+    ClockOk {},
+    /// The wall clock jumped `by_ms` (positive: forward): its time service
+    /// set it, or the computer slept. Calls being recorded keep their clock.
+    #[serde(rename_all = "camelCase")]
+    ClockStep { by_ms: f64 },
 }
 
 impl MonitorEvent {
@@ -72,14 +102,15 @@ impl MonitorEvent {
     pub fn level(&self) -> &'static str {
         match self {
             MonitorEvent::ControlLost { .. } | MonitorEvent::LinkDown { .. } | MonitorEvent::DiskLow { .. } | MonitorEvent::SpoolFull { .. } => "bad",
-            MonitorEvent::SpoolLow { critical, .. } => if *critical { "bad" } else { "warn" },
-            MonitorEvent::SourceDrops { .. } | MonitorEvent::SourceClipping { .. } => "warn",
+            MonitorEvent::SpoolLow { critical, .. } | MonitorEvent::ClockOff { bad: critical, .. } => if *critical { "bad" } else { "warn" },
+            MonitorEvent::SpoolRemoved { remade, .. } => if *remade { "warn" } else { "bad" },
+            MonitorEvent::SourceDrops { .. } | MonitorEvent::SourceClipping { .. } | MonitorEvent::ClockStep { .. } => "warn",
             MonitorEvent::PluginHealth { state, .. } => match state.as_str() {
                 "error" => "bad",
                 "warning" => "warn",
                 _ => "ok",
             },
-            MonitorEvent::ControlRegained { .. } | MonitorEvent::LinkUp { .. } | MonitorEvent::SourceRecovered { .. } | MonitorEvent::SpoolRecovered { .. } => "ok",
+            MonitorEvent::ControlRegained { .. } | MonitorEvent::LinkUp { .. } | MonitorEvent::SourceRecovered { .. } | MonitorEvent::SpoolRecovered { .. } | MonitorEvent::ClockOk {} => "ok",
             _ => "info",
         }
     }
@@ -163,7 +194,7 @@ mod tests {
         assert!(!m.wants_frequent());
         m.add_watcher(Box::new(Count(seen.clone())));
         assert!(m.wants_frequent());
-        let v = m.emit(100.0, MonitorEvent::ControlLost { system: "dcfd".into(), freq_hz: Some(851_000_000) }).unwrap();
+        let v = m.emit(100.0, MonitorEvent::ControlLost { system: "dcfd".into(), site: None, freq_hz: Some(851_000_000) }).unwrap();
         assert_eq!(v["kind"], "controlLost");
         assert_eq!(v["level"], "bad");
         assert_eq!(v["freqHz"], 851_000_000);

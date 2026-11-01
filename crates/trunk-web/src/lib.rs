@@ -10,6 +10,8 @@
 //! * [`WebProfiler`] — a source's roll-off for Setup: takes u8 IQ, answers
 //!   with a `sourceProfile` message.
 //!
+//! And to the page (both builds'): the config's rules ([`rules`]).
+//!
 //! Build: `cargo build -p trunk-web --target wasm32-unknown-unknown --profile
 //! dist` with `-C target-feature=+simd128`, then `wasm-bindgen --target web`
 //! (see web/package.json `build:wasm`).
@@ -24,6 +26,8 @@ use trunk_app::stats::{History, Topics};
 use trunk_app::{Config, Output, Session};
 use trunk_core::survey::Command;
 use wasm_bindgen::prelude::*;
+
+pub mod rules;
 
 fn local_offset(t: i64) -> i32 {
     let d = js_sys::Date::new(&JsValue::from_f64(t as f64 * 1000.0));
@@ -65,12 +69,26 @@ fn to_js(out: &mut Vec<Output>, history: &mut History) -> Array {
                 history.insert(&r);
                 continue;
             }
-            // (One page, which asked for its topics.)
-            Output::Text(t) | Output::Topic { text: t, .. } => {
-                set(&obj, "t", "text");
-                set(&obj, "json", t);
+            // The worker puts it in the config ([`learn_call_sign`]).
+            Output::CallSign { short_name, freq_hz, call_sign } => {
+                set(&obj, "t", "callSign");
+                set(&obj, "shortName", short_name);
+                set(&obj, "freqHz", freq_hz);
+                set(&obj, "callSign", call_sign);
             }
-            Output::Audio { system, short_name, tg, frame } => {
+            // The worker sends it to the directory, then says how it went ([`WebSession::share_done`]).
+            Output::Share { short_name, observation, site_names } => {
+                set(&obj, "t", "share");
+                set(&obj, "shortName", short_name);
+                set(&obj, "json", observation.to_string());
+                set(&obj, "siteNames", serde_json::to_string(&site_names).unwrap_or_default());
+            }
+            // (One page, which asked for its topics.)
+            Output::Message(m) | Output::Topic { msg: m, .. } => {
+                set(&obj, "t", "text");
+                set(&obj, "json", m.to_json());
+            }
+            Output::Audio { system, short_name, tg, frame, .. } => {
                 set(&obj, "t", "audio");
                 set(&obj, "system", system);
                 set(&obj, "shortName", short_name);
@@ -78,12 +96,12 @@ fn to_js(out: &mut Vec<Output>, history: &mut History) -> Array {
                 set(&obj, "frame", Uint8Array::from(frame.as_slice()));
             }
             // (No frame capture in the browser: the setting is desktop-only.)
-            Output::File { rel, wav, json, entry, .. } => {
+            Output::File { rel, wav, record, .. } => {
                 set(&obj, "t", "file");
-                set(&obj, "rel", rel);
                 set(&obj, "wav", Uint8Array::from(wav.as_slice()));
-                set(&obj, "json", json);
-                set(&obj, "entry", entry.to_string());
+                set(&obj, "json", record.to_json());
+                set(&obj, "entry", trunk_app::session::call_entry(&rel, &record).to_string());
+                set(&obj, "rel", rel);
             }
         }
         a.push(&obj);
@@ -101,14 +119,16 @@ pub struct WebSession {
 
 #[wasm_bindgen]
 impl WebSession {
-    /// `config_json`: the interface's Config. `bandplans_json`: `{shortName: plan}`
-    /// saved from a previous run ([`WebSession::bandplans`]).
+    /// `config_json`: the interface's Config. `talkgroups_json`: each system's talkgroups, `{shortName: [Talkgroup]}`.
+    /// `bandplans_json`: `{key: plan}` (a site's key: [`trunk_app::session::bandplan_key`]) saved from a previous run
+    /// ([`WebSession::due`]).
     #[wasm_bindgen(constructor)]
-    pub fn new(config_json: &str, epoch_ms: f64, bandplans_json: Option<String>) -> Result<WebSession, JsError> {
-        let cfg: Config = serde_json::from_str(config_json).map_err(|e| JsError::new(&format!("config: {e}")))?;
+    pub fn new(config_json: &str, talkgroups_json: &str, epoch_ms: f64, bandplans_json: Option<String>) -> Result<WebSession, JsError> {
+        let cfg = Config::from_json(config_json).map_err(|e| JsError::new(&format!("config: {e}")))?;
+        let talkgroups: trunk_app::config::TalkgroupLists = serde_json::from_str(talkgroups_json).unwrap_or_default();
         let plans: serde_json::Map<String, serde_json::Value> = bandplans_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
         let plan = |name: &str| plans.get(name).and_then(|v| v.as_str()).map(str::to_string);
-        let s = Session::new(cfg, epoch_ms, &plan, local_offset).map_err(|e| JsError::new(&e))?;
+        let s = Session::new(cfg, &talkgroups, epoch_ms, &plan, local_offset).map_err(|e| JsError::new(&e))?;
         Ok(WebSession { s, out: Vec::new(), history: History::default() })
     }
     /// What the page watches: JSON `["spectrum:0", "log", …]`.
@@ -118,31 +138,40 @@ impl WebSession {
     }
     /// A `statsQuery` (JSON) → its `statsResult` (JSON), from this session's minutes.
     pub fn stats_query(&self, query_json: &str) -> String {
-        let q: serde_json::Value = serde_json::from_str(query_json).unwrap_or_default();
-        let now = (js_sys::Date::now() / 1000.0) as i64;
-        let back = match q["range"].as_str().unwrap_or("1h") {
-            "10m" => 600,
-            "6h" => 6 * 3600,
-            "24h" => 86400,
-            "7d" => 7 * 86400,
-            _ => 3600,
-        };
-        let to = q["to"].as_i64().unwrap_or(now);
-        let from = q["from"].as_i64().unwrap_or(to - back);
-        let patterns: Vec<String> = q["series"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
-        let series = self.history.query(&patterns, from, to, q["points"].as_u64().unwrap_or(0) as usize);
-        serde_json::json!({ "type": "statsResult", "id": q["id"], "from": from, "to": to, "loading": false, "series": series }).to_string()
+        let q: trunk_app::protocol::StatsQuery = serde_json::from_str(query_json).unwrap_or_default();
+        q.answer(&self.history, (js_sys::Date::now() / 1000.0) as i64, false).to_json()
     }
     /// A `radioQuery` (JSON) → its `radioResult` (JSON).
     pub fn radio_query(&self, query_json: &str) -> String {
         let q: serde_json::Value = serde_json::from_str(query_json).unwrap_or_default();
-        self.s.radio_query(&q, (js_sys::Date::now() / 1000.0) as i64).to_string()
+        self.s.shared().radio_query(&q, (js_sys::Date::now() / 1000.0) as i64).to_json()
     }
-    /// A system's talkgroup file changed (an Ignore flag): calls from now on go by it.
-    pub fn set_talkgroups(&mut self, short_name: &str, csv: &str) {
-        self.s.set_talkgroups(short_name, csv);
+    /// A system's talkgroups changed (JSON `[Talkgroup]`): calls from now on go by them.
+    pub fn set_talkgroups(&mut self, short_name: &str, talkgroups_json: &str) {
+        let rows: Vec<trunk_core::trunk::TalkgroupRow> = serde_json::from_str(talkgroups_json).unwrap_or_default();
+        self.s.set_talkgroups(short_name, &rows);
     }
-    /// Preload the radio registry: JSON `{shortName: registry}` ([`WebSession::registry_unsaved`]).
+    /// This browser's directory recorder ID ([`directory_recorder_id`]): shares go under it.
+    pub fn set_recorder(&mut self, id: &str) {
+        self.s.set_recorder(id);
+    }
+    /// A system's sharing switched, or its directory link changed: `system_json`, its `System`.
+    pub fn set_share(&mut self, system_json: &str) {
+        if let Ok(sys) = serde_json::from_str::<trunk_app::config::System>(system_json) {
+            self.s.set_share(&sys);
+        }
+    }
+    /// How system `short_name`'s share went: `error` when it didn't.
+    /// `id` and `rev`: the directory's record and version for it (none: taken, not linked); `error`: why not.
+    pub fn share_done(&mut self, short_name: &str, now_ms: f64, id: Option<String>, rev: f64, error: Option<String>) {
+        let linked = id.map(|id| trunk_app::share::Linked { id, rev: rev.max(0.0) as u64 });
+        self.s.share_done(short_name, now_ms, error.map_or(Ok(linked), Err));
+    }
+    /// What sharing did before ([`WebSession::due`] gave): each directory record's version and last share.
+    pub fn load_sharing(&mut self, json: &str) {
+        self.s.load_sharing(json);
+    }
+    /// Preload the radio registry: JSON `{shortName: registry}` (each as [`WebSession::due`] gave it).
     pub fn load_registry(&mut self, json: &str) {
         let m: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
         let shared = self.s.shared();
@@ -152,11 +181,6 @@ impl WebSession {
                 r.load(&name, text);
             }
         }
-    }
-    /// The registry's systems that changed since the last call, JSON `{shortName: registry}`.
-    pub fn registry_unsaved(&mut self) -> String {
-        let changed = self.s.shared().radio.lock().unwrap().take_dirty();
-        serde_json::Value::Object(changed.into_iter().map(|(n, j)| (n, serde_json::Value::String(j))).collect()).to_string()
     }
     /// `at_ms`: when the samples arrived, on `poll`'s clock.
     pub fn push(&mut self, source: usize, bytes: &[u8], dropped: f64, at_ms: f64) {
@@ -185,39 +209,92 @@ impl WebSession {
         to_js(&mut self.out, &mut self.history)
     }
     /// Preload talker aliases: JSON `{shortName: csv}` saved from a previous
-    /// run ([`WebSession::units_changed`]).
+    /// run ([`WebSession::due`]).
     pub fn load_units(&mut self, units_json: &str) {
         let units: serde_json::Map<String, serde_json::Value> = serde_json::from_str(units_json).unwrap_or_default();
         self.s.load_units(&|name| units.get(name).and_then(|v| v.as_str()).map(str::to_string));
     }
-    /// Talker aliases of the systems that learned any since the last call, as JSON `{shortName: csv}`.
-    pub fn units_changed(&mut self) -> String {
-        serde_json::Value::Object(self.s.units_changed().into_iter().map(|(n, c)| (n, serde_json::Value::String(c))).collect()).to_string()
-    }
     /// Preload the codes conventional frequencies carried (what
-    /// [`WebSession::heard_unsaved`] gave on an earlier run).
+    /// [`WebSession::due`] gave on an earlier run).
     pub fn load_heard(&mut self, json: &str) {
         self.s.load_heard(json);
     }
-    /// Those codes as JSON to save, when they changed since the last call.
-    pub fn heard_unsaved(&mut self) -> Option<String> {
-        self.s.heard_unsaved()
-    }
-    /// Start AutoTune sources from the scores [`WebSession::tune_unsaved`] gave on an earlier run.
+    /// Start AutoTune sources from the scores [`WebSession::due`] gave on an earlier run.
     pub fn load_tune(&mut self, json: &str) {
         self.s.load_tune(json);
     }
-    /// The sources' AutoTune scores as JSON to save, when they changed since the last call.
-    pub fn tune_unsaved(&mut self) -> Option<String> {
-        self.s.tune_unsaved()
+    /// What's due to be kept between runs ([`trunk_app::saving`] says when),
+    /// as JSON `[{kind, name, text}]`: `kind` units (`name`: the system),
+    /// sharing, bandplan (`name`: the site's key), heard, tune or registry
+    /// (`name`: the system). `all`: everything that changed (the recording's end).
+    pub fn due(&mut self, now_ms: f64, all: bool) -> String {
+        use trunk_app::saving::Saved;
+        let saved = self.s.due(now_ms, all);
+        let shared = self.s.shared();
+        let radio = shared.radio.lock().unwrap();
+        let items: Vec<serde_json::Value> = saved
+            .into_iter()
+            .filter_map(|saved| {
+                let (kind, key) = (saved.kind().as_str(), saved.key().to_string());
+                let text = match saved {
+                    Saved::Units { csv: t, .. } | Saved::Sharing(t) | Saved::Bandplan { plan: t, .. } | Saved::Heard(t) | Saved::Tune(t) => t,
+                    // (The browser keeps each system's registry whole: the systems that changed are written.)
+                    Saved::Registry { system, .. } => serde_json::to_string(&radio.systems.get(&system)?.whole()).ok()?,
+                };
+                Some(serde_json::json!({ "kind": kind, "name": key, "text": text }))
+            })
+            .collect();
+        serde_json::Value::Array(items).to_string()
     }
-    /// Each system's band plan, as JSON `{shortName: plan}`.
-    pub fn bandplans(&self) -> String {
-        serde_json::Value::Object(self.s.bandplans().into_iter().map(|(n, p)| (n, serde_json::Value::String(p))).collect()).to_string()
+    /// Keep the radio registry every `ms` (a tab can be closed without the recording's end).
+    pub fn save_registry_every(&mut self, ms: f64) {
+        self.s.save_registry_every(ms);
     }
 }
 
+/// A call sign heard on the air for `freq_hz` of system `short_name`, into
+/// config `config_json`'s FCC licenses ([`Config::learn_call_sign`]): the
+/// config (JSON) when it changed, else undefined.
+#[wasm_bindgen]
+pub fn learn_call_sign(config_json: &str, short_name: &str, freq_hz: f64, call_sign: &str) -> Option<String> {
+    let mut cfg = Config::from_json(config_json).ok()?;
+    cfg.learn_call_sign(short_name, freq_hz, call_sign).then(|| serde_json::to_string(&cfg).unwrap_or_default())
+}
+
+/// config `config_json` with system `short_name` linked to the directory's
+/// records, as a share's answer gave them ([`Config::link_shared`]): the
+/// config (JSON) when it changed (a first share, a new site), else undefined. `site_names_json`, `site_ids_json`: arrays.
+#[wasm_bindgen]
+pub fn link_shared(config_json: &str, short_name: &str, id: &str, site_names_json: &str, site_ids_json: &str) -> Option<String> {
+    let mut cfg = Config::from_json(config_json).ok()?;
+    let names: Vec<String> = serde_json::from_str(site_names_json).ok()?;
+    let ids: Vec<String> = serde_json::from_str(site_ids_json).ok()?;
+    cfg.link_shared(short_name, id, &names, &ids).then(|| serde_json::to_string(&cfg).unwrap_or_default())
+}
+
+/// A new directory recorder ID from 16 random bytes.
+#[wasm_bindgen]
+pub fn directory_recorder_id(random: &[u8]) -> String {
+    let mut b = [0u8; 16];
+    for (d, s) in b.iter_mut().zip(random) {
+        *d = *s;
+    }
+    trunk_app::share::recorder_id(&b)
+}
+
 /// The bands the survey can scan: JSON [{id, label, loHz, hiHz, defaultOn}].
+/// The page of `calls` (JSON: the browser build's call index, as stored
+/// calls) that `query` (JSON: `callsQuery`'s fields) asks for, as the desktop
+/// app pages its store: the same order, filter and cursor ([`trunk_app::calls`]).
+#[wasm_bindgen]
+pub fn calls_page(calls: &str, query: &str) -> String {
+    use trunk_app::calls::{page_of, CallsQuery, StoredCall};
+    let calls: Vec<StoredCall> = serde_json::from_str(calls).unwrap_or_default();
+    let q: CallsQuery = serde_json::from_str(query).unwrap_or_default();
+    let names: Vec<String> = q.system.iter().cloned().collect();
+    serde_json::to_string(&page_of(&calls, &q, &names)).unwrap_or_default()
+}
+
 #[wasm_bindgen]
 pub fn survey_bands() -> String {
     trunk_app::survey::bands_json().to_string()
@@ -234,7 +311,7 @@ impl WebSurvey {
     /// `request_json`: {source, bands, findGain}.
     #[wasm_bindgen(constructor)]
     pub fn new(config_json: &str, request_json: &str) -> Result<WebSurvey, JsError> {
-        let cfg: Config = serde_json::from_str(config_json).map_err(|e| JsError::new(&format!("config: {e}")))?;
+        let cfg = Config::from_json(config_json).map_err(|e| JsError::new(&format!("config: {e}")))?;
         let req: serde_json::Value = serde_json::from_str(request_json).map_err(|e| JsError::new(&e.to_string()))?;
         let s = SurveySession::new(&cfg, &Request::from_json(&req)).map_err(|e| JsError::new(&e))?;
         Ok(WebSurvey { s, out: Vec::new() })

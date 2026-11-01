@@ -1,7 +1,7 @@
 //! The radio system as heard: talkgroups (first and last heard, calls and
 //! airtime by hour), radios (when they transmitted, what they're affiliated
-//! with, which talkgroups they use, who they talk with), and how well each
-//! frequency's voice decodes. Fed by the session's events ([`Registry`]'s
+//! with, which talkgroups they use, who they talk with), and each frequency:
+//! how well its voice decodes, and the calls on it no source covered. Fed by the session's events ([`Registry`]'s
 //! `call_*` / `message` / `concluded`); kept per system across runs (saved as
 //! JSON); asked by the dashboard ([`Registry::query`]).
 //!
@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use trunk_core::p25::crypt::algid_name;
+use trunk_core::dsp::inband::signal::Heard;
+use trunk_core::trunk::calls::Reason;
 use trunk_core::trunk::{Call, Message, MessageType};
 
 /// Caps per system.
@@ -19,8 +21,9 @@ const MAX_TGS: usize = 5000;
 const MAX_UNITS: usize = 20_000;
 const MAX_PAIRS: usize = 50_000;
 const MAX_FREQS: usize = 512;
-const MAX_AFFILIATIONS: usize = 2000;
-const MAX_LENGTHS: usize = 5000;
+pub const MAX_AFFILIATIONS: usize = 2000;
+pub const MAX_LENGTHS: usize = 5000;
+pub const MAX_TONES: usize = 5000;
 const MAX_RECENT_TX: usize = 30;
 const TOP_TGS: usize = 8;
 /// Ciphers (ALGID, key ID) kept per talkgroup.
@@ -39,6 +42,10 @@ const EWMA: f32 = 0.1;
 pub struct Tg {
     pub first: i64,
     pub last: i64,
+    /// The alpha tag its last named call carried: what it's called when
+    /// neither a row nor the talkgroup file names its number (a conventional
+    /// row that files under the air's talkgroup names every one it hears).
+    pub name: String,
     pub calls: u32,
     pub secs: f32,
     /// Calls that were encrypted.
@@ -48,6 +55,27 @@ pub struct Tg {
     pub ciphers: Vec<(u8, u16, u32, i64)>,
     /// (hour = Unix s / 3600, calls, seconds), oldest first, last week only.
     pub hours: VecDeque<(i64, (u32, f32))>,
+}
+
+impl Tg {
+    /// A call of it began or ended: keep the name it carried, if any.
+    fn note_name(&mut self, c: &Call) {
+        if let Some(t) = c.talkgroup_info.as_ref().filter(|t| !t.alpha_tag.is_empty()) {
+            if t.alpha_tag != self.name {
+                self.name = t.alpha_tag.clone();
+            }
+        }
+    }
+}
+
+/// What talkgroup `tg` of system `name` is called: by a conventional row or
+/// the talkgroup file ([`Names::tg`]), else as its last named call was.
+fn tg_alpha(name: &str, s: &SystemRadio, tg: u32, names: &Names) -> String {
+    (names.tg)(name, tg)
+        .map(|i| i.alpha_tag)
+        .filter(|a| !a.is_empty())
+        .or_else(|| s.tgs.get(&tg).map(|g| g.name.clone()))
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -91,6 +119,18 @@ pub struct Freq {
     pub last: i64,
     /// (hour, (calls, frames, errors, bad frames)), last week.
     pub hours: VecDeque<(i64, (u32, u64, u64, u64))>,
+    /// Calls granted on it that no source covered (out of band): how many,
+    /// the last (Unix s), and by hour, last week.
+    pub out_of_band: u32,
+    pub out_of_band_last: i64,
+    pub out_of_band_hours: VecDeque<(i64, u32)>,
+}
+
+impl Freq {
+    /// When it was last heard: a call decoded, or one out of band.
+    fn heard(&self) -> i64 {
+        self.last.max(self.out_of_band_last)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -107,6 +147,93 @@ pub struct SystemRadio {
     pub affiliations: VecDeque<(i64, u32, u32)>,
     /// (Unix s, talkgroup, seconds) of recent calls, newest last.
     pub lengths: VecDeque<(i64, u32, f32)>,
+    /// The tone patterns its calls carried (pages, alerts, digits), newest last.
+    pub tones: VecDeque<PatternSeen>,
+    /// What changed since [`Registry::take_changes`] last took it (not saved).
+    #[serde(skip)]
+    changed: Changed,
+}
+
+/// What changed in a system's registry, by row: which talkgroups, radios,
+/// pairs and frequencies changed or went, and how many of the latest
+/// affiliations, call lengths and tone patterns are new: what a store keeps
+/// (cheap: a key for each row that changed).
+#[derive(Clone, Debug, Default)]
+struct Changed {
+    tgs: BTreeSet<u32>,
+    units: BTreeSet<u32>,
+    pairs: BTreeSet<u64>,
+    freqs: BTreeSet<u64>,
+    gone: Gone,
+    affiliations: usize,
+    lengths: usize,
+    tones: usize,
+}
+
+impl Changed {
+    fn tg(&mut self, k: u32) {
+        self.tgs.insert(k);
+    }
+    fn unit(&mut self, k: u32) {
+        self.units.insert(k);
+    }
+    fn pair(&mut self, k: u64) {
+        self.pairs.insert(k);
+    }
+    fn freq(&mut self, k: u64) {
+        self.freqs.insert(k);
+    }
+}
+
+/// Rows that went (past a cap, the least recently heard).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Gone {
+    pub tgs: Vec<u32>,
+    pub units: Vec<u32>,
+    pub pairs: Vec<u64>,
+    pub freqs: Vec<u64>,
+}
+
+/// A system's registry rows that changed since the last time they were
+/// taken ([`Registry::take_changes`]), and those that went: what a store
+/// writes to keep it a row at a time (rows of a database, lines appended to
+/// a log), not all of it. [`SystemRadio::apply`] makes them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegistryChanges {
+    /// When the system was first heard (Unix s).
+    pub created: i64,
+    pub tgs: Vec<(u32, Tg)>,
+    pub units: Vec<(u32, Unit)>,
+    pub pairs: Vec<(u64, Pair)>,
+    pub freqs: Vec<(u64, Freq)>,
+    pub gone: Gone,
+    /// The newest of each, appended since.
+    pub affiliations: Vec<(i64, u32, u32)>,
+    pub lengths: Vec<(i64, u32, f32)>,
+    pub tones: Vec<PatternSeen>,
+}
+
+/// A tone pattern heard on a call: when, on which talkgroup, and the pattern
+/// as the call JSON and plugins have it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PatternSeen {
+    /// Unix s.
+    pub t: i64,
+    pub tg: u32,
+    #[serde(flatten)]
+    pub pattern: trunk_recorder_plugin::TonePattern,
+}
+
+impl PatternSeen {
+    fn frame(&self) -> bool {
+        self.pattern.origin == "frame"
+    }
+    fn tones(&self) -> Vec<f32> {
+        self.pattern.tones.iter().map(|&f| f as f32).collect()
+    }
 }
 
 /// What the configuration says of a talkgroup.
@@ -121,12 +248,13 @@ pub struct TgInfo {
 pub struct Names<'a> {
     pub tg: &'a dyn Fn(&str, u32) -> Option<TgInfo>,
     pub unit: &'a dyn Fn(&str, u32) -> Option<String>,
+    /// The system's signals a pattern heard on a talkgroup is (their ids).
+    pub signals: &'a dyn Fn(&str, &Heard, u32) -> Vec<String>,
 }
 
 #[derive(Default)]
 pub struct Registry {
     pub systems: BTreeMap<String, SystemRadio>,
-    dirty: BTreeSet<String>,
 }
 
 fn pair_key(a: u32, b: u32) -> u64 {
@@ -135,29 +263,55 @@ fn pair_key(a: u32, b: u32) -> u64 {
 }
 
 fn bump_hour<T>(hours: &mut VecDeque<(i64, T)>, h: i64, f: impl FnOnce(&mut T), new: impl FnOnce() -> T) {
-    match hours.back_mut() {
-        Some((hh, v)) if *hh == h => f(v),
+    // (Usually the last hour; a long call's air reaches back into earlier ones.)
+    let at = hours.iter().rposition(|(hh, _)| *hh <= h);
+    match at {
+        Some(i) if hours[i].0 == h => f(&mut hours[i].1),
         _ => {
             let mut v = new();
             f(&mut v);
-            hours.push_back((h, v));
+            hours.insert(at.map_or(0, |i| i + 1), (h, v));
         }
     }
-    while hours.front().is_some_and(|(hh, _)| *hh <= h - HOURS) {
+    let last = hours.back().map_or(h, |(hh, _)| *hh);
+    while hours.front().is_some_and(|(hh, _)| *hh <= last - HOURS) {
         hours.pop_front();
     }
 }
 
-/// Keep the `cap` most recently heard of `m` (when it's grown 10% past it).
-fn evict<V>(m: &mut HashMap<impl Copy + Eq + std::hash::Hash, V>, cap: usize, last: impl Fn(&V) -> i64) {
+/// Keep the `cap` most recently heard of `m` (when it's grown 10% past it); those that went.
+fn evict<K: Copy + Eq + std::hash::Hash, V>(m: &mut HashMap<K, V>, cap: usize, last: impl Fn(&V) -> i64) -> Vec<K> {
     if m.len() <= cap + cap / 10 {
-        return;
+        return Vec::new();
     }
     let mut ts: Vec<i64> = m.values().map(&last).collect();
     let cut = ts.len() - cap;
     let (_, t, _) = ts.select_nth_unstable(cut);
     let t = *t;
+    let gone: Vec<K> = m.iter().filter(|(_, v)| last(v) < t).map(|(k, _)| *k).collect();
     m.retain(|_, v| last(v) >= t);
+    gone
+}
+
+/// Keys that went: no longer changed, gone instead.
+fn went<K: Ord + Copy>(gone: Vec<K>, changed: &mut BTreeSet<K>, list: &mut Vec<K>) {
+    for k in gone {
+        changed.remove(&k);
+        list.push(k);
+    }
+}
+
+/// `v` with `new` appended, the oldest dropped past `cap`.
+fn append<T: Clone>(v: &mut VecDeque<T>, new: &[T], cap: usize) {
+    v.extend(new.iter().cloned());
+    while v.len() > cap {
+        v.pop_front();
+    }
+}
+
+/// The newest `n` of `v` (those appended since), oldest first.
+fn newest<T: Clone>(v: &VecDeque<T>, n: usize) -> Vec<T> {
+    v.iter().skip(v.len().saturating_sub(n)).cloned().collect()
 }
 
 impl SystemRadio {
@@ -170,6 +324,7 @@ impl SystemRadio {
     }
 
     fn unit(&mut self, unit: u32, t: i64) -> (&mut Unit, bool) {
+        self.changed.unit(unit);
         let new = !self.units.contains_key(&unit);
         let u = self.units.entry(unit).or_insert_with(|| Unit { first: t, ..Default::default() });
         u.last = u.last.max(t);
@@ -180,16 +335,87 @@ impl SystemRadio {
         if a == b || a == 0 || b == 0 {
             return;
         }
+        self.changed.pair(pair_key(a, b));
         let p = self.pairs.entry(pair_key(a, b)).or_default();
         p.n += 1;
         p.last = t;
     }
 
     fn evict(&mut self) {
-        evict(&mut self.tgs, MAX_TGS, |v| v.last);
-        evict(&mut self.units, MAX_UNITS, |v| v.last);
-        evict(&mut self.pairs, MAX_PAIRS, |v| v.last);
-        evict(&mut self.freqs, MAX_FREQS, |v| v.last);
+        let c = &mut self.changed;
+        let (tgs, units, pairs, freqs) = (evict(&mut self.tgs, MAX_TGS, |v| v.last), evict(&mut self.units, MAX_UNITS, |v| v.last), evict(&mut self.pairs, MAX_PAIRS, |v| v.last), evict(&mut self.freqs, MAX_FREQS, Freq::heard));
+        went(tgs, &mut c.tgs, &mut c.gone.tgs);
+        went(units, &mut c.units, &mut c.gone.units);
+        went(pairs, &mut c.pairs, &mut c.gone.pairs);
+        went(freqs, &mut c.freqs, &mut c.gone.freqs);
+    }
+
+    /// Every row, as changes: the whole system, as it's stored (the one
+    /// shape a registry is kept in: whole, or what changed).
+    pub fn whole(&self) -> RegistryChanges {
+        RegistryChanges {
+            created: self.created,
+            tgs: self.tgs.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            units: self.units.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            pairs: self.pairs.iter().map(|(k, v)| (*k, *v)).collect(),
+            freqs: self.freqs.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            gone: Gone::default(),
+            affiliations: self.affiliations.iter().copied().collect(),
+            lengths: self.lengths.iter().copied().collect(),
+            tones: self.tones.iter().cloned().collect(),
+        }
+    }
+
+    /// The system the stored rows `c` make (what a store loads).
+    pub fn from_changes(c: &RegistryChanges) -> SystemRadio {
+        let mut s = SystemRadio::new(c.created);
+        s.apply(c);
+        s
+    }
+
+    /// What changed since the last call, as rows (none: nothing did).
+    fn take_changes(&mut self) -> Option<RegistryChanges> {
+        let c = std::mem::take(&mut self.changed);
+        let nothing = c.tgs.is_empty() && c.units.is_empty() && c.pairs.is_empty() && c.freqs.is_empty() && c.gone == Gone::default() && c.affiliations + c.lengths + c.tones == 0;
+        if nothing {
+            return None;
+        }
+        Some(RegistryChanges {
+            created: self.created,
+            tgs: c.tgs.iter().filter_map(|k| self.tgs.get(k).map(|v| (*k, v.clone()))).collect(),
+            units: c.units.iter().filter_map(|k| self.units.get(k).map(|v| (*k, v.clone()))).collect(),
+            pairs: c.pairs.iter().filter_map(|k| self.pairs.get(k).map(|v| (*k, *v))).collect(),
+            freqs: c.freqs.iter().filter_map(|k| self.freqs.get(k).map(|v| (*k, v.clone()))).collect(),
+            gone: c.gone,
+            affiliations: newest(&self.affiliations, c.affiliations),
+            lengths: newest(&self.lengths, c.lengths),
+            tones: newest(&self.tones, c.tones),
+        })
+    }
+
+    /// Make `c` (what [`Registry::take_changes`] gave) here: this system as
+    /// it was then, from as it was when the changes before were taken.
+    pub fn apply(&mut self, c: &RegistryChanges) {
+        // (What went first: a row that went and was heard again since is among the changed.)
+        for k in &c.gone.tgs {
+            self.tgs.remove(k);
+        }
+        for k in &c.gone.units {
+            self.units.remove(k);
+        }
+        for k in &c.gone.pairs {
+            self.pairs.remove(k);
+        }
+        for k in &c.gone.freqs {
+            self.freqs.remove(k);
+        }
+        self.tgs.extend(c.tgs.iter().cloned());
+        self.units.extend(c.units.iter().cloned());
+        self.pairs.extend(c.pairs.iter().cloned());
+        self.freqs.extend(c.freqs.iter().cloned());
+        append(&mut self.affiliations, &c.affiliations, MAX_AFFILIATIONS);
+        append(&mut self.lengths, &c.lengths, MAX_LENGTHS);
+        append(&mut self.tones, &c.tones, MAX_TONES);
     }
 }
 
@@ -202,8 +428,12 @@ pub struct Firsts {
 
 impl Registry {
     fn sys(&mut self, name: &str, t: i64) -> &mut SystemRadio {
-        self.dirty.insert(name.to_string());
         self.systems.entry(name.to_string()).or_insert_with(|| SystemRadio::new(t))
+    }
+
+    /// Put system `name` as a store gave it.
+    pub fn put(&mut self, name: &str, s: SystemRadio) {
+        self.systems.insert(name.to_string(), s);
     }
 
     /// A call began (`t`: Unix s). Returns what was heard for the first time
@@ -213,10 +443,20 @@ impl Registry {
         let base = s.has_baseline(t);
         let mut firsts = Firsts::default();
         if !c.unit_to_unit {
+            s.changed.tg(c.talkgroup);
             let new = !s.tgs.contains_key(&c.talkgroup);
             let g = s.tgs.entry(c.talkgroup).or_insert_with(|| Tg { first: t, ..Default::default() });
             g.last = t;
+            g.note_name(c);
             firsts.tg = new && base;
+        }
+        if c.reason == Some(Reason::NoSource) {
+            s.changed.freq(c.freq_hz);
+            let f = s.freqs.entry(c.freq_hz).or_default();
+            f.out_of_band += 1;
+            f.out_of_band_last = t;
+            bump_hour(&mut f.out_of_band_hours, t.div_euclid(3600), |n: &mut u32| *n += 1, || 0);
+            s.evict();
         }
         for src in &c.sources {
             if src.src != 0 && s.unit(src.src, t).1 && base {
@@ -235,22 +475,27 @@ impl Registry {
         let start = t - secs.round() as i64;
         let h = t.div_euclid(3600);
         if !c.unit_to_unit {
+            s.changed.tg(c.talkgroup);
             let g = s.tgs.entry(c.talkgroup).or_insert_with(|| Tg { first: start, ..Default::default() });
             g.last = t;
+            g.note_name(c);
             g.calls += 1;
             g.secs += secs;
             g.enc += c.encrypted as u32;
             if let Some(cp) = c.cipher {
                 note_cipher(&mut g.ciphers, cp.algid, cp.keyid, t);
             }
-            bump_hour(&mut g.hours, h, |v: &mut (u32, f32)| {
-                v.0 += 1;
-                v.1 += secs;
-            }, || (0, 0.0));
-            s.lengths.push_back((t, c.talkgroup, secs));
-            while s.lengths.len() > MAX_LENGTHS {
-                s.lengths.pop_front();
+            // Its air in the hours it was on (a channel held open past the hour isn't all the last one's); the call in the last.
+            for hh in start.div_euclid(3600).max(h - HOURS + 1)..=h {
+                let on = (t.min((hh + 1) * 3600) - start.max(hh * 3600)).max(0) as f32;
+                let air = if t > start { secs * on / (t - start) as f32 } else { secs };
+                bump_hour(&mut g.hours, hh, |v: &mut (u32, f32)| {
+                    v.0 += (hh == h) as u32;
+                    v.1 += air;
+                }, || (0, 0.0));
             }
+            append(&mut s.lengths, &[(t, c.talkgroup, secs)], MAX_LENGTHS);
+            s.changed.lengths += 1;
         }
         let mut firsts = Vec::new();
         // Each talker's turn: from when it was first heard to the next's (or the end).
@@ -303,10 +548,8 @@ impl Registry {
                 u.aff = Some(m.talkgroup);
                 u.aff_t = t;
                 if changed {
-                    s.affiliations.push_back((t, unit, m.talkgroup));
-                    while s.affiliations.len() > MAX_AFFILIATIONS {
-                        s.affiliations.pop_front();
-                    }
+                    append(&mut s.affiliations, &[(t, unit, m.talkgroup)], MAX_AFFILIATIONS);
+                    s.changed.affiliations += 1;
                 }
                 changed.then_some((unit, m.talkgroup))
             }
@@ -319,7 +562,7 @@ impl Registry {
                 }
                 None
             }
-            MessageType::UuVGrant | MessageType::UuAnsReq => {
+            MessageType::UuVGrant | MessageType::UuAnsReq | MessageType::PhoneGrant => {
                 let s = self.sys(system, t);
                 s.unit(unit, t);
                 if m.talkgroup != 0 {
@@ -332,6 +575,7 @@ impl Registry {
                 if let Some(s) = self.systems.get_mut(system) {
                     if let Some(u) = s.units.get_mut(&unit) {
                         u.last = u.last.max(t);
+                        s.changed.unit(unit);
                     }
                 }
                 None
@@ -341,15 +585,16 @@ impl Registry {
     }
 
     /// A recorded call's file (Trunk Recorder's call JSON): how its frequency decoded.
-    pub fn concluded(&mut self, system: &str, record: &Value, t: i64) {
-        let Some(freq) = record["freq"].as_u64() else { return };
+    pub fn concluded(&mut self, system: &str, record: &trunk_recorder_plugin::CallRecord, t: i64) {
+        let freq = record.freq;
         let (mut frames, mut errors, mut bad) = (0u64, 0u64, 0u64);
-        for i in record["errorList"].as_array().into_iter().flatten() {
-            frames += i["frames"].as_u64().unwrap_or(0);
-            errors += i["error_count"].as_u64().unwrap_or(0);
-            bad += i["bad_frames"].as_u64().unwrap_or(0);
+        for i in &record.error_list {
+            frames += i.frames;
+            errors += i.error_count;
+            bad += i.bad_frames;
         }
         let s = self.sys(system, t);
+        s.changed.freq(freq);
         let f = s.freqs.entry(freq).or_default();
         let ewma = |old: Option<f32>, new: Option<f64>| match (old, new) {
             (o, None) => o,
@@ -360,9 +605,9 @@ impl Registry {
         f.frames += frames;
         f.errors += errors;
         f.bad += bad;
-        f.snr = ewma(f.snr, record["snr"].as_f64());
-        f.ferr = ewma(f.ferr, record["freq_error"].as_f64());
-        f.clean = ewma(f.clean, record["clean_voice_pct"].as_f64());
+        f.snr = ewma(f.snr, record.snr);
+        f.ferr = ewma(f.ferr, Some(record.freq_error as f64));
+        f.clean = ewma(f.clean, record.clean_voice_pct);
         f.last = t;
         bump_hour(&mut f.hours, t.div_euclid(3600), |v: &mut (u32, u64, u64, u64)| {
             v.0 += 1;
@@ -373,18 +618,24 @@ impl Registry {
         s.evict();
     }
 
-    /// Systems changed since the last call, as (short name, JSON) to save.
-    pub fn take_dirty(&mut self) -> Vec<(String, String)> {
-        std::mem::take(&mut self.dirty)
-            .into_iter()
-            .filter_map(|n| self.systems.get(&n).and_then(|s| serde_json::to_string(s).ok()).map(|j| (n, j)))
-            .collect()
+    /// A tone pattern heard on talkgroup `tg` of `system` at `t` (Unix s), as it was told.
+    pub fn tone_pattern(&mut self, system: &str, tg: u32, pattern: &trunk_recorder_plugin::TonePattern, t: i64) {
+        let s = self.sys(system, t);
+        append(&mut s.tones, &[PatternSeen { t, tg, pattern: pattern.clone() }], MAX_TONES);
+        s.changed.tones += 1;
     }
 
-    /// Load a system saved by [`Registry::take_dirty`] (a bad file is ignored).
+    /// Each system's rows that changed since the last call ([`RegistryChanges`]):
+    /// what's kept (a store appends them, and writes a system whole now and
+    /// then; the browser writes the systems they name whole).
+    pub fn take_changes(&mut self) -> Vec<(String, RegistryChanges)> {
+        self.systems.iter_mut().filter_map(|(n, s)| s.take_changes().map(|c| (n.clone(), c))).collect()
+    }
+
+    /// Load a system kept whole ([`SystemRadio::whole`], as JSON; a bad one is ignored).
     pub fn load(&mut self, system: &str, json: &str) {
-        if let Ok(s) = serde_json::from_str::<SystemRadio>(json) {
-            self.systems.insert(system.to_string(), s);
+        if let Ok(c) = serde_json::from_str::<RegistryChanges>(json) {
+            self.put(system, SystemRadio::from_changes(&c));
         }
     }
 
@@ -413,6 +664,7 @@ impl Registry {
                 None => json!({ "error": "which radio?" }),
             },
             "freqs" => freqs(s, now, hours),
+            "tones" => tones(name, s, now, hours, limit, names),
             "lengths" => json!({ "histogram": histogram(s.lengths.iter().filter(|l| l.0 > now - hours * 3600).map(|l| l.2)) }),
             _ => json!({ "error": format!("unknown query {what}") }),
         };
@@ -448,16 +700,20 @@ fn is_new(s: &SystemRadio, first: i64, now: i64) -> bool {
     first > now - NEW_S && first - s.created >= BASELINE_S
 }
 
-/// A talkgroup's per-hour activity over the last `hours`, oldest first: (calls, seconds).
-fn hourly(g: &Tg, now: i64, hours: i64) -> (Vec<u32>, Vec<f32>) {
+/// The hours of `per_hour` in the last `hours` to `now`, each with its place
+/// among them (0: the oldest).
+fn window<T>(per_hour: &VecDeque<(i64, T)>, now: i64, hours: i64) -> impl Iterator<Item = (usize, &T)> {
     let h1 = now.div_euclid(3600);
     let h0 = h1 - hours + 1;
+    per_hour.iter().filter(move |(h, _)| *h >= h0 && *h <= h1).map(move |(h, v)| ((h - h0) as usize, v))
+}
+
+/// A talkgroup's per-hour activity over the last `hours`, oldest first: (calls, seconds).
+fn hourly(g: &Tg, now: i64, hours: i64) -> (Vec<u32>, Vec<f32>) {
     let (mut c, mut sec) = (vec![0u32; hours as usize], vec![0f32; hours as usize]);
-    for &(h, (n, x)) in &g.hours {
-        if h >= h0 && h <= h1 {
-            c[(h - h0) as usize] = n;
-            sec[(h - h0) as usize] = (x * 10.0).round() / 10.0;
-        }
+    for (i, &(n, x)) in window(&g.hours, now, hours) {
+        c[i] = n;
+        sec[i] = (x * 10.0).round() / 10.0;
     }
     (c, sec)
 }
@@ -467,11 +723,11 @@ fn tg_row(name: &str, s: &SystemRadio, tg: u32, g: &Tg, now: i64, hours: i64, na
     let (c, sec) = hourly(g, now, hours);
     json!({
         "tg": tg,
-        "alphaTag": info.as_ref().map_or("", |i| i.alpha_tag.as_str()),
+        "alphaTag": tg_alpha(name, s, tg, names),
         "known": info.is_some(),
         "ignore": info.as_ref().is_some_and(|i| i.ignore),
         "first": g.first, "last": g.last,
-        "calls": c.iter().sum::<u32>(), "secs": (sec.iter().sum::<f32>() * 10.0).round() / 10.0,
+        "calls": c.iter().sum::<u32>(), "secs": (sec.iter().sum::<f32>() as f64 * 10.0).round() / 10.0,
         "totalCalls": g.calls,
         "encPct": if g.calls > 0 { (g.enc as f64 * 1000.0 / g.calls as f64).round() / 10.0 } else { 0.0 },
         "new": is_new(s, g.first, now),
@@ -516,7 +772,7 @@ fn unit_row(name: &str, s: &SystemRadio, id: u32, u: &Unit, now: i64, names: &Na
         "unit": id,
         "alias": (names.unit)(name, id).unwrap_or_default(),
         "first": u.first, "last": u.last, "lastTx": if u.last_tx > 0 { Some(u.last_tx) } else { None },
-        "tx": u.tx, "txSecs": (u.tx_secs * 10.0).round() / 10.0,
+        "tx": u.tx, "txSecs": (u.tx_secs as f64 * 10.0).round() / 10.0,
         "aff": u.aff, "affT": if u.aff.is_some() { Some(u.aff_t) } else { None }, "reg": u.reg,
         "tgs": u.tgs,
         "partners": if partners_n > 0 { partners(s, id, partners_n) } else { Vec::new() },
@@ -554,37 +810,37 @@ fn tg_detail(name: &str, s: &SystemRadio, tg: u32, now: i64, hours: i64, names: 
 
 fn unit_detail(name: &str, s: &SystemRadio, id: u32, now: i64, names: &Names) -> Value {
     let Some(u) = s.units.get(&id) else { return json!({ "unit": id, "row": null }) };
-    let tg_name = |tg: u32| (names.tg)(name, tg).map(|i| i.alpha_tag).unwrap_or_default();
+    let tg_name = |tg: u32| tg_alpha(name, s, tg, names);
     let partners = partners(s, id, 24);
     json!({
         "unit": id,
         "row": unit_row(name, s, id, u, now, names, 0),
-        "recent": u.recent.iter().rev().map(|&(t, tg, secs)| json!({ "t": t, "tg": tg, "alphaTag": tg_name(tg), "secs": (secs * 10.0).round() / 10.0 })).collect::<Vec<_>>(),
+        "recent": u.recent.iter().rev().map(|&(t, tg, secs)| json!({ "t": t, "tg": tg, "alphaTag": tg_name(tg), "secs": (secs as f64 * 10.0).round() / 10.0 })).collect::<Vec<_>>(),
         "affiliations": s.affiliations.iter().rev().filter(|a| a.1 == id).take(50).map(|&(t, _, tg)| json!({ "t": t, "tg": tg, "alphaTag": tg_name(tg) })).collect::<Vec<_>>(),
         "tgs": u.tgs.iter().map(|&(tg, n)| json!({ "tg": tg, "alphaTag": tg_name(tg), "n": n })).collect::<Vec<_>>(),
         "partners": partners.iter().map(|&(p, n)| json!({ "unit": p, "alias": (names.unit)(name, p).unwrap_or_default(), "n": n })).collect::<Vec<_>>(),
     })
 }
 
+/// Each frequency: how its voice decoded (`rows`: those with a call
+/// recorded), and the calls on it out of band in the last `hours`
+/// (`outOfBand`, the most first).
 fn freqs(s: &SystemRadio, now: i64, hours: i64) -> Value {
-    let h1 = now.div_euclid(3600);
-    let h0 = h1 - hours + 1;
     let mut rows: Vec<Value> = s
         .freqs
         .iter()
+        .filter(|(_, f)| f.calls > 0)
         .map(|(hz, f)| {
             let (mut c, mut fr, mut er, mut bd) = (0u32, 0u64, 0u64, 0u64);
             // Each hour's share of voice frames that couldn't be decoded, %.
             let mut spark = vec![Value::Null; hours as usize];
-            for &(h, (n, frames, errors, bad)) in &f.hours {
-                if h >= h0 && h <= h1 {
-                    c += n;
-                    fr += frames;
-                    er += errors;
-                    bd += bad;
-                    if frames > 0 {
-                        spark[(h - h0) as usize] = json!((bad as f64 * 1000.0 / frames as f64).round() / 10.0);
-                    }
+            for (i, &(n, frames, errors, bad)) in window(&f.hours, now, hours) {
+                c += n;
+                fr += frames;
+                er += errors;
+                bd += bad;
+                if frames > 0 {
+                    spark[i] = json!((bad as f64 * 1000.0 / frames as f64).round() / 10.0);
                 }
             }
             json!({
@@ -594,16 +850,122 @@ fn freqs(s: &SystemRadio, now: i64, hours: i64) -> Value {
                 "allErrPerFrame": if f.frames > 0 { Some((f.errors as f64 / f.frames as f64 * 1000.0).round() / 1000.0) } else { None },
                 "badPct": if fr > 0 { Some((bd as f64 * 1000.0 / fr as f64).round() / 10.0) } else { None },
                 "allBadPct": if f.frames > 0 { Some((f.bad as f64 * 1000.0 / f.frames as f64).round() / 10.0) } else { None },
-                "snr": f.snr.map(|v| (v * 10.0).round() / 10.0),
+                "snr": f.snr.map(|v| (v as f64 * 10.0).round() / 10.0),
                 "freqError": f.ferr.map(|v| v.round()),
-                "clean": f.clean.map(|v| (v * 10.0).round() / 10.0),
+                "clean": f.clean.map(|v| (v as f64 * 10.0).round() / 10.0),
                 "last": f.last,
                 "hourly": spark,
             })
         })
         .collect();
     rows.sort_by_key(|r| r["freqHz"].as_u64());
-    json!({ "hours": hours, "rows": rows })
+    let mut out_of_band: Vec<(u32, Value)> = s
+        .freqs
+        .iter()
+        .filter_map(|(hz, f)| {
+            let mut spark = vec![0u32; hours as usize];
+            for (i, &n) in window(&f.out_of_band_hours, now, hours) {
+                spark[i] = n;
+            }
+            let n: u32 = spark.iter().sum();
+            (n > 0).then(|| (n, json!({ "freqHz": hz, "calls": n, "totalCalls": f.out_of_band, "last": f.out_of_band_last, "hourly": spark })))
+        })
+        .collect();
+    out_of_band.sort_by(|a, b| b.0.cmp(&a.0).then(a.1["freqHz"].as_u64().cmp(&b.1["freqHz"].as_u64())));
+    json!({ "hours": hours, "rows": rows, "outOfBand": out_of_band.into_iter().map(|x| x.1).collect::<Vec<_>>() })
+}
+
+/// The tones log: the patterns heard over the last `hours`, alike ones
+/// together (same talkgroup, pattern and digits, tones as close as a signal
+/// matches them), most recently heard first, each named by the system's
+/// signals as they are now.
+fn tones(name: &str, s: &SystemRadio, now: i64, hours: i64, limit: usize, names: &Names) -> Value {
+    use trunk_core::dsp::inband::pattern::{format_plan, PatternKind};
+    use trunk_core::dsp::inband::tables::{identify_one, identify_pair, tolerance};
+    let span = |t: &[f32]| (t.iter().copied().fold(f32::MAX, f32::min), t.iter().copied().fold(0.0, f32::max));
+    let alike = |a: &PatternSeen, b: &PatternSeen| {
+        let (pa, pb) = (&a.pattern, &b.pattern);
+        let (ta, tb) = (a.tones(), b.tones());
+        a.tg == b.tg
+            && pa.pattern == pb.pattern
+            && (pa.digits.as_str(), pa.knox) == (pb.digits.as_str(), pb.knox)
+            && if pa.pattern == "sequence" {
+                // A chirp or a selective call heard with a tone more or less at
+                // either end (the vocoder drops some): the same sweep.
+                let ((alo, ahi), (blo, bhi)) = (span(&ta), span(&tb));
+                (alo - blo).abs() <= 32.0 && (ahi - bhi).abs() <= 32.0
+            } else {
+                ta.len() == tb.len() && ta.iter().zip(&tb).all(|(&x, &y)| (x - y).abs() <= tolerance(x, a.frame() && b.frame()))
+            }
+    };
+    let mut groups: Vec<Vec<&PatternSeen>> = Vec::new();
+    for h in s.tones.iter().rev().filter(|h| h.t > now - hours * 3600) {
+        match groups.iter_mut().find(|g| alike(g[0], h)) {
+            Some(g) => g.push(h),
+            None => groups.push(vec![h]),
+        }
+    }
+    let total = groups.len();
+    let rows: Vec<Value> = groups
+        .iter()
+        .take(limit)
+        .map(|g| {
+            let (h, p) = (g[0], &g[0].pattern);
+            let lengths: Vec<f64> = (0..p.lengths.len())
+                .map(|k| {
+                    let mut v: Vec<f64> = g.iter().filter_map(|x| x.pattern.lengths.get(k).copied()).collect();
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                })
+                .collect();
+            let mut formats: BTreeMap<&str, u32> = BTreeMap::new();
+            let mut radios: BTreeMap<u32, u32> = BTreeMap::new();
+            for x in g {
+                if !x.pattern.format.is_empty() {
+                    *formats.entry(x.pattern.format.as_str()).or_default() += 1;
+                }
+                if x.pattern.src > 0 {
+                    *radios.entry(x.pattern.src as u32).or_default() += 1;
+                }
+            }
+            let mut radios: Vec<(u32, u32)> = radios.into_iter().collect();
+            radios.sort_by_key(|r| std::cmp::Reverse(r.1));
+            let format = formats.iter().max_by_key(|f| f.1).map_or("", |f| *f.0);
+            // Which paging codes it may be, likeliest first; none: custom tones.
+            // One tone is a code only held like a group call (8 s): a shorter
+            // one is an alert tone, a beep speech misread or a tone in the background.
+            let tones = h.tones();
+            let frame = g.iter().all(|x| x.frame());
+            let mut ids: Vec<String> = match (p.pattern.as_str(), tones.as_slice()) {
+                ("two_tone", &[a, b]) => identify_pair(a, b, frame, format_plan(format)),
+                ("long", &[f]) if lengths[0] >= 6.0 => identify_one(f, frame),
+                _ => Vec::new(),
+            };
+            ids.truncate(4);
+            let heard = PatternKind::from_name(&p.pattern).map(|kind| Heard { kind, hz: &tones, digits: &p.digits, knox: p.knox, frame });
+            let info = (names.tg)(name, h.tg);
+            json!({
+                "tg": h.tg,
+                "alphaTag": info.as_ref().map_or("", |i| i.alpha_tag.as_str()),
+                "pattern": p.pattern,
+                "tones": p.tones,
+                "lengths": lengths,
+                "digits": p.digits,
+                "knox": p.knox,
+                "cycles": p.cycles,
+                "format": format,
+                "text": p.text,
+                "count": g.len(),
+                "first": g.last().map_or(0, |x| x.t),
+                "last": h.t,
+                "radios": radios.iter().take(3).map(|&(u, n)| json!({ "unit": u, "name": (names.unit)(name, u), "n": n })).collect::<Vec<Value>>(),
+                "frame": frame,
+                "ids": ids,
+                "signals": heard.map_or_else(Vec::new, |h| (names.signals)(name, &h, g[0].tg)),
+            })
+        })
+        .collect();
+    json!({ "hours": hours, "total": total, "rows": rows })
 }
 
 fn summary(name: &str, s: &SystemRadio, now: i64, names: &Names) -> Value {
@@ -612,7 +974,7 @@ fn summary(name: &str, s: &SystemRadio, now: i64, names: &Names) -> Value {
         .tgs
         .iter()
         .filter(|(_, g)| is_new(s, g.first, now))
-        .map(|(k, g)| json!({ "tg": k, "first": g.first, "alphaTag": (names.tg)(name, *k).map(|i| i.alpha_tag).unwrap_or_default() }))
+        .map(|(k, g)| json!({ "tg": k, "first": g.first, "alphaTag": tg_alpha(name, s, *k, names) }))
         .collect();
     let unknown = s.tgs.iter().filter(|(k, g)| g.last >= day && (names.tg)(name, **k).is_none()).count();
     json!({
@@ -645,8 +1007,24 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
+    fn no_signals(_: &str, _: &Heard, _: u32) -> Vec<String> {
+        Vec::new()
+    }
+
     fn names() -> (impl Fn(&str, u32) -> Option<TgInfo>, impl Fn(&str, u32) -> Option<String>) {
         (|_: &str, tg: u32| (tg == 100).then(|| TgInfo { alpha_tag: "Fire Dispatch".into(), ignore: false }), |_: &str, u: u32| (u == 7).then(|| "E7".to_string()))
+    }
+
+    #[test]
+    fn a_long_calls_air_is_in_the_hours_it_was_on() {
+        let mut r = Registry::default();
+        let t0 = 1_700_000_000 / 3600 * 3600 + 1800;
+        // 2½ hours held open, from half past: half an hour, an hour, an hour.
+        r.call_end("x", &call(100, &[], 0.0, 9000.0), t0 + 9000);
+        r.call_end("x", &call(100, &[], 0.0, 10.0), t0 + 9010);
+        let (calls, secs) = hourly(&r.systems["x"].tgs[&100], t0 + 9010, 4);
+        assert_eq!(calls, [0, 0, 0, 2], "a call counts in the hour it ended");
+        assert_eq!(secs, [1800.0, 3600.0, 3600.0, 10.0]);
     }
 
     #[test]
@@ -671,7 +1049,7 @@ mod tests {
         r.call_end("dcfd", &c2, t0 + 7203);
 
         let (tg, unit) = names();
-        let n = Names { tg: &tg, unit: &unit };
+        let n = Names { tg: &tg, unit: &unit, signals: &no_signals };
         let q = r.query(&json!({ "what": "talkgroups", "system": "dcfd", "hours": 24 }), t0 + 7300, &n);
         assert_eq!(q["total"], 2);
         assert_eq!(q["rows"][0]["tg"], 100, "busiest first");
@@ -687,29 +1065,146 @@ mod tests {
     }
 
     #[test]
+    fn a_talkgroup_nothing_names_is_named_as_its_calls_were() {
+        // A conventional catch-all that files under the air's talkgroup names every one it hears.
+        let mut r = Registry::default();
+        let t0 = 1_700_000_000;
+        let mut c = call(7, &[], 0.0, 2.0);
+        c.talkgroup_info = Some(trunk_core::trunk::Talkgroup { number: 7, alpha_tag: "Townville (other)".into(), ..Default::default() });
+        r.call_start("conv", &c, t0);
+        r.call_end("conv", &c, t0 + 2);
+        // A later call that carried no name keeps it.
+        c.talkgroup_info = None;
+        r.call_end("conv", &c, t0 + 5);
+        let (tg, unit) = names();
+        let n = Names { tg: &tg, unit: &unit, signals: &no_signals };
+        let q = r.query(&json!({ "what": "talkgroups", "system": "conv", "hours": 24 }), t0 + 10, &n);
+        assert_eq!((q["rows"][0]["alphaTag"].as_str(), q["rows"][0]["known"].as_bool()), (Some("Townville (other)"), Some(false)));
+    }
+
+    #[test]
     fn affiliations_and_saving() {
         let mut r = Registry::default();
         let m = Message { kind: MessageType::Affiliation, source: 42, talkgroup: 100, ..Default::default() };
         assert_eq!(r.message("x", &m, 10), Some((42, 100)));
         assert_eq!(r.message("x", &m, 11), None, "the same again isn't news");
-        let rec = json!({ "freq": 851_000_000u64, "snr": 20.0, "freq_error": -30, "clean_voice_pct": 98.0, "errorList": [{ "frames": 100, "error_count": 5, "bad_frames": 1 }] });
+        let rec = trunk_recorder_plugin::CallRecord {
+            freq: 851_000_000,
+            snr: Some(20.0),
+            freq_error: -30,
+            clean_voice_pct: Some(98.0),
+            error_list: vec![trunk_recorder_plugin::ErrorInterval { frames: 100, error_count: 5, bad_frames: 1, ..Default::default() }],
+            ..Default::default()
+        };
         r.concluded("x", &rec, 20);
-        let saved = r.take_dirty();
-        assert_eq!(saved.len(), 1);
-        assert!(r.take_dirty().is_empty());
+        assert_eq!(r.take_changes().len(), 1);
+        assert!(r.take_changes().is_empty());
         let mut back = Registry::default();
-        back.load("x", &saved[0].1);
+        back.load("x", &serde_json::to_string(&r.systems["x"].whole()).unwrap());
         assert_eq!(back.systems["x"].units[&42].aff, Some(100));
         assert_eq!(back.systems["x"].freqs[&851_000_000].errors, 5);
         let (tg, unit) = names();
-        let q = back.query(&json!({ "what": "freqs", "system": "x" }), 30, &Names { tg: &tg, unit: &unit });
+        let q = back.query(&json!({ "what": "freqs", "system": "x" }), 30, &Names { tg: &tg, unit: &unit, signals: &no_signals });
         assert_eq!(q["rows"][0]["errPerFrame"], 0.05);
+    }
+
+    #[test]
+    fn tones_log_groups_alike_pages() {
+        use trunk_recorder_plugin::TonePattern;
+        let page = |tones: [f64; 2], src| TonePattern { pattern: "two_tone".into(), tones: tones.to_vec(), lengths: vec![0.98, 2.98], format: "Quick Call II".into(), src, origin: "frame".into(), ..Default::default() };
+        let mut r = Registry::default();
+        r.tone_pattern("x", 100, &page([781.25, 875.0], 7), 1000);
+        r.tone_pattern("x", 100, &page([781.25, 875.0], 7), 2000);
+        r.tone_pattern("x", 100, &page([1593.75, 1468.75], 8), 3000);
+        r.tone_pattern("x", 200, &page([781.25, 875.0], 9), 4000);
+        let (tg, unit) = names();
+        // Named by the system's signals as they are now.
+        let signals = |_: &str, h: &Heard, tg: u32| if tg == 100 && h.hz.first().is_some_and(|&a| (a - 781.25).abs() < 1.0) { vec!["NORWALK_EMS".to_string()] } else { Vec::new() };
+        let q = r.query(&json!({ "what": "tones", "system": "x", "hours": 24 }), 5000, &Names { tg: &tg, unit: &unit, signals: &signals });
+        assert_eq!(q["total"], 3, "one page on two talkgroups is two rows");
+        let rows = q["rows"].as_array().unwrap();
+        assert_eq!((rows[0]["tg"].as_u64(), rows[0]["count"].as_u64()), (Some(200), Some(1)), "most recent first");
+        let norwalk = &rows[2];
+        assert_eq!((norwalk["count"].as_u64(), norwalk["first"].as_i64(), norwalk["last"].as_i64()), (Some(2), Some(1000), Some(2000)));
+        assert_eq!(norwalk["alphaTag"], "Fire Dispatch");
+        assert_eq!(norwalk["format"], "Quick Call II");
+        assert_eq!(norwalk["radios"][0]["name"], "E7");
+        assert_eq!(norwalk["ids"][0], "QC2 126/128 (268)");
+        assert_eq!(norwalk["signals"][0], "NORWALK_EMS");
+        assert_eq!(rows[1]["ids"][0], "QC2 173/170");
+        assert_eq!(rows[0]["signals"].as_array().map(Vec::len), Some(0), "another talkgroup");
+    }
+
+    #[test]
+    fn frequencies_no_source_covered_are_listed_apart_from_decoding() {
+        let mut r = Registry::default();
+        let t0 = 1_700_000_000;
+        let oob = |hz| Call { freq_hz: hz, reason: Some(Reason::NoSource), ..call(100, &[], 0.0, 1.0) };
+        for (hz, at) in [(860_000_000, t0), (860_000_000, t0 + 60), (861_000_000, t0 + 7200)] {
+            r.call_start("x", &oob(hz), at);
+        }
+        // Another reason isn't out of band.
+        r.call_start("x", &Call { freq_hz: 862_000_000, reason: Some(Reason::NoRecorder), ..call(100, &[], 0.0, 1.0) }, t0);
+        r.concluded("x", &trunk_recorder_plugin::CallRecord { freq: 851_000_000, ..Default::default() }, t0);
+        let (tg, unit) = names();
+        let n = Names { tg: &tg, unit: &unit, signals: &no_signals };
+        let q = r.query(&json!({ "what": "freqs", "system": "x", "hours": 24 }), t0 + 7300, &n);
+        assert_eq!(q["rows"].as_array().unwrap().len(), 1, "decoding: only frequencies with a call recorded");
+        assert_eq!(q["rows"][0]["freqHz"], 851_000_000u64);
+        let o = &q["outOfBand"];
+        assert_eq!((o[0]["freqHz"].as_u64(), o[0]["calls"].as_u64(), o[0]["last"].as_i64()), (Some(860_000_000), Some(2), Some(t0 + 60)), "the most first");
+        assert_eq!(o[1]["freqHz"], 861_000_000u64);
+        assert_eq!(o[0]["hourly"].as_array().unwrap().len(), 24);
+        assert_eq!(o.as_array().unwrap().len(), 2);
+        // Out of the range asked: not listed (all time still counted).
+        let q = r.query(&json!({ "what": "freqs", "system": "x", "hours": 1 }), t0 + 7300, &n);
+        assert_eq!(q["outOfBand"], json!([{ "freqHz": 861_000_000u64, "calls": 1, "totalCalls": 1, "last": t0 + 7200, "hourly": [1] }]));
+        // Kept across runs.
+        let mut back = Registry::default();
+        back.load("x", &serde_json::to_string(&r.systems["x"].whole()).unwrap());
+        assert_eq!(back.systems["x"].freqs[&860_000_000].out_of_band, 2);
+    }
+
+    /// The rows taken as they change, made over the registry as it was
+    /// when last taken, are the registry: what went past a cap and what was
+    /// heard again since, the newest affiliations, lengths and tones too.
+    #[test]
+    fn changes_taken_by_row_make_the_registry() {
+        let mut r = Registry::default();
+        r.call_end("x", &call(100, &[(1, 0.0), (2, 1.0)], 0.0, 3.0), 3);
+        assert_eq!(r.take_changes().len(), 1);
+        assert!(r.take_changes().is_empty(), "nothing since");
+        let mut kept = r.systems["x"].clone();
+        // Past the caps: radios and pairs go, the oldest first.
+        let n = (MAX_PAIRS / 5 + MAX_PAIRS / 40) as u32;
+        for i in 0..n {
+            let talkers: Vec<(u32, f64)> = (0..6).map(|k| (10_000 + 6 * i + k, k as f64)).collect();
+            r.call_end("x", &call(200 + i % 50, &talkers, 0.0, 6.0), 10 + i as i64);
+        }
+        // Radio 1 went, and is heard again.
+        r.call_end("x", &call(100, &[(1, 0.0)], 0.0, 2.0), 100_000);
+        r.message("x", &Message { kind: MessageType::Affiliation, source: 1, talkgroup: 300, ..Default::default() }, 100_001);
+        r.tone_pattern("x", 100, &trunk_recorder_plugin::TonePattern { origin: "frame".into(), ..Default::default() }, 100_002);
+        r.concluded("x", &trunk_recorder_plugin::CallRecord { freq: 851_000_000, ..Default::default() }, 100_003);
+        let changes = r.take_changes();
+        let (_, c) = &changes[0];
+        assert!(!c.gone.units.is_empty() && !c.gone.pairs.is_empty() && c.gone.units.contains(&2), "{} radios, {} pairs went", c.gone.units.len(), c.gone.pairs.len());
+        assert!(c.units.iter().any(|(u, _)| *u == 1), "radio 1 heard again");
+        assert!(c.units.len() < r.systems["x"].units.len() + c.gone.units.len(), "only what changed");
+        kept.apply(c);
+        assert_eq!(serde_json::to_value(&kept).unwrap(), serde_json::to_value(&r.systems["x"]).unwrap());
+        // The whole system as rows, made again: what a store imports and loads.
+        let again = SystemRadio::from_changes(&r.systems["x"].whole());
+        assert_eq!(serde_json::to_value(&again).unwrap(), serde_json::to_value(&r.systems["x"]).unwrap());
+        // As a log's line, and back.
+        let line = serde_json::to_string(c).unwrap();
+        assert_eq!(serde_json::from_str::<RegistryChanges>(&line).unwrap().units.len(), c.units.len());
     }
 
     #[test]
     fn tables_stay_bounded() {
         let mut m: HashMap<u32, i64> = (0..1200).map(|i| (i, i as i64)).collect();
-        evict(&mut m, 1000, |v| *v);
+        assert_eq!(evict(&mut m, 1000, |v| *v).len(), 200, "those that went");
         assert_eq!(m.len(), 1000);
         assert!(m.contains_key(&1199) && !m.contains_key(&10));
     }
@@ -725,8 +1220,49 @@ mod tests {
         }
         assert_eq!(r.systems["dcfd"].tgs[&100].ciphers, vec![(0x84, 2, 1, t0 + 30), (0xAA, 0x1B50, 2, t0 + 20)]);
         let (tg, unit) = names();
-        let n = Names { tg: &tg, unit: &unit };
+        let n = Names { tg: &tg, unit: &unit, signals: &no_signals };
         let q = r.query(&json!({ "what": "tg", "system": "dcfd", "key": 100, "hours": 24 }), t0 + 40, &n);
         assert_eq!(q["row"]["ciphers"][1], json!({ "algid": 0xAA, "keyId": 0x1B50, "name": "ADP", "calls": 2, "last": t0 + 20 }));
+    }
+
+    /// How big a system's registry file gets, and how long turning it into
+    /// JSON and copying it take: at every cap (a week of a very large
+    /// system), and at about half. `cargo test --release -p trunk-app --lib
+    /// registry_size -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn registry_size() {
+        for (label, tgs, units, pairs) in [("at the caps", MAX_TGS, MAX_UNITS, MAX_PAIRS), ("about half", MAX_TGS / 2, MAX_UNITS / 2, MAX_PAIRS / 2)] {
+            let t = 1_790_000_000i64;
+            let mut s = SystemRadio::new(t);
+            let hours = |n: usize| (0..n as i64).map(|h| (t / 3600 - h, (12u32, 95.5f32))).collect::<VecDeque<_>>();
+            for g in 0..tgs as u32 {
+                s.tgs.insert(10_000 + g, Tg { first: t, last: t + 600_000, name: format!("TG {g} Dispatch"), calls: 4321, secs: 98_765.5, enc: 12, ciphers: vec![(0x84, 0x1234, 40, t)], hours: hours(HOURS as usize) });
+            }
+            for u in 0..units as u32 {
+                let recent = (0..MAX_RECENT_TX as i64).map(|k| (t + k * 60, 10_000 + u % 500, 4.25f32)).collect();
+                s.units.insert(1_000_000 + u, Unit { first: t, last: t + 600_000, last_tx: t + 599_000, tx: 321, tx_secs: 1234.5, aff: Some(10_001), aff_t: t, reg: Some(true), tgs: (0..TOP_TGS as u32).map(|k| (10_000 + k, 40 - k)).collect(), recent });
+            }
+            for p in 0..pairs as u64 {
+                s.pairs.insert(pair_key(1_000_000 + (p % 20_000) as u32, 1_020_000 + p as u32), Pair { n: 17, last: t });
+            }
+            for f in 0..MAX_FREQS as u64 {
+                let hours = (0..HOURS).map(|h| (t / 3600 - h, (40u32, 100_000u64, 2_000u64, 30u64))).collect();
+                s.freqs.insert(851_000_000 + f * 12_500, Freq { calls: 5000, frames: 9_000_000, errors: 12_345, bad: 678, snr: Some(18.5), ferr: Some(0.2), clean: Some(0.97), last: t, hours, ..Default::default() });
+            }
+            s.affiliations = (0..MAX_AFFILIATIONS as i64).map(|k| (t + k, 1_000_000 + k as u32, 10_001)).collect();
+            s.lengths = (0..MAX_LENGTHS as i64).map(|k| (t + k, 10_001, 5.5f32)).collect();
+            let at = std::time::Instant::now();
+            let copy = s.clone();
+            let cloned = at.elapsed();
+            let at = std::time::Instant::now();
+            let json = serde_json::to_string(&copy).unwrap();
+            let made = at.elapsed();
+            let at = std::time::Instant::now();
+            let back: SystemRadio = serde_json::from_str(&json).unwrap();
+            let read = at.elapsed();
+            assert_eq!(back.units.len(), units);
+            println!("{label}: {tgs} talkgroups, {units} radios, {pairs} pairs: {:.1} MB; copied in {cloned:.1?}, JSON in {made:.1?}, read back in {read:.1?}", json.len() as f64 / 1e6);
+        }
     }
 }

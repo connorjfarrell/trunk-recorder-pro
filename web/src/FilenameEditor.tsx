@@ -5,6 +5,8 @@
 
 import { useMemo, useState } from "react";
 import { useApp } from "./controller.ts";
+import { verbatim } from "./fieldText.ts";
+import { DraftInput, TextInput } from "./inputs.tsx";
 import { formatToString, parseFormat, pieceProblem, pieceSample, samplePath, TEXT_NOT_ALLOWED, type Piece } from "./filenameFormat.ts";
 
 /** Trunk Recorder's layout, as near as a format gets (its file name has `.<slot>` on TDMA calls). */
@@ -12,12 +14,14 @@ export const DEFAULT_FORMAT = "{short_name}/{time:%Y}/{time:%-m}/{time:%-d}/{tal
 
 const TOKEN_LABEL: Record<string, string> = {
   talkgroup: "Talkgroup",
+  talkgroup_ota: "Air talkgroup",
   talkgroup_alpha_tag: "Alpha tag",
   talkgroup_tag: "Tag",
   talkgroup_description: "Description",
   talkgroup_group: "Category",
   talkgroup_display: "Talkgroup",
   short_name: "System",
+  site: "Site",
   freq: "Frequency, Hz",
   freq_mhz: "Frequency, MHz",
   epoch: "Start, Unix time",
@@ -32,8 +36,11 @@ const TOKEN_LABEL: Record<string, string> = {
   recorder_num: "Recorder number",
   signal: "Signal, dB",
   noise: "Noise, dB",
+  nac: "P25 NAC",
   color_code: "Colour code",
   ran: "NXDN RAN",
+  system_type: "System type",
+  voice_mode: "Voice mode",
 };
 
 const TIME_LABEL: Record<string, string> = {
@@ -56,9 +63,9 @@ const TIME_LABEL: Record<string, string> = {
 };
 
 const GROUPS: { title: string; tokens: string[] }[] = [
-  { title: "Talkgroup", tokens: ["talkgroup", "talkgroup_alpha_tag", "talkgroup_tag", "talkgroup_description", "talkgroup_group"] },
-  { title: "Call", tokens: ["short_name", "freq", "freq_mhz", "epoch", "call_num", "tdma_slot", "audio_type", "emergency", "encrypted", "priority"] },
-  { title: "Radio", tokens: ["sys_num", "source_num", "recorder_num", "signal", "noise", "color_code", "ran"] },
+  { title: "Talkgroup", tokens: ["talkgroup", "talkgroup_ota", "talkgroup_alpha_tag", "talkgroup_tag", "talkgroup_description", "talkgroup_group"] },
+  { title: "Call", tokens: ["short_name", "site", "freq", "freq_mhz", "epoch", "call_num", "tdma_slot", "audio_type", "voice_mode", "emergency", "encrypted", "priority"] },
+  { title: "Radio", tokens: ["system_type", "sys_num", "source_num", "recorder_num", "signal", "noise", "nac", "color_code", "ran"] },
 ];
 const TIMES = ["%Y", "%m", "%-m", "%d", "%-d", "%H", "%M", "%S", "%f", "%Y-%m-%d", "%H%M%S", "iso", "%j", "%a"];
 const JOINERS = ["-", "_", ".", " "];
@@ -269,13 +276,14 @@ function Builder(props: { pieces: Piece[]; own: boolean; when: Date; value: stri
                 }}
               >
                 {p.kind === "text" ? (
-                  <input
+                  <DraftInput
                     className="fname-text-input"
+                    codec={verbatim}
                     value={p.text}
-                    size={Math.max(1, p.text.length)}
+                    sizeToText
                     aria-label="Text"
-                    onChange={(e) => {
-                      const c = cleanText(e.target.value, true);
+                    onChange={(typed) => {
+                      const c = cleanText(typed, true);
                       if (c.dropped) setNote('Not allowed: : * ? " < > |');
                       // A / or \ typed here makes a folder.
                       const next = [...pieces];
@@ -378,13 +386,7 @@ function Builder(props: { pieces: Piece[]; own: boolean; when: Date; value: stri
         )}
       </div>
       {raw && (
-        <input
-          className="mono"
-          aria-label="The format as text"
-          value={props.value}
-          placeholder="{short_name}/{time:%Y}/…"
-          onChange={(e) => props.onChange(e.target.value)}
-        />
+        <TextInput className="mono" aria-label="The format as text" value={props.value} placeholder="{short_name}/{time:%Y}/…" onChange={props.onChange} />
       )}
     </div>
   );

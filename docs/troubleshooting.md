@@ -12,10 +12,18 @@ what to put in a bug report.
 /home/pi/.config/trunk-pro/config.json: not a config this version reads (expected `,` or `}` at line 41 column 5)
 ```
 
-The config file isn't valid JSON, or a value has the wrong type (text where a number goes, say).
+The config file isn't valid JSON, a value has the wrong type (text where a number goes, say), or a
+choice isn't one the app lists (a system `type` of `P25x`, a `vocoder` of `best`):
+
+```text
+config.json: not a config this version reads (unknown variant `P25x`, expected one of `p25`, `smartnet`, `dmr`, `nxdn` at line 12 column 20)
+```
+
 The part in brackets says what and where. This usually comes from a hand edit: a missing comma,
-a trailing comma, or a stray quote. Fix that line, or move the file aside and start again (the
-app starts with the default config, one RTL-SDR and no systems, when there's no file).
+a trailing comma, a stray quote or a misspelt choice (choices are read in any case, so `P25` is
+fine). Fix that line, or move the file aside and start again (the app starts with the default
+config, one RTL-SDR and no systems, when there's no file). The choices each key takes are listed
+in the [config reference](configuration/README.md#general-rules).
 
 A Trunk Recorder `config.json` is a different format. Don't point `--config` at one; bring it over
 with **Import Trunk Recorder config…** instead (see
@@ -32,6 +40,7 @@ Other things that stop it at start, each with its message:
 | `--port x: a port number, 1–65535` | A number in that range |
 | `bind address: …` | `--bind` or `server.bind` must be an IP address (`127.0.0.1`, `0.0.0.0`), not a host name |
 | `--ui <folder>: no index.html there` | Point `--ui` at a folder with an `index.html` |
+| `Interface <id>: can't serve it on port <n>: …` | Another program has the port (or it's below 1024): pick another on the Interfaces page |
 
 Started from Finder, Explorer or a desktop launcher, these show as a dialog (macOS) or a
 notification (Linux) titled "Trunk Recorder Pro couldn't start".
@@ -72,6 +81,8 @@ the log says `Not started: <why>`. The reasons:
 | `Add a system with a control channel, or a conventional channel.` | A trunked system only counts once it's enabled and has a control channel |
 | `Every system needs a short name.` | Give it one in Setup |
 | `Two systems are named "x" — each needs a short name of its own …` | Short names are folder names and how plugins tell systems apart, so they must differ (conventional systems included) |
+| `Two sites of x are named "y" — each needs a name of its own.` | Site names are unique within their system |
+| `Source N: the USB transfer size must be a multiple of 512 bytes, at most 16 MiB …` or `Source N: at most 256 USB transfers in flight.` | An RTL-SDR's `bufLen` or `buffers` (Setup's **USB transfer size**) is out of range; `65536` is the usual value |
 | `Set a center frequency for source N — it couldn't be placed automatically …` | Automatic centring couldn't fit the channels. Set the centre yourself, or add a source. See [Radios](guides/radios.md). |
 | `No control channel of x falls inside any source's bandwidth — move a center frequency or add a source.` | At least one control channel must be inside a source's usable band (its band minus the guard band at each edge) |
 | `x: DMR (or NXDN) frequencies outside every source's bandwidth: … MHz` | Every control and voice frequency of a DMR or NXDN site has to be covered |
@@ -80,7 +91,9 @@ the log says `Not started: <why>`. The reasons:
 | `Conventional channel … MHz is in both a and b …` | A frequency can belong to only one conventional system |
 | `A conventional channel has no frequency yet.` | Fill it in or remove the row |
 | `Conventional channel … MHz: …` | Its tone, NAC, colour code or RAN can't be read; see [Tones](guides/tones.md) |
-| `At most 256 conventional systems.` | |
+| `Conventional channel … MHz: a bandwidth is 4–20 kHz.` | A channel's **Bandwidth kHz** is outside that range |
+| `<system>: AM low cut is 0–600 Hz.` (also `Squelch open delay is 0–500 ms.`, `Squelch hang is 0–1000 ms.`) | A conventional system's demodulation setting is out of range |
+| `File name format: Unknown token: {x}.` (or `<system>'s file name format: …`) | A file name format has a token that isn't one of [the listed ones](configuration/recording.md#file-names), or a `{` with no `}` |
 
 A linked channel file that can't be read also stops the start, with the file's problem as the
 message.
@@ -101,7 +114,7 @@ what follows.
   another.
 - **Only one program can use a dongle.** Quit SDR#, SDR++, GQRX, `rtl_tcp`, another recorder, and
   `trunk-pro capture`.
-- **Linux: permission.** `install.sh` adds a udev rule for you. Without it, add one and replug the
+- **Linux: permission.** `install.sh` adds a udev rule for you (it covers HackRFs too). Without it, add one and replug the
   dongle:
 
   ```bash
@@ -143,6 +156,19 @@ USB trouble shows as `Source 0: <error>` (sources counted from 0) in the log and
 `USB: …`, `USB stream timed out`). The app reopens the dongle by itself after 2 seconds, so a
 dongle that was unplugged and plugged back in carries on. If it keeps happening, suspect the cable,
 the hub or the power supply (a Raspberry Pi with a weak supply is a common one).
+
+Opening a radio, and searching for one, gives up after a deadline (5 s for an RTL-SDR, HackRF or
+Airspy; 15 s for a bladeRF or SoapySDR device; 30 s for a USRP). A radio whose firmware is stuck says:
+
+```text
+<radio> isn't answering (its firmware is stuck): unplug it and plug it back in, or power-cycle its USB hub
+```
+
+Do that; the other radios keep opening meanwhile. An RTL-SDR or HackRF whose USB stream is stuck is
+reopened, with `keeps sending the same samples over and over (its USB stream is stuck, so the
+waterfall stands still)` or `sends samples at N× its sample rate …`.
+
+A HackRF with firmware older than 2021.03 is refused when opened: update it with `hackrf_spiflash`.
 
 ## The control channel isn't decoding
 
@@ -187,7 +213,7 @@ amber: that points at reception (multipath, a marginal signal), not at traffic.
 Control channel 857.26250 MHz is not this system: NAC 2A3 (expected 2A4)
 ```
 
-The system has a site lock (`expect` in the config, set by Find my system or by hand) and the
+The site has a site lock (its `expect` in the config, set by Find my system or by hand) and the
 control channel it found belongs to a different system or site. Its grants aren't followed and the
 recorder keeps hunting. Either the frequency belongs to another site (fix the control channel list),
 or the expected identity is wrong (fix or clear it). See [Multiple sites](guides/multi-site.md).
@@ -205,7 +231,7 @@ or the expected identity is wrong (fix or clear it). See [Multiple sites](guides
   band edge (move the centre), or all of them (gain, antenna, ppm).
 - **Calls you know happened aren't there.** The Radio system page's **What happened to calls**
   shows where they went: **No recorder** (raise **Recorders**), **Out of band** (a voice channel no
-  source covers), **Not in the file** (unknown talkgroups are off), **Ignored**.
+  source covers: click it for which frequencies, and how far each is past the nearest source's edge), **Not in the file** (unknown talkgroups are off), **Ignored**.
 
 ## Nothing is recorded on a conventional channel
 
@@ -234,11 +260,29 @@ doesn't collect them in time, they're lost. Causes, most likely first:
 - **CPU.** Check the Platform page and **Decoding load** on the Overview. A lower sample rate,
   fewer sources, or a faster computer helps.
 - **USB.** Several dongles on one hub or one bus, a long or poor cable, or a Raspberry Pi with a weak
-  power supply. Spread dongles across ports.
+  power supply. Spread dongles across ports. An RTL-SDR reports the samples its chip dropped at each
+  retune or gain change; losses the driver doesn't report show up as samples falling behind the
+  clock and are logged as "lost without its driver saying so".
+- **A busy computer.** If the queue to the decoder is full, the block is dropped there and counted
+  (the gap is filled), rather than letting the radio's own buffer overflow unseen. Receive threads run
+  at real-time priority on macOS and Linux. On Linux that needs `CAP_SYS_NICE`; if it is refused, the log
+  says once "can't run at real-time priority". Allow it with
+  `sudo setcap cap_sys_nice+ep $(which trunk-pro)` (again after each update). A user systemd unit
+  can't grant it. File capabilities make the dynamic loader ignore `LD_LIBRARY_PATH`, so if UHD or
+  SoapySDR are found only through it (radioconda, `/opt` installs), name the library with
+  `TRUNK_PRO_UHD` / `TRUNK_PRO_SOAPY` (the path of the library file), or skip `setcap`.
+- **Linux: "usbfs_memory_mb".** A USB transfer refused for lack of memory means the radios' transfers
+  have used up Linux's USB memory (16 MB by default). The message gives the command to raise it.
 - **Something else on the computer** hogging it for a moment (a backup, a screen-sharing session).
 
+**Airspys** hand their samples over through libairspy, whose own thread drops a buffer
+(6.5 ms at 10 MS/s) when it runs more than ~50 ms late. The recorder now takes the Airspy's raw
+samples and turns them into IQ on its own decoding thread, so libairspy's thread only copies.
+If an Airspy's channels ever look wrong (nothing decodes, or the spectrum looks mirrored), start
+the recorder with `TRUNK_PRO_AIRSPY_LIBRARY_IQ=1` to have libairspy convert as before, and tell us.
+
 **USRPs** have a very small buffer by default, so the app asks UHD for a bigger one
-(`num_recv_frames=256`, about 65 ms) unless your device arguments set `num_recv_frames`
+(`num_recv_frames=1024`, about 260 ms at 8 MSPS) unless your device arguments set `num_recv_frames`
 themselves. Other USRP messages: `USRP can't run at … MSPS (it offers …); set that sample rate`
 (pick a rate the device supports) and `USRP: no samples for 3 s`.
 
@@ -254,7 +298,7 @@ raises the noise and overloads the radio. See [Radios](guides/radios.md).
 No M4A encoder found (install ffmpeg): calls are kept as WAV only
 ```
 
-**Also save an M4A** needs an encoder: `ffmpeg` (any system), `afconvert` (built into macOS) or
+**Keep .m4a** needs an encoder: `ffmpeg` (any system), `afconvert` (built into macOS) or
 `fdkaac`, found on your `PATH`. Install ffmpeg (`brew install ffmpeg`, `sudo apt install ffmpeg`).
 `trunk-pro plugin list` says which encoder it would use. `M4A encoding is off: calls are kept as
 WAV only` means the encoder is set to `none`. See [Recordings](guides/recordings.md).
@@ -288,6 +332,16 @@ carries on, writing to disk. Spool warnings in the event feed (filling, full) me
 aren't uploading as fast as calls arrive. Nothing is lost when it's full: calls go to the
 recordings folder instead. See [Recordings](guides/recordings.md).
 
+**The RAM spool was deleted while running** (Linux): systemd deletes a user's files in /dev/shm
+when their last login session ends (`RemoveIPC`, on by default), as when the SSH session that
+started `trunk-pro` closes, or someone logs in and out as the account a system service runs as.
+The app makes the spool again, but calls waiting in it for their uploads are lost, and each
+logout deletes it again. Run it as the [user service](install/linux.md#running-it-headless) or a
+[system service](install/linux.md#as-a-system-service-under-an-account-of-its-own) with
+`RuntimeDirectory=trunk-pro`, which keeps the spool in the service's own folder; or set
+`RemoveIPC=no` in /etc/systemd/logind.conf and restart (or `sudo systemctl restart
+systemd-logind`).
+
 ## Spotlight
 
 On macOS, the Platform page may say **Spotlight indexes the recordings folder**. Spotlight reads
@@ -302,8 +356,9 @@ and choose the recordings folder. The app checks again once a day. If it can't t
 Refused a page from http://192.168.1.50:3000: add it to server.allowedOrigins in the config to let it use the interface.
 ```
 
-The app only lets its own pages drive it, so other web pages can't. Add the page's origin to
-**Other pages allowed to use the API** in Setup → Recording → Interfaces. See
+The app only lets its own pages drive it, so other web pages can't. Each interface it serves
+uses the API on its own port: a page on port 8081 is refused on 8080. For a page served by
+something else, add its origin to **Pages served elsewhere** on the Interfaces page. See
 [Remote access](guides/interface.md#remote-access).
 
 ## Where is the log?
@@ -327,7 +382,7 @@ the journal:
 journalctl --user -u trunk-pro -f
 ```
 
-The Live page's **Control channel log** is a live view of control messages, not this log.
+The **Control channel log** at the bottom of a system's Radio system page is a live view of control messages, not this log.
 
 ## Making a capture
 

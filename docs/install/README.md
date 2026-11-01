@@ -54,8 +54,9 @@ lists the differences.
 - **RTL-SDR dongles** work out of the box on every platform. Trunk Recorder Pro drives them
   itself (no `librtlsdr`), which works for dongles with an **R820T or R828D** tuner. That is
   nearly every dongle sold today, including the RTL-SDR Blog V3 and V4.
+- **HackRF One** works out of the box too (firmware 2021.03 or newer), also in Docker.
 - **Older RTL-SDRs** with an E4000, FC0012, FC0013 or FC2580 tuner, **USRPs**, **Airspy R2 / Mini**
-  and anything with a **SoapySDR** module (HackRF, SDRplay, LimeSDR, ...) work too, once you have
+  and anything with a **SoapySDR** module (SDRplay, LimeSDR, ...) work too, once you have
   installed their makers' drivers. See [Other radios](other-radios.md). These are desktop-only.
 
 How many dongles you need depends on how spread out the system's frequencies are. A dongle sees
@@ -77,6 +78,7 @@ system.
 | Linux | x86-64 or ARM64 (64-bit only), glibc 2.28 or newer: Debian 10, Ubuntu 20.04, RHEL 8, Raspberry Pi OS (64-bit) or anything newer |
 | Docker | A Linux host, x86-64 or ARM64. Docker Desktop on macOS and Windows can't pass USB devices into a container. |
 | Browser | Chrome, Edge, Opera or Brave on Windows, macOS, Linux or ChromeOS; Chrome on Android with a USB-OTG adapter |
+| Browser, for the dashboard | One with WebAssembly SIMD: Safari 16.4, Chrome 91, Firefox 89 or later. The dashboard runs the recorder's own rules for checking a config as WebAssembly, and says so if the browser can't |
 
 Recordings take disk space: a WAV file per call, plus a small JSON file. Decide where they go
 before a long run; the default is a folder called `TrunkRecorderPro` in your home folder, and you
@@ -96,13 +98,20 @@ frequency correction, and pressing **Start**.
 You only need this if you want to change the code or run a version that hasn't been released.
 You need:
 
-- **Rust 1.95 or newer** (the `rust-version` in `Cargo.toml`), from [rustup](https://rustup.rs).
+- **Rust 1.99 or newer** (the `rust-version` in `Cargo.toml`), from [rustup](https://rustup.rs).
 - **Node.js 20 or newer** for the web interface (the release builds use Node 22).
+
+Since 0.2.0 the interface runs the recorder's own rules as WebAssembly, so the WebAssembly engine is
+built first, with the WebAssembly target and `wasm-bindgen-cli` at the version pinned in `Cargo.lock`
+(0.2.129 at the time of writing):
 
 ```bash
 git clone https://github.com/TrunkRecorder/trunk-recorder-pro.git
 cd trunk-recorder-pro
-(cd web && npm ci && npx vite build)     # the interface -> web/dist, embedded in the binary
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
+(cd web && npm ci && npm run wasm)       # the WebAssembly engine -> web/src/web/pkg
+(cd web && npx vite build)               # the interface -> web/dist, embedded in the binary
 cargo build --release                    # -> target/release/trunk-pro
 target/release/trunk-pro
 ```
@@ -111,15 +120,11 @@ Build the interface first: the binary embeds `web/dist` when it is compiled, so 
 binary after changing the interface. `cargo build --profile dist` makes a stripped binary like the
 released ones.
 
-`npm run build` does the same as `npx vite build` but also type-checks the browser version, which
-fails until you have built its WebAssembly engine. To build the browser version, add the
-WebAssembly target and `wasm-bindgen-cli` at the version pinned in `Cargo.lock` (0.2.129 at the
-time of writing):
+`npm run build` does the same as `npx vite build` but also type-checks it. For the browser
+version, with the same tools:
 
 ```bash
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.129 --locked
-(cd web && npm run wasm && npm run build:web)   # -> web/dist-web
+(cd web && npm run build:web)            # -> web/dist-web
 ```
 
 `packaging/package.sh` turns a built binary into the release packages; the comment at the top of
